@@ -16,6 +16,7 @@ const (
 	ansiYellow  = "\x1b[33m"
 	ansiCyan    = "\x1b[36m"
 	ansiMagenta = "\x1b[35m" // demandes d'interaction utilisateur (permission, confirmation)
+	ansiGray    = "\x1b[90m" // rappel du message tapé, au moment où son traitement démarre (voir dispatchTurn/file d'attente)
 )
 
 // colorsEnabled désactive la couleur si NO_COLOR est défini (convention

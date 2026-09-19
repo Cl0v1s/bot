@@ -161,13 +161,19 @@ func main() {
 					log.Printf("mode mail: sandbox %q non configuré (lancez le mode chat au moins une fois pour le mettre en place), run_shell non proposé", sandbox.User)
 				}
 			}
+			gitConfigPath := ""
 			if sandboxReady {
+				if err := sandbox.EnsureGitConfig(cfg.WorkspaceDir); err != nil {
+					log.Printf("mode mail: échec de la préparation de la config git (%s) : %v", cfg.WorkspaceDir, err)
+				}
 				if err := sandbox.GrantDirectory(cfg.WorkspaceDir); err != nil {
 					log.Printf("mode mail: échec de l'ouverture du workspace (%s) au compte %q : %v", cfg.WorkspaceDir, sandbox.User, err)
+				} else {
+					gitConfigPath = sandbox.GitConfigPath(cfg.WorkspaceDir)
 				}
 			}
 			if shellAvailable {
-				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, Sandboxed: sandboxReady, Perms: perms})
+				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
 			}
 
 			opts.Tools = tools.NewRegistry(toolList...)

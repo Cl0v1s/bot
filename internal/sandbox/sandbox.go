@@ -16,7 +16,9 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -49,6 +51,15 @@ func Explain(currentUser string) string {
 // l'effectue. Ne fait rien (et ne demande rien) si Ready() est déjà vrai.
 func Ensure(out io.Writer, confirm func(prompt string) bool) error {
 	if Ready() {
+		// Le sandbox est déjà provisionné, mais CE processus (lancé depuis un
+		// shell qui peut lui-même dater d'avant que l'utilisateur courant ait
+		// rejoint Group) n'a pas forcément Group actif dans ses propres
+		// informations d'identité (voir groupStale) : sans ce contrôle,
+		// GrantDirectory échouerait plus tard avec un chgrp "operation not
+		// permitted" malgré un sandbox par ailleurs correctement configuré.
+		if err := ensureGroupActive(Group); err != nil {
+			return fmt.Errorf("activation du groupe %q pour cette session: %w", Group, err)
+		}
 		return nil
 	}
 
@@ -82,8 +93,44 @@ func Ensure(out io.Writer, confirm func(prompt string) bool) error {
 	if !Ready() {
 		return fmt.Errorf("configuration effectuée mais la vérification a échoué (sudo -n -u %s toujours refusé)", User)
 	}
+
+	// usermod met à jour /etc/group, mais ne rafraîchit pas les groupes déjà
+	// en mémoire des processus en cours — y compris celui-ci, qui vient de
+	// s'y ajouter lui-même. GrantDirectory (chgrp local, sans sudo) échouerait
+	// silencieusement juste après si on ne le corrige pas ici.
+	if err := ensureGroupActive(Group); err != nil {
+		return fmt.Errorf("activation du groupe %q pour cette session: %w", Group, err)
+	}
+
 	fmt.Fprintln(out, "[sandbox] configuration terminée avec succès.")
 	return nil
+}
+
+// groupStale indique si group ne fait pas partie des groupes actifs (au sens
+// du noyau, via getgroups(2)) du processus courant, alors qu'il apparaît
+// déjà dans /etc/group pour l'utilisateur courant. Cas typique : ce
+// processus vient d'ajouter l'utilisateur courant à group (usermod) mais n'a
+// pas relu ses propres informations d'identité depuis — seule une nouvelle
+// session, ou un utilitaire dédié comme "sg", le fait.
+func groupStale(group string) (bool, error) {
+	grp, err := user.LookupGroup(group)
+	if err != nil {
+		return false, fmt.Errorf("groupe %q introuvable: %w", group, err)
+	}
+	gid, err := strconv.Atoi(grp.Gid)
+	if err != nil {
+		return false, fmt.Errorf("gid invalide pour le groupe %q: %w", group, err)
+	}
+	active, err := syscall.Getgroups()
+	if err != nil {
+		return false, fmt.Errorf("lecture des groupes du processus courant: %w", err)
+	}
+	for _, g := range active {
+		if g == gid {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func userExists(name string) bool {

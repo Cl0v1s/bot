@@ -34,6 +34,11 @@ type ShellTool struct {
 	// demandé (RequestAccess), ce qui déclenche en mode chat la même
 	// question interactive que request_directory_access.
 	Perms *DirPermissions
+
+	// GitConfigPath : si non vide (et Sandboxed actif), transmis à
+	// sandbox.WrapCommand pour donner à User une configuration git
+	// "globale" utilisable (voir sandbox.EnsureGitConfig).
+	GitConfigPath string
 }
 
 func (t *ShellTool) Name() string { return "run_shell" }
@@ -107,7 +112,7 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 
 	var cmd *exec.Cmd
 	if t.Sandboxed {
-		cmd = sandbox.WrapCommand(cctx, args.Command)
+		cmd = sandbox.WrapCommand(cctx, args.Command, t.GitConfigPath)
 	} else {
 		cmd = exec.CommandContext(cctx, "sh", "-c", args.Command)
 	}

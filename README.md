@@ -26,6 +26,8 @@ En mode `chat` :
 - `/reset` — vider l'historique de la conversation
 - `/stats` — afficher le nombre de messages et l'estimation de tokens utilisés
 
+Chaque tour (réponse du modèle, y compris ses éventuels appels d'outils) s'exécute en tâche de fond : vous pouvez continuer à taper pendant qu'il tourne. Les lignes tapées pendant ce temps sont mises en file d'attente et traitées automatiquement, dans l'ordre, dès que le tour en cours se termine (commandes `/exit`, `/new`... comprises). Exception : si le modèle demande une confirmation pendant son tour (permission d'accès à un répertoire, mise en place du sandbox), c'est la ligne suivante que vous tapez qui lui répond, pas la file. Un Ctrl+C annule le tour en cours et vide la file d'attente.
+
 ## Gestion du contexte
 
 La taille du contexte est estimée grossièrement (~4 caractères/token). Quand elle atteint la fraction `CONTEXT_COMPACT_AT` (0.9 par défaut) de `LLM_CONTEXT_TOKENS`, les messages les plus anciens sont résumés en un seul message via un appel au LLM, en conservant tels quels les `CONTEXT_KEEP_LAST` derniers messages.

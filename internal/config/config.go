@@ -126,6 +126,18 @@ func getenv(key, fallback string) string {
 	return fallback
 }
 
+// getenvAllowEmpty est comme getenv, mais une variable explicitement définie
+// à vide dans l'environnement (LLM_API_KEY= par exemple) est respectée telle
+// quelle plutôt que de retomber sur fallback : certains serveurs locaux
+// rejettent tout en-tête Authorization non vide (jeton non reconnu), donc il
+// faut pouvoir demander explicitement l'absence de clé.
+func getenvAllowEmpty(key, fallback string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return fallback
+}
+
 // parseList découpe une valeur d'environnement séparée par des virgules en
 // une liste de tokens non vides, en les mettant en minuscules si lower=true
 // (adapté aux adresses mail, pas aux chemins de fichiers sensibles à la casse).
@@ -200,7 +212,7 @@ func Load() Config {
 
 	return Config{
 		LLMBaseURL:   getenv("LLM_BASE_URL", "http://localhost:8080/v1"),
-		LLMAPIKey:    getenv("LLM_API_KEY", "sk-local"),
+		LLMAPIKey:    getenvAllowEmpty("LLM_API_KEY", "sk-local"),
 		LLMModel:     getenv("LLM_MODEL", "local-model"),
 		SystemPrompt: getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
 

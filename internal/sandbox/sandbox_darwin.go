@@ -9,6 +9,22 @@ import (
 	"strings"
 )
 
+// ensureGroupActive s'assure que group est actif pour le processus courant
+// (voir groupStale). macOS n'a pas d'équivalent de "sg" pour activer un
+// groupe fraîchement rejoint sans reconnexion complète ; on le signale
+// clairement plutôt que de laisser échouer GrantDirectory juste après avec
+// un message cryptique.
+func ensureGroupActive(group string) error {
+	stale, err := groupStale(group)
+	if err != nil {
+		return err
+	}
+	if !stale {
+		return nil
+	}
+	return fmt.Errorf("%q vient d'être rejoint mais n'est pas encore actif pour cette session : ouvrez un nouveau terminal (ou déconnectez-vous puis reconnectez-vous), puis relancez le programme", group)
+}
+
 // createSystemUserAndGroup crée le groupe et l'utilisateur système "llm" via
 // dscl (pas de useradd/groupadd sur macOS). L'utilisateur est désactivé
 // (aucun mot de passe possible, AuthenticationAuthority ";DisabledUser;")

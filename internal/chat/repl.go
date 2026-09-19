@@ -41,6 +41,15 @@ type ToolsConfig struct {
 	WorkspaceDir string
 }
 
+// chatLine est le résultat d'une lecture de ligne au clavier, transmis par
+// la goroutine de lecture du terminal (voir plus bas) à la boucle
+// principale. eof=true signale une fin de saisie (Ctrl+D ou erreur de
+// lecture).
+type chatLine struct {
+	text string
+	eof  bool
+}
+
 // Run lance une boucle de lecture-évaluation-affichage sur la console.
 // Commandes spéciales : /exit, /reset, /stats.
 //
@@ -52,14 +61,32 @@ type ToolsConfig struct {
 // question interactive (o/N) à l'utilisateur — le verrouillage est appliqué
 // dans les tools eux-mêmes (internal/tools.DirPermissions), pas par une
 // simple instruction de prompt.
+//
+// Tapez ahead : chaque tour (réponse du modèle, y compris les éventuels
+// appels d'outils) s'exécute en tâche de fond, ce qui permet de continuer à
+// taper pendant qu'il tourne. Une ligne tapée pendant qu'un tour est en
+// cours est soit mise en file d'attente (traitée automatiquement, dans
+// l'ordre, dès que le tour courant se termine), soit — si le modèle demande
+// une confirmation (permission de répertoire, mise en place du sandbox) —
+// utilisée comme réponse à cette confirmation : voir terminalInput. Un seul
+// tour à la fois est jamais exécuté, donc conv (*convo.Conversation) reste
+// toujours accédée séquentiellement, sans verrou dédié. Un Ctrl+C pendant un
+// tour annule ce tour et vide la file d'attente (voir doneCh ci-dessous) :
+// il n'y a pas de façon d'annuler un seul message en file sans tout vider.
 func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, toolsCfg ToolsConfig, in io.Reader, out io.Writer) error {
+	// color est calculé sur la sortie d'origine : colorsEnabled fait un
+	// type-assert vers *os.File, qui échouerait sur le syncWriter ci-dessous.
 	color := colorizer(out)
+	// À partir d'ici, plusieurs goroutines (streaming en tâche de fond, écho
+	// clavier, boucle principale) écrivent potentiellement en parallèle vers
+	// out : on le sérialise pour éviter des écritures entrelacées/coupées.
+	out = &syncWriter{out: out}
 
 	// L'éditeur de ligne (édition + historique haut/bas) n'est activé que
 	// si in est un vrai terminal interactif : sur une entrée redirigée
 	// (pipe, fichier, tests), on garde bufio.Scanner tel quel. readLine()
 	// unifie les deux : c'est la seule façon de lire une ligne dans tout le
-	// reste de la fonction (prompt principal, confirmations o/N...).
+	// reste de la fonction.
 	var editor *lineEditor
 	if f, ok := in.(*os.File); ok && isTerminalFile(f) {
 		if ed, err := newLineEditor(f, out); err == nil {
@@ -74,11 +101,15 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var scanErr error
 
-	readLine := func(prompt string) (string, bool) {
+	// readLine ne reçoit jamais de texte de prompt à afficher : l'affichage
+	// du prompt est découplé de la lecture (voir plus bas, terminalInput) car
+	// une même ligne tapée peut aussi bien répondre à une confirmation
+	// qu'alimenter le prochain message de chat, selon ce qui l'attend au
+	// moment où elle arrive.
+	readLine := func() (string, bool) {
 		if editor != nil {
-			return editor.ReadLine(prompt)
+			return editor.ReadLine("")
 		}
-		fmt.Fprint(out, prompt)
 		if !scanner.Scan() {
 			scanErr = scanner.Err()
 			return "", false
@@ -86,16 +117,22 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		return scanner.Text(), true
 	}
 
-	// askYesNo lit la ligne suivante saisie par l'utilisateur via readLine :
-	// c'est volontaire et sûr, les appels sont toujours séquentiels, jamais
-	// concurrents (agent.Run bloque la boucle principale pendant son tour).
-	// Le prompt est affiché en violet : toute demande d'interaction
-	// utilisateur (permission, confirmation) partage ce même code couleur.
+	// term arbitre, pour chaque ligne tapée, si elle répond à une
+	// confirmation en attente (askYesNo, potentiellement appelée depuis la
+	// tâche de fond d'un tour en cours) ou si elle doit être traitée comme
+	// un message de chat (voir la goroutine de lecture plus bas).
+	term := &terminalInput{}
+
+	// askYesNo affiche prompt puis attend la prochaine ligne tapée comme
+	// réponse, via term : sûr à appeler aussi bien depuis la boucle
+	// principale (confirmations avant le début de la boucle, ex. sandbox)
+	// que depuis la tâche de fond d'un tour en cours (permission de
+	// répertoire demandée par un appel d'outil). Le prompt est affiché en
+	// violet : toute demande d'interaction utilisateur (permission,
+	// confirmation) partage ce même code couleur.
 	askYesNo := func(prompt string) bool {
-		line, ok := readLine(color(ansiMagenta, prompt))
-		if !ok {
-			return false
-		}
+		fmt.Fprint(out, color(ansiMagenta, prompt))
+		line := <-term.Ask()
 		answer := strings.ToLower(strings.TrimSpace(line))
 		return answer == "o" || answer == "oui" || answer == "y" || answer == "yes"
 	}
@@ -137,11 +174,17 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 		// Le workspace du bot est toujours accessible, indépendamment des
 		// accès accordés en direct par l'utilisateur (voir AlwaysAllow).
+		gitConfigPath := ""
 		if toolsCfg.WorkspaceDir != "" {
 			perms.AlwaysAllow(toolsCfg.WorkspaceDir)
 			if sandboxReady {
+				if err := sandbox.EnsureGitConfig(toolsCfg.WorkspaceDir); err != nil {
+					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de la préparation de la config git (%s) : %v", toolsCfg.WorkspaceDir, err)))
+				}
 				if err := sandbox.GrantDirectory(toolsCfg.WorkspaceDir); err != nil {
 					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de l'ouverture du workspace (%s) au compte %q : %v", toolsCfg.WorkspaceDir, sandbox.User, err)))
+				} else {
+					gitConfigPath = sandbox.GitConfigPath(toolsCfg.WorkspaceDir)
 				}
 			}
 		}
@@ -153,7 +196,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.RequestDirectoryAccessTool{Perms: perms},
 		}
 		if shellAvailable {
-			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, Sandboxed: sandboxReady, Perms: perms})
+			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
 		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
@@ -161,7 +204,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}
 
-	prompt := color(ansiBold+ansiCyan, "> ")
+	promptIdle := color(ansiBold+ansiCyan, "> ")
 	errorLine := func(format string, a ...any) {
 		fmt.Fprintln(out, color(ansiRed, fmt.Sprintf(format, a...)))
 	}
@@ -181,25 +224,19 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	defer editor.restore()
 	interrupt := newInterruptController(editor.restore)
 
-	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique.")
-
-	for {
-		rawLine, ok := readLine(prompt)
-		if !ok {
-			break
-		}
-		line := strings.TrimSpace(rawLine)
-		if line == "" {
-			continue
-		}
-
+	// runCommand traite line si c'est une commande spéciale. Retourne
+	// handled=true si line était une commande (à ne donc pas traiter comme
+	// un message de chat), et exit=true si le programme doit se terminer.
+	// N'est appelée que quand aucun tour n'est en cours (conv accédée sans
+	// verrou dédié, voir le commentaire de Run).
+	runCommand := func(line string) (handled, exit bool) {
 		switch line {
 		case "/exit", "/quit":
-			return nil
+			return true, true
 		case "/new", "/reset":
 			conv.Reset()
 			fmt.Fprintln(out, "[historique vidé]")
-			continue
+			return true, false
 		case "/stats":
 			basis := "estimé (~4 car./token)"
 			if conv.TokensAreExact() {
@@ -208,59 +245,189 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				basis = "exact + estimation du dernier message"
 			}
 			fmt.Fprintf(out, "[messages=%d tokens~=%d/%d (%s)]\n", len(conv.Messages), conv.EstimateTokens(), conv.MaxContextTokens, basis)
-			continue
+			return true, false
 		}
+		return false, false
+	}
 
-		conv.AddUser(line)
+	// doneCh signale la fin du tour en cours (succès, erreur, ou annulation
+	// par Ctrl+C — auquel cas la valeur transmise est true). Bufferisé à 1 :
+	// dispatchTurn n'est jamais rappelée avant que la précédente n'ait
+	// signalé sa fin (voir la boucle principale), donc jamais plus d'un
+	// envoi en attente.
+	doneCh := make(chan bool, 1)
 
-		// reqCtx est propre à ce tour : un Ctrl+C pendant son exécution
-		// n'annule que lui (endReq désarme l'annulation dès qu'il se
-		// termine, pour qu'un Ctrl+C ultérieur au prompt quitte le
-		// programme au lieu de casser silencieusement les tours suivants).
-		reqCtx, endReq := interrupt.begin(ctx)
+	// dispatchTurn ajoute line à la conversation et exécute le tour
+	// (réponse du modèle, avec ou sans outils) en tâche de fond, pour ne pas
+	// bloquer la boucle principale : elle reste ainsi libre de continuer à
+	// recevoir des lignes tapées (mise en file d'attente, ou réponse à une
+	// confirmation demandée par un appel d'outil de ce tour). L'appelant
+	// doit s'assurer qu'aucun autre tour n'est déjà en cours.
+	dispatchTurn := func(line string) {
+		go func() {
+			cancelled := false
+			defer func() { doneCh <- cancelled }()
 
-		if !registry.Empty() {
-			reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, func(e agent.Event) {
-				code := ansiYellow // appel d'outil
-				if e.Kind == agent.EventToolResult {
-					code = ansiGreen // résultat d'outil
-					if e.Err != nil {
-						code = ansiRed // résultat en erreur
+			conv.AddUser(line)
+			// reqCtx est propre à ce tour : un Ctrl+C pendant son exécution
+			// n'annule que lui (endReq désarme l'annulation dès qu'il se
+			// termine, pour qu'un Ctrl+C ultérieur au prompt quitte le
+			// programme au lieu de casser silencieusement les tours
+			// suivants).
+			reqCtx, endReq := interrupt.begin(ctx)
+			defer endReq()
+
+			if !registry.Empty() {
+				reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, func(e agent.Event) {
+					code := ansiYellow // appel d'outil
+					if e.Kind == agent.EventToolResult {
+						code = ansiGreen // résultat d'outil
+						if e.Err != nil {
+							code = ansiRed // résultat en erreur
+						}
 					}
+					fmt.Fprint(out, color(code, e.Format()))
+				})
+				if err != nil {
+					cancelled = errors.Is(err, context.Canceled)
+					reqErrorLine(err)
+					return
 				}
-				fmt.Fprint(out, color(code, e.Format()))
+				fmt.Fprintln(out, "\n"+reply)
+				return
+			}
+
+			if compacted, err := conv.CompactIfNeeded(reqCtx, client); err != nil {
+				errorLine("[avertissement: échec de la compaction du contexte: %v]", err)
+			} else if compacted {
+				fmt.Fprintln(out, "[contexte compacté automatiquement]")
+			}
+
+			reply, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), func(delta string) {
+				fmt.Fprint(out, delta)
 			})
-			endReq()
 			if err != nil {
+				cancelled = errors.Is(err, context.Canceled)
 				reqErrorLine(err)
+				return
+			}
+			fmt.Fprintln(out)
+
+			conv.AddAssistant(reply)
+			conv.RecordUsage(usage)
+		}()
+	}
+
+	// dispatchOrHandle traite line comme une commande spéciale si elle en
+	// est une, sinon lance un tour via dispatchTurn. dispatched=true signale
+	// qu'un tour a été lancé (donc que la boucle principale ne doit pas
+	// réafficher le prompt tout de suite : il faut attendre doneCh).
+	dispatchOrHandle := func(line string) (dispatched, exit bool) {
+		if handled, ex := runCommand(line); handled {
+			return false, ex
+		}
+		dispatchTurn(line)
+		return true, false
+	}
+
+	// chatLinesCh reçoit les lignes tapées qui ne répondent pas à une
+	// confirmation en attente (voir term). Bufferisé pour ne jamais bloquer
+	// la goroutine de lecture, y compris si la boucle principale est
+	// momentanément occupée à autre chose (ex. les confirmations affichées
+	// avant même le début de la boucle, plus haut).
+	chatLinesCh := make(chan chatLine, 64)
+	go func() {
+		for {
+			rawLine, ok := readLine()
+			if !ok {
+				// Débloque une éventuelle confirmation en attente (réponse
+				// "non" par défaut, comme le faisait déjà l'ancien
+				// readLine() sur ok=false) avant de signaler la fin de
+				// saisie à la boucle principale.
+				term.Dispatch("")
+				chatLinesCh <- chatLine{eof: true}
+				return
+			}
+			if term.Dispatch(rawLine) {
+				chatLinesCh <- chatLine{text: rawLine}
+			}
+		}
+	}()
+
+	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique.")
+	fmt.Fprint(out, promptIdle)
+
+	var queue []string
+	busy := false
+	eofPending := false
+
+	for {
+		select {
+		case cl := <-chatLinesCh:
+			if cl.eof {
+				eofPending = true
+				if !busy {
+					if scanErr != nil {
+						return scanErr
+					}
+					return nil
+				}
 				continue
 			}
-			fmt.Fprintln(out, "\n"+reply)
-			continue
-		}
+			line := strings.TrimSpace(cl.text)
+			if line == "" {
+				if !busy {
+					fmt.Fprint(out, promptIdle)
+				}
+				continue
+			}
+			if busy {
+				queue = append(queue, line)
+				fmt.Fprintln(out, color(ansiCyan, "  [mis en file d'attente, traité après la réponse en cours]"))
+				continue
+			}
+			dispatched, exit := dispatchOrHandle(line)
+			if exit {
+				return nil
+			}
+			busy = dispatched
+			if !dispatched {
+				fmt.Fprint(out, promptIdle)
+			}
 
-		if compacted, err := conv.CompactIfNeeded(reqCtx, client); err != nil {
-			errorLine("[avertissement: échec de la compaction du contexte: %v]", err)
-		} else if compacted {
-			fmt.Fprintln(out, "[contexte compacté automatiquement]")
+		case cancelled := <-doneCh:
+			busy = false
+			if cancelled && len(queue) > 0 {
+				queue = nil
+				fmt.Fprintln(out, color(ansiYellow, "[file d'attente vidée après annulation]"))
+			}
+			for len(queue) > 0 {
+				next := queue[0]
+				queue = queue[1:]
+				// Le message tapé peut être loin en arrière dans le
+				// défilement du terminal (le tour précédent a pu produire
+				// beaucoup de sortie) : on le rappelle en gris au moment où
+				// son traitement démarre, pour qu'il soit clair lequel des
+				// messages en file est en cours.
+				fmt.Fprintln(out, color(ansiGray, "> "+next))
+				dispatched, exit := dispatchOrHandle(next)
+				if exit {
+					return nil
+				}
+				if dispatched {
+					busy = true
+					break
+				}
+			}
+			if !busy {
+				if eofPending {
+					if scanErr != nil {
+						return scanErr
+					}
+					return nil
+				}
+				fmt.Fprint(out, promptIdle)
+			}
 		}
-
-		reply, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), func(delta string) {
-			fmt.Fprint(out, delta)
-		})
-		endReq()
-		if err != nil {
-			reqErrorLine(err)
-			continue
-		}
-		fmt.Fprintln(out)
-
-		conv.AddAssistant(reply)
-		conv.RecordUsage(usage)
 	}
-
-	if scanErr != nil {
-		return scanErr
-	}
-	return nil
 }
