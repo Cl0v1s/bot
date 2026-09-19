@@ -1,0 +1,31 @@
+# Fichiers Python compilés
+*.pyc
+__pycache__/
+*.pyo
+.Python
+
+# Fichiers de compilation Java
+*.class
+*.jar
+*.war
+*.ear
+
+# Fichiers de compilation C/C++
+*.o
+*.a
+*.so
+*.dll
+
+# Fichiers de compilation Go
+*.exe
+*.bin
+
+# Autres fichiers temporaires ou compilés
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Fichiers secrets
+.env
+bot
