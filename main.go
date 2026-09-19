@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"bot/internal/agent"
 	"bot/internal/chat"
 	"bot/internal/config"
 	"bot/internal/convo"
@@ -51,6 +52,10 @@ func main() {
 	if summary := skills.Summary(loadedSkills); summary != "" {
 		systemPrompt += "\n\n" + summary
 	}
+	// Ajouté systématiquement (indépendant des outils, contrairement à
+	// agent.ToolUsagePrompt qui n'est ajouté que si des outils sont
+	// effectivement proposés) : voir agent.ReflectionPrompt.
+	systemPrompt += "\n\n" + agent.ReflectionPrompt
 
 	client := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
 

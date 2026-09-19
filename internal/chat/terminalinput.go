@@ -42,3 +42,18 @@ func (t *terminalInput) Dispatch(line string) bool {
 	ch <- line
 	return false
 }
+
+// Cancel désenregistre une attente créée par Ask, si elle est toujours
+// active (personne n'y a encore répondu) : utilisé quand l'attente est
+// abandonnée (Ctrl+C) pour que la prochaine ligne tapée soit bien traitée
+// comme un nouveau message de chat, au lieu d'être silencieusement avalée
+// par le canal abandonné. No-op si ch a déjà été consommé ou remplacé par
+// une nouvelle attente (Dispatch a gagné la course, ou un nouvel Ask a déjà
+// eu lieu).
+func (t *terminalInput) Cancel(ch <-chan string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.waiting == ch {
+		t.waiting = nil
+	}
+}

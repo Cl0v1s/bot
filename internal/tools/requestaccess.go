@@ -47,7 +47,7 @@ func (t *RequestDirectoryAccessTool) Call(ctx context.Context, argsJSON string) 
 		return "", fmt.Errorf(`paramètre "directory" requis`)
 	}
 
-	granted, err := t.Perms.RequestAccess(args.Directory, args.Reason)
+	granted, err := t.Perms.RequestAccess(ctx, args.Directory, args.Reason)
 	if err != nil {
 		return "", err
 	}

@@ -125,16 +125,30 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 
 	// askYesNo affiche prompt puis attend la prochaine ligne tapée comme
 	// réponse, via term : sûr à appeler aussi bien depuis la boucle
-	// principale (confirmations avant le début de la boucle, ex. sandbox)
-	// que depuis la tâche de fond d'un tour en cours (permission de
-	// répertoire demandée par un appel d'outil). Le prompt est affiché en
-	// violet : toute demande d'interaction utilisateur (permission,
-	// confirmation) partage ce même code couleur.
-	askYesNo := func(prompt string) bool {
+	// principale (confirmations avant le début de la boucle, ex. sandbox,
+	// avec le ctx de fond de Run — jamais annulé pendant cette fenêtre) que
+	// depuis la tâche de fond d'un tour en cours (permission de répertoire
+	// demandée par un appel d'outil, avec le reqCtx de ce tour). Le prompt
+	// est affiché en violet : toute demande d'interaction utilisateur
+	// (permission, confirmation) partage ce même code couleur.
+	//
+	// Respecte ctx : sans ça, un Ctrl+C pendant l'affichage de cette
+	// question n'aurait aucun effet (annule bien reqCtx, mais la lecture
+	// bloquante de term.Ask() ne s'en aperçoit jamais) — on resterait
+	// bloqué là jusqu'à ce qu'une réponse soit tapée, sans aucun moyen de
+	// s'en sortir au clavier.
+	askYesNo := func(ctx context.Context, prompt string) bool {
 		fmt.Fprint(out, color(ansiMagenta, prompt))
-		line := <-term.Ask()
-		answer := strings.ToLower(strings.TrimSpace(line))
-		return answer == "o" || answer == "oui" || answer == "y" || answer == "yes"
+		ch := term.Ask()
+		select {
+		case line := <-ch:
+			answer := strings.ToLower(strings.TrimSpace(line))
+			return answer == "o" || answer == "oui" || answer == "y" || answer == "yes"
+		case <-ctx.Done():
+			term.Cancel(ch)
+			fmt.Fprintln(out, color(ansiYellow, "\n[demande annulée (Ctrl+C)]"))
+			return false
+		}
 	}
 
 	var registry *tools.Registry
@@ -146,7 +160,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		shellAvailable := !toolsCfg.ShellSandboxEnabled
 		sandboxReady := false
 		if toolsCfg.ShellSandboxEnabled {
-			if err := sandbox.Ensure(out, askYesNo); err != nil {
+			if err := sandbox.Ensure(out, func(prompt string) bool { return askYesNo(ctx, prompt) }); err != nil {
 				fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] indisponible, run_shell ne sera pas proposé cette session : %v", err)))
 			} else {
 				sandboxReady = true
@@ -154,12 +168,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 		}
 
-		perms := tools.NewDirPermissions(func(dir, reason string) (bool, error) {
+		perms := tools.NewDirPermissions(func(ctx context.Context, dir, reason string) (bool, error) {
 			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("\n[permission] le modèle demande l'accès au répertoire : %s", dir)))
 			if reason != "" {
 				fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  raison : %s", reason)))
 			}
-			if !askYesNo("  autoriser ? [o/N] ") {
+			if !askYesNo(ctx, "  autoriser ? [o/N] ") {
 				return false, nil
 			}
 			if sandboxReady {

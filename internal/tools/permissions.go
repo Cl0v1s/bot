@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,13 +18,19 @@ import (
 // demande est automatiquement refusée, et rien n'est jamais ajouté à la
 // liste.
 //
+// ctx est celui de la requête en cours (voir Registry.Call) : une
+// implémentation interactive doit le respecter (ex: abandonner l'attente de
+// réponse si ctx est annulé par un Ctrl+C) plutôt que de bloquer
+// indéfiniment sur une confirmation qui ne viendra jamais — sans quoi
+// Ctrl+C n'a plus aucun effet tant qu'une telle confirmation est affichée.
+//
 // err doit être non nil UNIQUEMENT en cas d'échec technique pendant
 // l'octroi (ex: échec du chgrp vers le groupe du sandbox) — jamais pour un
 // simple refus de l'utilisateur (granted=false, err=nil). Cette distinction
 // est essentielle : un échec technique doit remonter au modèle comme une
 // erreur à comprendre/éventuellement réessayer, pas comme "l'utilisateur a
 // refusé", qui est une tout autre situation.
-type DirGrantFunc func(abs, reason string) (granted bool, err error)
+type DirGrantFunc func(ctx context.Context, abs, reason string) (granted bool, err error)
 
 // DefaultAllowedDirsFile est le chemin (relatif au répertoire de travail du
 // programme) du fichier de persistance partagé entre le mode chat et le
@@ -191,7 +198,7 @@ func (p *DirPermissions) CheckFile(path string) (string, error) {
 // en a un) ; toute demande sans callback disponible (mode mail) est
 // automatiquement refusée, sans jamais toucher à la liste ni au fichier
 // partagé.
-func (p *DirPermissions) RequestAccess(dir, reason string) (bool, error) {
+func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) (bool, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return false, fmt.Errorf("chemin invalide %q: %w", dir, err)
@@ -209,7 +216,7 @@ func (p *DirPermissions) RequestAccess(dir, reason string) (bool, error) {
 		return false, nil
 	}
 
-	granted, grantErr := p.grant(abs, reason)
+	granted, grantErr := p.grant(ctx, abs, reason)
 	if grantErr != nil {
 		// Échec technique (ex: chgrp vers le groupe du sandbox) : distinct
 		// d'un simple refus, remonté comme une vraie erreur au modèle.

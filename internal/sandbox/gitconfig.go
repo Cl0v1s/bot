@@ -13,6 +13,13 @@ import (
 // sandbox — voir GitConfigPath.
 const gitConfigFileName = ".sandbox-gitconfig"
 
+// knownHostsFileName est le nom, à côté de gitConfigFileName, du fichier
+// known_hosts dédié au sandbox : User n'ayant pas de répertoire personnel,
+// il n'a pas de ~/.ssh/known_hosts, et sans ça toute commande git sur un
+// dépôt distant en SSH (github.com, etc.) bloque sur l'invite interactive
+// de vérification de clé d'hôte jusqu'au timeout de run_shell.
+const knownHostsFileName = ".sandbox-known-hosts"
+
 // GitConfigPath retourne le chemin du fichier de config git dédié au
 // sandbox à l'intérieur de dir. À passer à WrapCommand une fois dir accordé
 // à User via GrantDirectory.
@@ -34,6 +41,18 @@ func GitConfigPath(dir string) string {
 //     l'utilisateur courant, s'ils y sont définis, pour que les commits
 //     faits par le LLM aient une identité au lieu d'échouer ("Please tell
 //     me who you are").
+//   - core.sshCommand : pointé vers un known_hosts dédié (voir
+//     knownHostsFileName) avec StrictHostKeyChecking=accept-new, pour que
+//     git sur un dépôt distant en SSH n'attende pas indéfiniment une
+//     confirmation interactive de clé d'hôte (impossible à donner : run_shell
+//     n'a pas de terminal en face). "accept-new" fait confiance à la clé lors
+//     du premier contact avec un hôte donné, mais refuse toujours une clé qui
+//     changerait ensuite pour un hôte déjà connu.
+//
+// Chaque réglage n'est écrit que s'il est absent, pour ne jamais écraser une
+// valeur déjà présente (y compris posée à la main) : appelable sans risque à
+// chaque démarrage, y compris sur un fichier créé par une version antérieure
+// de cette fonction qui n'avait pas encore tel ou tel réglage.
 //
 // Volontairement, ceci ne touche ni à /etc/gitconfig (qui affecterait tous
 // les utilisateurs de la machine) ni ne crée de répertoire personnel pour
@@ -44,30 +63,66 @@ func EnsureGitConfig(dir string) error {
 	if path == "" {
 		return nil
 	}
-	if _, err := os.Stat(path); err == nil {
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("vérification de %q: %w", path, err)
-	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("création de %q: %w", dir, err)
 	}
-
-	if err := exec.Command("git", "config", "--file", path, "--add", "safe.directory", "*").Run(); err != nil {
-		return fmt.Errorf("écriture de safe.directory dans %q: %w", path, err)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
+			return fmt.Errorf("création de %q: %w", path, err)
+		} else {
+			f.Close()
+		}
+	} else if err != nil {
+		return fmt.Errorf("vérification de %q: %w", path, err)
 	}
-	if name := globalGitConfig("user.name"); name != "" {
-		if err := exec.Command("git", "config", "--file", path, "user.name", name).Run(); err != nil {
-			return fmt.Errorf("écriture de user.name dans %q: %w", path, err)
+
+	if gitConfigGet(path, "safe.directory") == "" {
+		if err := exec.Command("git", "config", "--file", path, "--add", "safe.directory", "*").Run(); err != nil {
+			return fmt.Errorf("écriture de safe.directory dans %q: %w", path, err)
 		}
 	}
-	if email := globalGitConfig("user.email"); email != "" {
-		if err := exec.Command("git", "config", "--file", path, "user.email", email).Run(); err != nil {
-			return fmt.Errorf("écriture de user.email dans %q: %w", path, err)
+	if gitConfigGet(path, "user.name") == "" {
+		if name := globalGitConfig("user.name"); name != "" {
+			if err := exec.Command("git", "config", "--file", path, "user.name", name).Run(); err != nil {
+				return fmt.Errorf("écriture de user.name dans %q: %w", path, err)
+			}
+		}
+	}
+	if gitConfigGet(path, "user.email") == "" {
+		if email := globalGitConfig("user.email"); email != "" {
+			if err := exec.Command("git", "config", "--file", path, "user.email", email).Run(); err != nil {
+				return fmt.Errorf("écriture de user.email dans %q: %w", path, err)
+			}
+		}
+	}
+	if gitConfigGet(path, "core.sshCommand") == "" {
+		knownHosts := filepath.Join(dir, knownHostsFileName)
+		if _, err := os.Stat(knownHosts); os.IsNotExist(err) {
+			if f, err := os.OpenFile(knownHosts, os.O_CREATE|os.O_WRONLY, 0o644); err != nil {
+				return fmt.Errorf("création de %q: %w", knownHosts, err)
+			} else {
+				f.Close()
+			}
+		} else if err != nil {
+			return fmt.Errorf("vérification de %q: %w", knownHosts, err)
+		}
+		sshCommand := fmt.Sprintf("ssh -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new", knownHosts)
+		if err := exec.Command("git", "config", "--file", path, "core.sshCommand", sshCommand).Run(); err != nil {
+			return fmt.Errorf("écriture de core.sshCommand dans %q: %w", path, err)
 		}
 	}
 	return nil
+}
+
+// gitConfigGet retourne la valeur de key dans le fichier de config file, ou
+// "" si elle est absente (ou si sa lecture échoue).
+func gitConfigGet(file, key string) string {
+	out, err := exec.Command("git", "config", "--file", file, "--get", key).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func globalGitConfig(key string) string {

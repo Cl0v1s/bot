@@ -34,6 +34,15 @@ func AppendToolUsagePrompt(conv *convo.Conversation) {
 	conv.SystemPrompt = strings.TrimSpace(conv.SystemPrompt + "\n\n" + ToolUsagePrompt)
 }
 
+// ReflectionPrompt pousse le modèle à décomposer une demande non triviale en
+// sous-questions et à chercher activement à les vérifier (via un outil s'il
+// y en a un de pertinent, sinon par un raisonnement explicite) avant de
+// conclure, plutôt que de répondre du tac au tac ou d'inventer un fait.
+// Contrairement à ToolUsagePrompt, ne dépend pas de la présence d'outils :
+// ajouté systématiquement au system prompt (voir main.go), en mode chat
+// comme en mode mail.
+const ReflectionPrompt = `Avant de répondre à une question non triviale ou composée de plusieurs parties, décompose-la mentalement en sous-questions, et pour chacune, identifie si tu en connais déjà la réponse avec certitude ou si tu dois la vérifier. Si un outil disponible peut lever le doute (lire un fichier, exécuter une commande, faire une requête HTTP...), utilise-le avant de conclure, plutôt que de deviner. Si aucun outil ne peut t'aider et qu'une incertitude demeure, dis-le explicitement dans ta réponse plutôt que d'affirmer comme certain un fait non vérifié.`
+
 // EventKind distingue le début d'un appel d'outil de son résultat, pour
 // permettre un affichage en deux temps (utile en mode interactif : on
 // affiche l'appel avant même que le résultat soit connu).

@@ -94,7 +94,7 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 	}
 
 	if t.Perms != nil {
-		granted, err := t.Perms.RequestAccess(workDir, "exécution d'une commande shell (run_shell) dans ce répertoire")
+		granted, err := t.Perms.RequestAccess(ctx, workDir, "exécution d'une commande shell (run_shell) dans ce répertoire")
 		if err != nil {
 			return "", fmt.Errorf("vérification de l'accès à %q: %w", workDir, err)
 		}
@@ -117,6 +117,14 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		cmd = exec.CommandContext(cctx, "sh", "-c", args.Command)
 	}
 	cmd.Dir = workDir
+	// Sans WaitDelay, un timeout ne tue que le process de tête (sh, ou sudo
+	// en mode sandboxé) : si un petit-fils garde stdout/stderr ouverts (job
+	// en arrière-plan, ou — cas sandboxé — l'enfant de sudo qui tourne sous
+	// un autre uid et n'est pas atteint par le kill de sudo), Wait() ne
+	// revient jamais et CombinedOutput() bloque indéfiniment, au-delà du
+	// timeout demandé. WaitDelay force la fermeture des pipes après ce délai
+	// pour que la sortie déjà capturée soit quand même renvoyée.
+	cmd.WaitDelay = 5 * time.Second
 
 	output, runErr := cmd.CombinedOutput()
 
