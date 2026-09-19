@@ -22,6 +22,19 @@ type ShellTool struct {
 	MaxOutputBytes int
 	Dir            string // répertoire de travail, optionnel (défaut: cwd du processus)
 
+	// MaxTimeout : borne supérieure du timeout que le modèle peut demander
+	// via le paramètre "timeout_seconds" (voir ParametersSchema/Call) — sans
+	// plafond, une commande interactive ou bloquante par erreur pourrait
+	// monopoliser le sandbox indéfiniment. <= 0 = valeur par défaut (10 min).
+	MaxTimeout time.Duration
+
+	// NotifyThreshold : au-delà de cette durée réelle d'exécution, une
+	// notification de bureau (voir notify.go) est envoyée à la fin de la
+	// commande — utile pour une commande longue (build, installation...)
+	// lancée pendant qu'on fait autre chose. <= 0 = désactivé (aucune
+	// notification, quelle que soit la durée).
+	NotifyThreshold time.Duration
+
 	// Sandboxed : si vrai, la commande est exécutée sous le compte système
 	// restreint "llm" (internal/sandbox) plutôt que sous l'identité de la
 	// personne qui a lancé le harnais. Ne doit être activé qu'après un
@@ -50,14 +63,19 @@ func (t *ShellTool) Description() string {
 	} else {
 		base += " Accès complet au système : à utiliser avec prudence."
 	}
-	return base + " Les commandes manifestement destructrices (rm -rf/-f, formatage, écriture disque brute, arrêt machine, bombe fork...) sont bloquées avant exécution."
+	base += fmt.Sprintf(
+		" Timeout par défaut %s, ajustable par commande via \"timeout_seconds\" (utile pour une commande normalement longue, ex: build, installation de paquets) jusqu'à %s maximum — au-delà, la commande est interrompue et sa sortie déjà produite est renvoyée.",
+		t.effectiveTimeout(), t.effectiveMaxTimeout(),
+	)
+	return base + " Les commandes manifestement destructrices (rm -rf/-f, formatage, écriture disque brute, arrêt machine, bombe fork...) sont bloquées avant exécution : ne les tente pas, elles échoueront systématiquement — pour supprimer un fichier ou un dossier vide, utilise `rm`/`rmdir` sans -f ni -r plutôt que `rm -f`/`rm -rf`."
 }
 
 func (t *ShellTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"command": {"type": "string", "description": "Commande shell à exécuter, interprétée par sh -c."}
+			"command": {"type": "string", "description": "Commande shell à exécuter, interprétée par sh -c."},
+			"timeout_seconds": {"type": "integer", "description": "Timeout pour cette commande, en secondes. Optionnel : par défaut, timeout standard du tool. Plafonné à une valeur maximale fixée par la configuration.", "minimum": 1}
 		},
 		"required": ["command"],
 		"additionalProperties": false
@@ -65,7 +83,25 @@ func (t *ShellTool) ParametersSchema() json.RawMessage {
 }
 
 type shellArgs struct {
-	Command string `json:"command"`
+	Command        string `json:"command"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+}
+
+// effectiveTimeout retourne t.Timeout, ou 30s par défaut si non configuré.
+func (t *ShellTool) effectiveTimeout() time.Duration {
+	if t.Timeout > 0 {
+		return t.Timeout
+	}
+	return 30 * time.Second
+}
+
+// effectiveMaxTimeout retourne t.MaxTimeout, ou 10 minutes par défaut si non
+// configuré.
+func (t *ShellTool) effectiveMaxTimeout() time.Duration {
+	if t.MaxTimeout > 0 {
+		return t.MaxTimeout
+	}
+	return 10 * time.Minute
 }
 
 func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
@@ -103,9 +139,13 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		}
 	}
 
-	timeout := t.Timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
+	timeout := t.effectiveTimeout()
+	if args.TimeoutSeconds > 0 {
+		requested := time.Duration(args.TimeoutSeconds) * time.Second
+		if max := t.effectiveMaxTimeout(); requested > max {
+			requested = max
+		}
+		timeout = requested
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -126,7 +166,21 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 	// pour que la sortie déjà capturée soit quand même renvoyée.
 	cmd.WaitDelay = 5 * time.Second
 
+	start := time.Now()
 	output, runErr := cmd.CombinedOutput()
+	elapsed := time.Since(start)
+
+	if t.NotifyThreshold > 0 && elapsed >= t.NotifyThreshold {
+		title := "run_shell terminé"
+		switch {
+		case cctx.Err() == context.DeadlineExceeded:
+			title = "run_shell : timeout"
+		case runErr != nil:
+			title = "run_shell : erreur"
+		}
+		body := fmt.Sprintf("%s (%s)", truncateForNotify(args.Command, 100), elapsed.Round(time.Second))
+		go notifyOS(title, body)
+	}
 
 	maxBytes := t.MaxOutputBytes
 	if maxBytes <= 0 {
@@ -149,4 +203,13 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		b.WriteString(fmt.Sprintf("\n[commande terminée avec erreur: %v]", runErr))
 	}
 	return b.String(), nil
+}
+
+// truncateForNotify raccourcit s à max caractères, pour le corps d'une
+// notification de bureau (jamais destinée à afficher une commande complète).
+func truncateForNotify(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }

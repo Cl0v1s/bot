@@ -28,3 +28,17 @@ func ensureGroupTraverse(path string) error {
 	}
 	return nil
 }
+
+// ensureGroupReadable ajoute, via une ACL macOS (chmod +a), le droit de
+// lecture ("read") pour le groupe Group sur path — sans changer son
+// propriétaire ni ses droits existants. Contrairement à ensureGroupTraverse,
+// jamais utilisé sur un répertoire entier : uniquement sur un fichier précis
+// (voir EnsureSSHKeyAccess). Toujours (ré)appliqué, sans vérification
+// préalable : idempotent.
+func ensureGroupReadable(path string) error {
+	out, err := exec.Command("chmod", "+a", "group:"+Group+" allow read", path).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("chmod +a: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+	return nil
+}

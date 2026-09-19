@@ -58,9 +58,30 @@ type Config struct {
 	// lancement et effectuée si besoin, avec confirmation explicite.
 	ShellSandboxEnabled bool
 
+	// SandboxSSHKey : chemin d'une clé privée SSH de l'utilisateur courant,
+	// à laquelle le compte sandbox "llm" reçoit un accès en lecture seule
+	// (voir internal/sandbox.EnsureSSHKeyAccess) pour que les commandes git
+	// exécutées via run_shell (clone/push/pull sur un dépôt distant en SSH)
+	// puissent s'authentifier avec la véritable identité de l'utilisateur.
+	// Affaiblit délibérément l'isolation du sandbox pour ce cas précis : "" =
+	// désactivé (défaut si aucune clé usuelle n'est trouvée). Sans effet si
+	// ShellSandboxEnabled est faux.
+	SandboxSSHKey string
+
 	ToolsShellTimeout time.Duration
-	ToolsHTTPTimeout  time.Duration
-	AgentMaxSteps     int
+	// ToolsShellMaxTimeout : borne supérieure du timeout que le modèle peut
+	// demander pour une commande run_shell précise (voir
+	// internal/tools.ShellTool, paramètre "timeout_seconds") — sans plafond,
+	// une commande interactive ou bloquante par erreur monopoliserait le
+	// sandbox indéfiniment.
+	ToolsShellMaxTimeout time.Duration
+	// ToolsShellNotifyThreshold : durée d'exécution réelle au-delà de
+	// laquelle une commande run_shell déclenche une notification de bureau à
+	// la fin (voir internal/tools.ShellTool.NotifyThreshold, notify.go). <=
+	// 0 = désactivé.
+	ToolsShellNotifyThreshold time.Duration
+	ToolsHTTPTimeout          time.Duration
+	AgentMaxSteps             int
 
 	// WorkspaceDir : répertoire toujours accessible en lecture/écriture pour
 	// read_file/write_file (voir internal/tools.DirPermissions.AlwaysAllow),
@@ -85,6 +106,24 @@ func defaultWorkspaceDir() string {
 		return "bot-workspace"
 	}
 	return filepath.Join(home, "bot-workspace")
+}
+
+// defaultSandboxSSHKey retourne le premier fichier de clé privée SSH usuel
+// trouvé dans ~/.ssh (ordre de préférence : ed25519, ecdsa, rsa), ou "" si
+// aucun n'existe — auquel cas SandboxSSHKey reste désactivé par défaut
+// (aucun changement de comportement pour qui ne s'en sert pas).
+func defaultSandboxSSHKey() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		path := filepath.Join(home, ".ssh", name)
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
+	return ""
 }
 
 // LoadDotEnv lit un fichier .env (KEY=VALUE par ligne) s'il existe et
@@ -201,6 +240,17 @@ func Load() Config {
 	if err != nil || toolsShellTimeout <= 0 {
 		toolsShellTimeout = 30 * time.Second
 	}
+	toolsShellMaxTimeout, err := time.ParseDuration(getenv("TOOLS_SHELL_MAX_TIMEOUT", "10m"))
+	if err != nil || toolsShellMaxTimeout <= 0 {
+		toolsShellMaxTimeout = 10 * time.Minute
+	}
+	// Contrairement aux timeouts ci-dessus, 0 est ici une valeur valide et
+	// intentionnelle (désactive les notifications) : seule une erreur de
+	// parsing retombe sur le défaut, pas une valeur <= 0 explicitement posée.
+	toolsShellNotifyThreshold, err := time.ParseDuration(getenv("TOOLS_SHELL_NOTIFY_THRESHOLD", "20s"))
+	if err != nil {
+		toolsShellNotifyThreshold = 20 * time.Second
+	}
 	toolsHTTPTimeout, err := time.ParseDuration(getenv("TOOLS_HTTP_TIMEOUT", "20s"))
 	if err != nil || toolsHTTPTimeout <= 0 {
 		toolsHTTPTimeout = 20 * time.Second
@@ -243,9 +293,12 @@ func Load() Config {
 		MailToolsEnabled: getenvBool("MAIL_TOOLS_ENABLED", false),
 
 		ShellSandboxEnabled: getenvBool("SHELL_SANDBOX_USER_ENABLED", true),
+		SandboxSSHKey:       getenv("SANDBOX_SSH_KEY", defaultSandboxSSHKey()),
 
-		ToolsShellTimeout: toolsShellTimeout,
-		ToolsHTTPTimeout:  toolsHTTPTimeout,
+		ToolsShellTimeout:    toolsShellTimeout,
+		ToolsShellMaxTimeout:      toolsShellMaxTimeout,
+		ToolsShellNotifyThreshold: toolsShellNotifyThreshold,
+		ToolsHTTPTimeout:     toolsHTTPTimeout,
 		AgentMaxSteps:     agentMaxSteps,
 
 		WorkspaceDir: getenv("WORKSPACE_DIR", defaultWorkspaceDir()),

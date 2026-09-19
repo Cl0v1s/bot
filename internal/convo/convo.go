@@ -84,6 +84,22 @@ func estimateTokens(s string) int {
 	return (len(s)+3)/4 + 4
 }
 
+// messageEstimateTokens estime le coût en tokens d'un message complet, tool
+// calls compris. Un message assistant porteur d'un appel d'outil a
+// typiquement un Content vide (voir llm.Message) : sans compter aussi
+// Function.Arguments, un tel message serait estimé à quasiment 0 token quel
+// que soit le volume réel de ses arguments (ex: un write_file avec un gros
+// contenu, ou plusieurs run_shell), sous-estimant fortement le contexte
+// pendant les tours à base d'outils — précisément ceux les plus susceptibles
+// de le remplir.
+func messageEstimateTokens(m llm.Message) int {
+	total := estimateTokens(m.Content)
+	for _, tc := range m.ToolCalls {
+		total += estimateTokens(tc.Function.Name) + estimateTokens(tc.Function.Arguments)
+	}
+	return total
+}
+
 // EstimateTokens donne la meilleure estimation disponible du nombre de
 // tokens de la conversation complète (system prompt inclus). Si un usage
 // réel a été enregistré via RecordUsage, il sert de base exacte à laquelle
@@ -94,7 +110,7 @@ func (c *Conversation) EstimateTokens() int {
 	if c.LastKnownTokens > 0 && c.LastKnownMessageCount <= len(c.Messages) {
 		total := c.LastKnownTokens
 		for _, m := range c.Messages[c.LastKnownMessageCount:] {
-			total += estimateTokens(m.Content)
+			total += messageEstimateTokens(m)
 		}
 		return total
 	}
@@ -104,7 +120,7 @@ func (c *Conversation) EstimateTokens() int {
 		total += estimateTokens(c.SystemPrompt)
 	}
 	for _, m := range c.Messages {
-		total += estimateTokens(m.Content)
+		total += messageEstimateTokens(m)
 	}
 	return total
 }
@@ -145,8 +161,28 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 		return false, nil
 	}
 
-	toSummarize := c.Messages[:len(c.Messages)-keep]
-	kept := append([]llm.Message(nil), c.Messages[len(c.Messages)-keep:]...)
+	cut := len(c.Messages) - keep
+	// Ne jamais couper au milieu d'un groupe [message assistant à tool_calls
+	// + ses résultats d'outils] : côté API, un message role="tool" ne peut
+	// apparaître qu'immédiatement après le message assistant qui l'a
+	// demandé. Couper pile à la limite de keep, sans égard pour cette
+	// structure, produit soit un message assistant à tool_calls sans ses
+	// résultats en fin de résumé (rejeté par le serveur : "Cannot continue
+	// an assistant message that contains tool calls"), soit, symétriquement,
+	// un message "tool" orphelin en tête de l'historique conservé — les deux
+	// cassent le tour suivant. On recule donc jusqu'à un point de coupure
+	// sûr (jamais sur un message "tool").
+	for cut > 0 && cut < len(c.Messages) && c.Messages[cut].Role == "tool" {
+		cut--
+	}
+	if cut <= 0 {
+		// Tout ce qui précédait le point visé fait partie d'un même groupe
+		// tool_calls : rien à résumer sans casser ce groupe.
+		return false, nil
+	}
+
+	toSummarize := c.Messages[:cut]
+	kept := append([]llm.Message(nil), c.Messages[cut:]...)
 
 	summarizeReq := make([]llm.Message, 0, len(toSummarize)+1)
 	summarizeReq = append(summarizeReq, llm.Message{Role: "system", Content: summarizeSystemPrompt})

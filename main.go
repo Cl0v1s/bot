@@ -73,10 +73,13 @@ func main() {
 			Enabled:             cfg.ChatToolsEnabled,
 			AllowedDirsFile:     allowedDirsFile,
 			ShellSandboxEnabled: cfg.ShellSandboxEnabled,
-			ShellTimeout:        cfg.ToolsShellTimeout,
-			HTTPTimeout:         cfg.ToolsHTTPTimeout,
+			ShellTimeout:         cfg.ToolsShellTimeout,
+			ShellMaxTimeout:      cfg.ToolsShellMaxTimeout,
+			ShellNotifyThreshold: cfg.ToolsShellNotifyThreshold,
+			HTTPTimeout:          cfg.ToolsHTTPTimeout,
 			MaxSteps:            cfg.AgentMaxSteps,
 			WorkspaceDir:        cfg.WorkspaceDir,
+			SandboxSSHKey:       cfg.SandboxSSHKey,
 		}
 		// Pas de contexte dérivé d'un signal ici : chat.Run gère lui-même
 		// Ctrl+C/SIGTERM (annulation de la requête en cours si une requête
@@ -168,7 +171,12 @@ func main() {
 			}
 			gitConfigPath := ""
 			if sandboxReady {
-				if err := sandbox.EnsureGitConfig(cfg.WorkspaceDir); err != nil {
+				if cfg.SandboxSSHKey != "" {
+					if err := sandbox.EnsureSSHKeyAccess(cfg.SandboxSSHKey); err != nil {
+						log.Printf("mode mail: échec de l'octroi d'accès à la clé SSH (%s) : %v", cfg.SandboxSSHKey, err)
+					}
+				}
+				if err := sandbox.EnsureGitConfig(cfg.WorkspaceDir, cfg.SandboxSSHKey); err != nil {
 					log.Printf("mode mail: échec de la préparation de la config git (%s) : %v", cfg.WorkspaceDir, err)
 				}
 				if err := sandbox.GrantDirectory(cfg.WorkspaceDir); err != nil {
@@ -178,7 +186,7 @@ func main() {
 				}
 			}
 			if shellAvailable {
-				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
+				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, NotifyThreshold: cfg.ToolsShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
 			}
 
 			opts.Tools = tools.NewRegistry(toolList...)

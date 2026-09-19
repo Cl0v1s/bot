@@ -19,6 +19,14 @@ type Message struct {
 	Content    string     `json:"content,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"` // pour role="tool" : lie le résultat à l'appel
+
+	// ReasoningContent : raisonnement du modèle avant sa réponse/ses
+	// tool_calls (convention "reasoning_content" exposée par llama.cpp/vLLM
+	// pour les modèles à raisonnement, ex: DeepSeek-R1, QwQ, Qwen en mode
+	// "thinking"). Jamais envoyé dans une requête (un tour précédent ne
+	// renvoie pas son propre raisonnement au modèle) : uniquement lu depuis
+	// une réponse, pour affichage — voir agent.EventReasoning.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // Tool décrit une fonction proposée au LLM (format OpenAI "function tool").

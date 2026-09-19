@@ -51,6 +51,13 @@ type EventKind int
 const (
 	EventToolCall EventKind = iota
 	EventToolResult
+	// EventReasoning : commentaire du modèle avant d'appeler un ou plusieurs
+	// outils (ReasoningContent s'il est fourni par le serveur, sinon Content
+	// si le modèle a simplement écrit du texte avant ses tool_calls) — sans
+	// ça, ce texte est silencieusement conservé dans l'historique
+	// (conv.AppendRaw) mais jamais montré : seuls les tool_calls et leurs
+	// résultats étaient visibles en mode interactif, pas ce qui les motive.
+	EventReasoning
 )
 
 type Event struct {
@@ -69,6 +76,11 @@ type Event struct {
 func (e Event) Format() string {
 	var b strings.Builder
 	switch e.Kind {
+	case EventReasoning:
+		b.WriteString("\n┄ réflexion\n")
+		for _, line := range strings.Split(strings.TrimRight(truncateForDisplay(e.Result, 4000), "\n"), "\n") {
+			fmt.Fprintf(&b, "┆ %s\n", line)
+		}
 	case EventToolCall:
 		fmt.Fprintf(&b, "\n╭─ outil › %s\n", e.Tool)
 		fmt.Fprintf(&b, "│ args: %s\n", compactJSON(e.Args))
@@ -124,13 +136,35 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		}
 		lastUsage = usage
 
+		// Enregistré immédiatement après cet AppendRaw (avant d'ajouter les
+		// résultats d'outils ci-dessous, dont le coût réel n'est pas encore
+		// connu) : usage correspond exactement à l'historique jusqu'à ce
+		// message assistant inclus. Fait à chaque étape, pas seulement à la
+		// dernière (sans tool_calls) — sinon, pendant un tour à plusieurs
+		// étapes d'outils, l'estimation de contexte reste basée sur l'usage
+		// réel du tour précédent (potentiellement très périmé) pour toute la
+		// durée de celui-ci, au moment même où le contexte se remplit le
+		// plus vite.
+		conv.AppendRaw(msg)
+		conv.RecordUsage(usage)
+
 		if len(msg.ToolCalls) == 0 {
-			conv.AppendRaw(msg)
-			conv.RecordUsage(usage)
 			return msg.Content, usage, nil
 		}
 
-		conv.AppendRaw(msg)
+		// Le modèle a motivé ses appels d'outils (reasoning_content si le
+		// serveur le distingue, sinon le Content écrit à côté des
+		// tool_calls) : à afficher avant ceux-ci plutôt qu'à le laisser
+		// invisible dans l'historique.
+		if onEvent != nil {
+			note := strings.TrimSpace(msg.ReasoningContent)
+			if note == "" {
+				note = strings.TrimSpace(msg.Content)
+			}
+			if note != "" {
+				onEvent(Event{Kind: EventReasoning, Result: note})
+			}
+		}
 
 		for _, tc := range msg.ToolCalls {
 			if onEvent != nil {

@@ -33,12 +33,23 @@ type ToolsConfig struct {
 	// confirmation) à chaque lancement.
 	ShellSandboxEnabled bool
 	ShellTimeout        time.Duration
-	HTTPTimeout         time.Duration
-	MaxSteps            int
+	// ShellMaxTimeout : borne supérieure du timeout que le modèle peut
+	// demander pour une commande run_shell précise (voir
+	// tools.ShellTool.MaxTimeout).
+	ShellMaxTimeout time.Duration
+	// ShellNotifyThreshold : voir tools.ShellTool.NotifyThreshold.
+	ShellNotifyThreshold time.Duration
+	HTTPTimeout          time.Duration
+	MaxSteps             int
 	// WorkspaceDir : répertoire toujours accessible en lecture/écriture pour
 	// read_file/write_file (voir tools.DirPermissions.AlwaysAllow), sans
 	// passer par request_directory_access.
 	WorkspaceDir string
+	// SandboxSSHKey : chemin d'une clé privée SSH de l'utilisateur réel,
+	// rendue lisible par le compte sandbox pour que git (via run_shell)
+	// puisse s'authentifier sur un dépôt distant — voir
+	// config.SandboxSSHKey et sandbox.EnsureSSHKeyAccess. "" = désactivé.
+	SandboxSSHKey string
 }
 
 // chatLine est le résultat d'une lecture de ligne au clavier, transmis par
@@ -192,7 +203,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		if toolsCfg.WorkspaceDir != "" {
 			perms.AlwaysAllow(toolsCfg.WorkspaceDir)
 			if sandboxReady {
-				if err := sandbox.EnsureGitConfig(toolsCfg.WorkspaceDir); err != nil {
+				if toolsCfg.SandboxSSHKey != "" {
+					if err := sandbox.EnsureSSHKeyAccess(toolsCfg.SandboxSSHKey); err != nil {
+						fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de l'octroi d'accès à la clé SSH (%s) : %v", toolsCfg.SandboxSSHKey, err)))
+					}
+				}
+				if err := sandbox.EnsureGitConfig(toolsCfg.WorkspaceDir, toolsCfg.SandboxSSHKey); err != nil {
 					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de la préparation de la config git (%s) : %v", toolsCfg.WorkspaceDir, err)))
 				}
 				if err := sandbox.GrantDirectory(toolsCfg.WorkspaceDir); err != nil {
@@ -210,7 +226,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.RequestDirectoryAccessTool{Perms: perms},
 		}
 		if shellAvailable {
-			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
+			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
 		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
@@ -294,7 +310,10 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			if !registry.Empty() {
 				reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, func(e agent.Event) {
 					code := ansiYellow // appel d'outil
-					if e.Kind == agent.EventToolResult {
+					switch {
+					case e.Kind == agent.EventReasoning:
+						code = ansiGray // commentaire du modèle avant ses tool_calls
+					case e.Kind == agent.EventToolResult:
 						code = ansiGreen // résultat d'outil
 						if e.Err != nil {
 							code = ansiRed // résultat en erreur

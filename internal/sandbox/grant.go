@@ -7,6 +7,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"syscall"
 )
 
 // GrantDirectory change le GROUPE de dir et de tout son contenu vers Group
@@ -20,6 +21,17 @@ import (
 // utilisé, uid=-1 signifiant explicitement "ne pas changer". Ne nécessite
 // aucun privilège particulier tant que l'appelant est déjà propriétaire de
 // ces fichiers et membre du groupe Group (mis en place par Ensure).
+//
+// Un fichier déjà possédé par quelqu'un d'autre est ignoré (ni chgrp ni
+// chmod), plutôt que de faire échouer tout l'appel : chgrp/chmod exigent
+// d'être propriétaire du fichier (ou root), donc impossibles à appliquer
+// sans privilège particulier — mais aussi inutiles, son propriétaire ayant
+// déjà pleinement accès. Cas concret : une fois dir accordé, User lui-même
+// (voir WrapCommand) peut y avoir écrit des fichiers via run_shell, qui lui
+// appartiennent alors en propre. Sans ce contournement, un seul tel fichier
+// interromprait tout le parcours (filepath.WalkDir s'arrête à la première
+// erreur) et laisserait le reste de l'arborescence — tout ce qui vient
+// après, dans l'ordre de parcours — sans les droits nécessaires pour User.
 func GrantDirectory(dir string) error {
 	grp, err := user.LookupGroup(Group)
 	if err != nil {
@@ -50,14 +62,19 @@ func GrantDirectory(dir string) error {
 		if err != nil {
 			return err
 		}
-		if err := os.Chown(path, -1, gid); err != nil {
-			return fmt.Errorf("changement de groupe de %q: %w", path, err)
-		}
 
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+			return nil
+		}
+
+		if err := os.Chown(path, -1, gid); err != nil {
+			return fmt.Errorf("changement de groupe de %q: %w", path, err)
+		}
+
 		mode := info.Mode().Perm()
 		if d.IsDir() {
 			mode |= 0o070 // rwx pour le groupe

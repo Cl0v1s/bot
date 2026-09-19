@@ -47,18 +47,25 @@ func GitConfigPath(dir string) string {
 //     confirmation interactive de clé d'hôte (impossible à donner : run_shell
 //     n'a pas de terminal en face). "accept-new" fait confiance à la clé lors
 //     du premier contact avec un hôte donné, mais refuse toujours une clé qui
-//     changerait ensuite pour un hôte déjà connu.
+//     changerait ensuite pour un hôte déjà connu. Si sshKeyPath est non vide,
+//     y ajoute "-i sshKeyPath -o IdentitiesOnly=yes" pour que git s'authentifie
+//     avec cette clé (celle de l'utilisateur réel, voir EnsureSSHKeyAccess,
+//     à appeler séparément pour que User puisse effectivement la lire) plutôt
+//     que d'échouer faute d'identité (User n'a pas de ~/.ssh à lui).
 //
 // Chaque réglage n'est écrit que s'il est absent, pour ne jamais écraser une
 // valeur déjà présente (y compris posée à la main) : appelable sans risque à
 // chaque démarrage, y compris sur un fichier créé par une version antérieure
-// de cette fonction qui n'avait pas encore tel ou tel réglage.
+// de cette fonction qui n'avait pas encore tel ou tel réglage. Corollaire :
+// activer SandboxSSHKey après coup, sur un workspace où ce fichier existe déjà
+// avec un core.sshCommand sans "-i", ne le met pas à jour automatiquement —
+// supprimer la ligne (ou le fichier) à la main pour la faire régénérer.
 //
 // Volontairement, ceci ne touche ni à /etc/gitconfig (qui affecterait tous
 // les utilisateurs de la machine) ni ne crée de répertoire personnel pour
 // User : dir doit déjà être un répertoire accordé à User (voir
 // GrantDirectory), qui couvre alors aussi ce fichier.
-func EnsureGitConfig(dir string) error {
+func EnsureGitConfig(dir string, sshKeyPath string) error {
 	path := GitConfigPath(dir)
 	if path == "" {
 		return nil
@@ -108,6 +115,9 @@ func EnsureGitConfig(dir string) error {
 			return fmt.Errorf("vérification de %q: %w", knownHosts, err)
 		}
 		sshCommand := fmt.Sprintf("ssh -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new", knownHosts)
+		if sshKeyPath != "" {
+			sshCommand += fmt.Sprintf(" -i %s -o IdentitiesOnly=yes", sshKeyPath)
+		}
 		if err := exec.Command("git", "config", "--file", path, "core.sshCommand", sshCommand).Run(); err != nil {
 			return fmt.Errorf("écriture de core.sshCommand dans %q: %w", path, err)
 		}

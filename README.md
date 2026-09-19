@@ -76,6 +76,14 @@ Si le sandbox est demandé (`SHELL_SANDBOX_USER_ENABLED=true`) mais que sa confi
 
 Nécessite macOS ou Linux (pas testé sur d'autres plateformes).
 
+#### Git / SSH sous le sandbox
+
+Le compte `llm` n'a pas de répertoire personnel : sans configuration, `git` y échoue ("dubious ownership", "Please tell me who you are") et toute commande git sur un dépôt distant en SSH bloque en attendant une confirmation de clé d'hôte impossible à donner. Au premier octroi du workspace au sandbox, le programme crée automatiquement `<workspace>/.sandbox-gitconfig` (identité recopiée depuis votre config git `--global`, `safe.directory=*`, `known_hosts` dédié en `StrictHostKeyChecking=accept-new`) et le pointe via `GIT_CONFIG_GLOBAL`.
+
+Par défaut, `llm` n'a toujours **aucune clé SSH** : un `git push`/`pull` distant échoue avec `Permission denied (publickey)`. `SANDBOX_SSH_KEY` (chemin d'une clé privée SSH de l'utilisateur courant) donne à `llm` un accès en **lecture seule** à cette clé précise (ACL, `setfacl`/`chmod +a` — jamais de `chown`, jamais de copie de la clé), et l'utilise via `core.sshCommand -i`. **Implication de sécurité assumée** : le LLM peut alors s'authentifier en SSH avec la véritable identité de l'utilisateur (git push vers ses dépôts, etc.) — le sandbox n'isole plus les opérations SSH/git comme il isole le reste. Vide (défaut si aucune clé usuelle n'est trouvée dans `~/.ssh`) = comportement précédent, `run_shell` sous sandbox ne peut pas s'authentifier en SSH.
+
+Ce fichier n'est jamais réécrit une fois créé (y compris s'il a été édité à la main) : pour appliquer `SANDBOX_SSH_KEY` sur un workspace déjà initialisé sans cette option, supprimez `<workspace>/.sandbox-gitconfig` pour le faire régénérer.
+
 ## Workspace et skills
 
 Au démarrage, le bot crée (si besoin) un répertoire **workspace**, `WORKSPACE_DIR` (défaut `~/bot-workspace`), et son sous-répertoire `skills/`. Ce dernier contient toujours d'office une skill `creer-une-skill` (recréée si absente, jamais si elle existe déjà) qui explique au modèle lui-même le format ci-dessous, pour qu'il puisse déclarer de nouvelles skills sans documentation externe.
