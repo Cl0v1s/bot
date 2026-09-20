@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"bot/internal/llm"
@@ -95,6 +96,20 @@ func decodeArgs(argsJSON string, dst any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return fmt.Errorf("arguments invalides: %w", err)
+	}
+	return nil
+}
+
+// requireAbsolutePath retourne une erreur si path n'est pas un chemin
+// absolu. Les tools fichiers (read_file, write_file, list_dir,
+// request_directory_access) n'acceptent jamais de chemin relatif : un
+// chemin relatif serait résolu contre le répertoire de travail du
+// processus, qui n'est ni garanti ni connu du modèle, source d'ambiguïté et
+// d'erreurs (ex: accès au mauvais fichier) plutôt que d'un simple refus
+// explicite.
+func requireAbsolutePath(paramName, path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("paramètre %q invalide : %q n'est pas un chemin absolu (les chemins relatifs ne sont pas acceptés)", paramName, path)
 	}
 	return nil
 }

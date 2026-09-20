@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"bot/internal/sandbox"
@@ -52,6 +54,13 @@ type ShellTool struct {
 	// sandbox.WrapCommand pour donner à User une configuration git
 	// "globale" utilisable (voir sandbox.EnsureGitConfig).
 	GitConfigPath string
+
+	// HomeDir : si non vide (et Sandboxed actif), transmis à
+	// sandbox.WrapCommand comme HOME pour la commande — User n'ayant pas de
+	// répertoire personnel réel, tout outil qui a besoin d'y écrire une
+	// config/un cache (ex: `glab auth login`) échoue sinon (voir
+	// sandbox.SandboxHomeDir).
+	HomeDir string
 }
 
 func (t *ShellTool) Name() string { return "run_shell" }
@@ -139,6 +148,22 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		}
 	}
 
+	if t.Sandboxed {
+		// Resynchronise avant chaque exécution, pas seulement une fois au
+		// moment de l'octroi initial : un fichier créé ou modifié depuis en
+		// dehors du harnais (édition manuelle, git pull/checkout lancé hors
+		// de run_shell, etc. — write_file, lui, se resynchronise déjà après
+		// coup à chaque appel, voir son commentaire) garde les droits
+		// classiques de l'utilisateur réel (souvent non accessibles en
+		// écriture au groupe), invisibles pour le compte sandbox tant que
+		// personne ne relance GrantDirectory. Best-effort : un échec ici ne
+		// doit pas empêcher la commande de s'exécuter (elle échouera d'elle-
+		// même si l'accès manque réellement, avec une erreur normale).
+		if err := sandbox.GrantDirectory(workDir); err != nil {
+			log.Printf("run_shell: échec de la resynchronisation sandbox de %q: %v", workDir, err)
+		}
+	}
+
 	timeout := t.effectiveTimeout()
 	if args.TimeoutSeconds > 0 {
 		requested := time.Duration(args.TimeoutSeconds) * time.Second
@@ -152,11 +177,23 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 
 	var cmd *exec.Cmd
 	if t.Sandboxed {
-		cmd = sandbox.WrapCommand(cctx, args.Command, t.GitConfigPath)
+		cmd = sandbox.WrapCommand(cctx, args.Command, t.GitConfigPath, t.HomeDir)
 	} else {
 		cmd = exec.CommandContext(cctx, "sh", "-c", args.Command)
 	}
 	cmd.Dir = workDir
+	// Détache la commande du terminal de contrôle (nouvelle session) : sans
+	// ça, une commande qui ouvre /dev/tty directement (un outil interactif
+	// ignorant sciemment que son entrée standard est /dev/null — vim, less,
+	// top, ssh...) peut passer le terminal en mode brut/sans echo pour sa
+	// propre interface, et l'y laisser si elle ne se termine pas proprement
+	// au timeout — en particulier en mode sandboxé, où tuer le "sudo" de
+	// tête ne tue pas nécessairement l'enfant qui tourne sous l'autre uid
+	// (voir le commentaire de WaitDelay ci-dessous) : ce petit-fils peut
+	// alors survivre au bot lui-même, terminal cassé y compris après avoir
+	// quitté. Après setsid, /dev/tty n'a plus de terminal de contrôle à
+	// ouvrir : impossible d'atteindre le nôtre, orpheline ou non.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	// Sans WaitDelay, un timeout ne tue que le process de tête (sh, ou sudo
 	// en mode sandboxé) : si un petit-fils garde stdout/stderr ouverts (job
 	// en arrière-plan, ou — cas sandboxé — l'enfant de sudo qui tourne sous

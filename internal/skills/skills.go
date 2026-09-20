@@ -1,8 +1,12 @@
 // Package skills charge les skills déclarées par l'utilisateur dans le
 // sous-répertoire "skills" du workspace du bot (voir
-// internal/config.Config.SkillsDir). Une skill est un fichier Markdown
-// (directement dans le répertoire, ou nommé SKILL.md dans un
-// sous-répertoire dédié) avec un en-tête optionnel délimité par "---" :
+// internal/config.Config.SkillsDir). Une skill est TOUJOURS un
+// sous-répertoire dédié contenant un fichier SKILL.md (jamais un fichier
+// Markdown directement dans "skills/") — pratique pour regrouper une skill
+// avec d'éventuels fichiers annexes (exemples, scripts...) dans son propre
+// répertoire dès le départ, plutôt que de devoir migrer un fichier plat le
+// jour où elle en a besoin. Ce fichier a un en-tête optionnel délimité par
+// "---" :
 //
 //	---
 //	name: nom-de-la-skill
@@ -32,10 +36,10 @@ type Skill struct {
 	Path        string // chemin absolu du fichier Markdown, à lire via read_file pour les instructions complètes
 }
 
-// defaultSkillFile est la skill fournie d'office dans le workspace (voir
-// EnsureDefaults) : elle explique au modèle lui-même comment déclarer de
-// nouvelles skills dans ce même répertoire.
-const defaultSkillFile = "creer-une-skill.md"
+// defaultSkillDir est le sous-répertoire de la skill fournie d'office dans
+// le workspace (voir EnsureDefaults) : elle explique au modèle lui-même
+// comment déclarer de nouvelles skills dans ce même répertoire.
+const defaultSkillDir = "creer-une-skill"
 
 const defaultSkillContent = `---
 name: creer-une-skill
@@ -43,8 +47,13 @@ description: Explique comment déclarer une nouvelle skill dans ce workspace (fo
 ---
 # Créer une skill
 
-Une skill est un fichier Markdown placé dans ce répertoire ("skills/"), avec
-un en-tête optionnel délimité par des lignes "---" :
+Une skill est TOUJOURS un sous-répertoire dédié de ce répertoire ("skills/")
+contenant un fichier "SKILL.md", avec un en-tête optionnel délimité par des
+lignes "---" :
+
+` + "```" + `
+skills/nom-de-la-skill/SKILL.md
+` + "```" + `
 
 ` + "```" + `
 ---
@@ -55,10 +64,8 @@ Instructions détaillées pour le modèle : étapes à suivre, exemples,
 contraintes...
 ` + "```" + `
 
-Deux emplacements possibles :
-- directement "skills/nom-de-la-skill.md" ;
-- ou "skills/nom-de-la-skill/SKILL.md", si la skill a besoin de fichiers
-  annexes rangés dans son propre sous-répertoire.
+Le sous-répertoire dédié permet aussi d'y ranger, si besoin, des fichiers
+annexes (exemples, scripts...) aux côtés de SKILL.md.
 
 Règles :
 - "name" et "description" sont chargés au démarrage du bot et ajoutés au
@@ -69,9 +76,8 @@ Règles :
   read_file sur le chemin indiqué : les instructions détaillées peuvent donc
   être aussi longues que nécessaire, elles ne polluent pas le contexte par
   défaut.
-- Sans en-tête, le nom du fichier (ou du sous-répertoire) sert de nom, et la
-  description reste vide — toujours préférable de renseigner les deux
-  explicitement.
+- Sans en-tête, le nom du sous-répertoire sert de nom, et la description
+  reste vide — toujours préférable de renseigner les deux explicitement.
 - Illustre toujours les instructions par des exemples concrets (une commande
   exacte plutôt qu'une description vague, un extrait avant/après...) : une
   skill qui ne fait qu'expliquer en abstrait est plus difficile à appliquer
@@ -128,25 +134,31 @@ revient avec « motif dangereux détecté », propose une alternative plutôt qu
 de la reformuler pour contourner le filtre.
 `
 
-// EnsureDefaults crée, si absente, la skill "creer-une-skill" dans dir (voir
-// defaultSkillContent) : le dossier skills/ du workspace contient toujours
-// d'office cette meta-skill expliquant comment en déclarer de nouvelles.
-// N'écrase jamais un fichier déjà présent à ce chemin (y compris modifié ou
-// vidé par l'utilisateur) : seule son absence déclenche la (re)création.
+// EnsureDefaults crée, si absent, le sous-répertoire de la skill
+// "creer-une-skill" dans dir (voir defaultSkillContent) : le dossier
+// "skills/" du workspace contient toujours d'office cette meta-skill
+// expliquant comment en déclarer de nouvelles. N'écrase jamais un fichier
+// SKILL.md déjà présent à ce chemin (y compris modifié ou vidé par
+// l'utilisateur) : seule son absence déclenche la (re)création.
 func EnsureDefaults(dir string) error {
-	path := filepath.Join(dir, defaultSkillFile)
+	skillDir := filepath.Join(dir, defaultSkillDir)
+	path := filepath.Join(skillDir, "SKILL.md")
 	if _, err := os.Stat(path); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		return err
+	}
 	return os.WriteFile(path, []byte(defaultSkillContent), 0o644)
 }
 
-// Load scans dir à la recherche de skills : chaque fichier "*.md" trouvé
-// directement dans dir, ou dans un sous-répertoire immédiat sous la forme
-// "<sous-répertoire>/SKILL.md". Un dir absent n'est pas une erreur (aucune
-// skill déclarée).
+// Load scans dir à la recherche de skills : chaque sous-répertoire immédiat
+// contenant un fichier "SKILL.md". Une skill est toujours dans son propre
+// sous-répertoire (jamais un fichier Markdown directement dans dir, voir le
+// commentaire de package). Un dir absent n'est pas une erreur (aucune skill
+// déclarée).
 func Load(dir string) ([]Skill, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -158,21 +170,15 @@ func Load(dir string) ([]Skill, error) {
 
 	var out []Skill
 	for _, e := range entries {
-		var path string
-		switch {
-		case !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".md"):
-			path = filepath.Join(dir, e.Name())
-		case e.IsDir():
-			candidate := filepath.Join(dir, e.Name(), "SKILL.md")
-			if _, err := os.Stat(candidate); err != nil {
-				continue
-			}
-			path = candidate
-		default:
+		if !e.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(dir, e.Name(), "SKILL.md")
+		if _, err := os.Stat(candidate); err != nil {
 			continue
 		}
 
-		abs, err := filepath.Abs(path)
+		abs, err := filepath.Abs(candidate)
 		if err != nil {
 			continue
 		}
@@ -187,18 +193,13 @@ func Load(dir string) ([]Skill, error) {
 	return out, nil
 }
 
-// parseSkillFile lit l'en-tête "name"/"description" d'un fichier de skill.
-// À défaut d'en-tête, le nom du fichier (sans extension) sert de nom, et la
-// description reste vide.
+// parseSkillFile lit l'en-tête "name"/"description" d'un fichier SKILL.md.
+// Le nom du sous-répertoire qui le contient sert de nom par défaut ; à
+// défaut d'en-tête, la description reste vide.
 func parseSkillFile(path string) (Skill, error) {
 	s := Skill{
-		Name: strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		Name: filepath.Base(filepath.Dir(path)),
 		Path: path,
-	}
-	// Une skill sous forme de sous-répertoire (.../<nom>/SKILL.md) prend le
-	// nom de son répertoire plutôt que "SKILL".
-	if strings.EqualFold(filepath.Base(path), "SKILL.md") {
-		s.Name = filepath.Base(filepath.Dir(path))
 	}
 
 	f, err := os.Open(path)

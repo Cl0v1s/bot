@@ -43,6 +43,46 @@ func AppendToolUsagePrompt(conv *convo.Conversation) {
 // comme en mode mail.
 const ReflectionPrompt = `Avant de répondre à une question non triviale ou composée de plusieurs parties, décompose-la mentalement en sous-questions, et pour chacune, identifie si tu en connais déjà la réponse avec certitude ou si tu dois la vérifier. Si un outil disponible peut lever le doute (lire un fichier, exécuter une commande, faire une requête HTTP...), utilise-le avant de conclure, plutôt que de deviner. Si aucun outil ne peut t'aider et qu'une incertitude demeure, dis-le explicitement dans ta réponse plutôt que d'affirmer comme certain un fait non vérifié.`
 
+// WorkspacePrompt décrit l'architecture du workspace persistant du modèle
+// (workspaceDir), pour qu'il sache où écrire quoi : skillsDir (déclarations
+// de skills, à ne modifier que pour en ajouter une nouvelle), scratchDir
+// (ses propres fichiers de travail, qu'il est censé nettoyer lui-même en fin
+// de tâche), memoryFile (mémoire long terme, voir plus bas) vs. /tmp
+// (fichiers vraiment éphémères, à ne jamais faire s'accumuler dans le
+// workspace). Ajouté systématiquement au system prompt (voir main.go),
+// indépendamment des outils, comme ReflectionPrompt : un modèle sans accès
+// fichier n'en tire simplement aucun parti.
+//
+// memoryContent, si non vide, est le contenu de memoryFile au démarrage,
+// injecté tel quel dans le prompt (voir main.go) : compter sur le modèle
+// pour penser à appeler read_file dessus avant de répondre s'est révélé peu
+// fiable en pratique (un modèle qui voit "MEMORY.md" dans un list_dir n'a
+// pas forcément le réflexe de le lire) — l'avoir toujours sous les yeux
+// supprime ce pari. Contrepartie acceptée, comme pour les skills (dont seuls
+// nom/description sont chargés au démarrage) : une modification faite en
+// cours de session (par le modèle ou par une compaction automatique)
+// n'apparaît qu'après redémarrage, pas dans le reste de la session en cours.
+func WorkspacePrompt(workspaceDir, skillsDir, scratchDir, memoryFile, memoryContent string) string {
+	memorySection := fmt.Sprintf(`- %s : ta mémoire long terme, censée survivre à cette conversation (contrairement au reste, qui n'existe que le temps de la tâche en cours). Écris-y (write_file, en relisant d'abord pour compléter plutôt qu'écraser) quand l'utilisateur te demande explicitement de retenir quelque chose, ou quand tu identifies toi-même un fait/une préférence/une contrainte qui mériterait de survivre à un reset de la conversation — une compaction automatique du contexte y ajoute aussi, de son côté, ce qu'elle juge digne d'être retenu.`, memoryFile)
+	if memoryContent != "" {
+		memorySection += fmt.Sprintf(`
+  Son contenu, tel qu'il était au démarrage de cette session, est reproduit ci-dessous : CONSULTE-LE avant de répondre à toute question sur le contexte de l'utilisateur (préférences, projets en cours, faits déjà donnés) ou avant de dire que tu ne sais pas — ne demande jamais à l'utilisateur une information qui s'y trouve déjà. S'il a pu changer depuis (une écriture plus tard dans cette session, ou une compaction automatique), relis-le directement (read_file) pour la version à jour.
+  --- contenu de %s (au démarrage) ---
+%s
+  --- fin de %s ---`, memoryFile, memoryContent, memoryFile)
+	} else {
+		memorySection += " Vide pour l'instant : lis-le (read_file) si tu veux vérifier, mais rien n'y a encore été consigné."
+	}
+
+	return fmt.Sprintf(`Ton workspace persistant est %s (accessible sans demander de permission). Il contient :
+- %s : les skills déclarées, à ne modifier que pour en déclarer une nouvelle (voir la skill "creer-une-skill" pour le format).
+- %s : ton scratchpad, pour tes propres fichiers de travail pendant une tâche (brouillons, fichiers générés, résultats intermédiaires...). En fin de traitement d'une tâche, utilise list_dir dessus et supprime (via run_shell, si disponible) ce qui n'a plus d'utilité : ne le laisse pas s'accumuler d'une tâche à l'autre.
+%s
+- D'autres fichiers à la racine du workspace sont des réglages internes au harnais (permissions accordées, configuration git du sandbox...) : ne les modifie pas toi-même.
+
+Pour un fichier vraiment éphémère (utile seulement le temps d'une commande ou d'un pipeline shell, à jeter immédiatement après, jamais à relire plus tard) : utilise /tmp plutôt que le scratchpad, lui aussi accessible sans permission — ça évite d'encombrer un espace censé rester lisible d'une tâche à l'autre.`, workspaceDir, skillsDir, scratchDir, memorySection)
+}
+
 // EventKind distingue le début d'un appel d'outil de son résultat, pour
 // permettre un affichage en deux temps (utile en mode interactif : on
 // affiche l'appel avant même que le résultat soit connu).
@@ -58,6 +98,10 @@ const (
 	// (conv.AppendRaw) mais jamais montré : seuls les tool_calls et leurs
 	// résultats étaient visibles en mode interactif, pas ce qui les motive.
 	EventReasoning
+	// EventWarning : problème non fatal, qui n'empêche pas le tour de
+	// continuer (ex: échec de la compaction automatique du contexte — voir
+	// Run) — à afficher, pas à faire échouer la réponse pour autant.
+	EventWarning
 )
 
 type Event struct {
@@ -76,6 +120,8 @@ type Event struct {
 func (e Event) Format() string {
 	var b strings.Builder
 	switch e.Kind {
+	case EventWarning:
+		fmt.Fprintf(&b, "\n[avertissement: %s]\n", e.Result)
 	case EventReasoning:
 		b.WriteString("\n┄ réflexion\n")
 		for _, line := range strings.Split(strings.TrimRight(truncateForDisplay(e.Result, 4000), "\n"), "\n") {
@@ -125,9 +171,36 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 	specs := registry.Specs()
 
 	var lastUsage llm.Usage
+	// compactionFailed : dès qu'une tentative échoue dans cet appel à Run,
+	// on arrête d'en retenter à chaque étape suivante (même avertissement,
+	// même échec probable — pas la peine de payer un appel LLM par étape
+	// pour ça) ; sert aussi à ne montrer l'avertissement qu'une seule fois.
+	compactionFailed := false
 	for step := 0; step < maxSteps; step++ {
-		if _, err := conv.CompactIfNeeded(ctx, client); err != nil {
-			return "", lastUsage, fmt.Errorf("compaction du contexte: %w", err)
+		// Un échec de compaction ne doit JAMAIS faire échouer le tour : la
+		// compaction est une optimisation de contexte, pas un prérequis pour
+		// répondre. Un modèle qui échoue systématiquement à produire un
+		// résumé propre (observé : échappe un tool_call en texte brut à
+		// chaque tentative, de façon reproductible, pas un aléa isolé)
+		// bloquerait sinon définitivement la conversation — chaque tour
+		// retenterait la même compaction, échouerait de la même façon, sans
+		// qu'aucun message ne puisse plus jamais aboutir. On continue donc
+		// simplement sans compacter, avec l'historique complet tel quel.
+		if !compactionFailed {
+			if _, err := conv.CompactIfNeeded(ctx, client); err != nil {
+				compactionFailed = true
+				if onEvent != nil {
+					onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("échec de la compaction du contexte, poursuite sans compacter : %v", err)})
+				}
+			}
+		}
+		// Filet de sécurité de dernier recours : si l'historique dépasse
+		// encore la fenêtre réelle malgré (une tentative de) compaction —
+		// notamment quand compactionFailed vient de se déclencher —,
+		// supprime les plus vieux messages plutôt que d'envoyer une requête
+		// vouée à être rejetée par le serveur pour dépassement de contexte.
+		if dropped := conv.EnsureFitsContext(); dropped > 0 && onEvent != nil {
+			onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé", dropped)})
 		}
 
 		msg, usage, err := client.ChatCompletion(ctx, conv.Full(), specs)

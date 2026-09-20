@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 
@@ -34,6 +35,27 @@ type Options struct {
 	ContextMaxTokens int
 	ContextCompactAt float64
 	ContextKeepLast  int
+
+	// MemoryFile : voir convo.Conversation.MemoryFile — "" = désactivé.
+	// ATTENTION : le corps d'un mail entrant est un contenu non fiable (voir
+	// Tools ci-dessous) ; l'activer expose l'extraction mémoire de la
+	// compaction à un mail malveillant qui y injecterait une "mémoire"
+	// persistante, susceptible d'influencer le modèle bien au-delà de ce
+	// seul mail — y compris en mode chat, ce fichier étant partagé. Accepté
+	// en connaissance de cause à la demande explicite de l'opérateur.
+	MemoryFile string
+
+	// Conversations : historique de conversation par fil de discussion (voir
+	// threadKey/normalizeSubject), pour qu'une réponse dans un fil en cours
+	// reprenne le contexte des échanges précédents au lieu de repartir de
+	// zéro à chaque mail — comme le fait déjà le mode chat entre deux
+	// messages d'une même session. Un fil est identifié par (expéditeur,
+	// sujet normalisé) : le sujet seul ne suffit pas, sous peine de mélanger
+	// le contexte de deux personnes différentes qui écrivent avec le même
+	// sujet (ou sans sujet). Initialisé automatiquement si nil par Run.
+	// Vit en mémoire du process : perdu au redémarrage, pas persisté sur
+	// disque, comme le reste de l'état du mode mail (et du mode chat).
+	Conversations map[string]*convo.Conversation
 
 	// AllowFrom : liste blanche d'adresses (en minuscules) autorisées à
 	// déclencher une réponse automatique. Vide = pas de filtre.
@@ -81,10 +103,66 @@ func (o Options) imapAddr() string {
 	return net.JoinHostPort(o.IMAPHost, o.IMAPPort)
 }
 
+// subjectPrefixRe reconnaît un préfixe de réponse/transfert en tête de
+// sujet (Re:, Fwd:, Fw:, Tr:...), pour le retirer lors de la normalisation.
+var subjectPrefixRe = regexp.MustCompile(`(?i)^(re|fwd?|tr)\s*:\s*`)
+
+// normalizeSubject réduit un sujet de mail à sa forme canonique pour
+// regrouper les mails d'un même fil de discussion : préfixes de réponse/
+// transfert retirés (répétés, ex: "Re: Fwd: Question"), espaces superflus et
+// casse normalisés. Correspondance approximative par sujet — pas le suivi
+// RFC des en-têtes References/In-Reply-To (plus robuste mais plus complexe),
+// choisi ici parce que c'est ce qu'un humain considère spontanément comme
+// "le même sujet".
+func normalizeSubject(subject string) string {
+	s := strings.TrimSpace(subject)
+	for {
+		trimmed := strings.TrimSpace(subjectPrefixRe.ReplaceAllString(s, ""))
+		if trimmed == s {
+			break
+		}
+		s = trimmed
+	}
+	return strings.ToLower(s)
+}
+
+// threadKey identifie un fil de discussion par (expéditeur, sujet
+// normalisé) : le sujet seul ne suffit pas, sous peine de mélanger le
+// contexte de deux personnes différentes qui écrivent avec le même sujet
+// (fréquent avec un sujet vide, ex: toujours "" pour qui n'en met jamais).
+func threadKey(senderAddr, subject string) string {
+	return strings.ToLower(senderAddr) + "\x00" + normalizeSubject(subject)
+}
+
+// getOrCreateConversation retourne la conversation existante pour le fil
+// (senderAddr, subject) si ce fil est déjà en cours, ou en crée une
+// nouvelle sinon (et l'enregistre pour les mails suivants du même fil). Le
+// rappel de l'usage des outils (voir agent.AppendToolUsagePrompt) n'est
+// ajouté qu'à la création : le répéter à chaque réutilisation grossirait le
+// system prompt inutilement à chaque mail du fil.
+func (o Options) getOrCreateConversation(senderAddr, subject string) *convo.Conversation {
+	key := threadKey(senderAddr, subject)
+	if conv, ok := o.Conversations[key]; ok {
+		return conv
+	}
+
+	conv := convo.New(o.SystemPrompt, o.ContextMaxTokens, o.ContextCompactAt, o.ContextKeepLast)
+	conv.MemoryFile = o.MemoryFile
+	if !o.Tools.Empty() {
+		agent.AppendToolUsagePrompt(conv)
+	}
+	o.Conversations[key] = conv
+	return conv
+}
+
 // Run boucle indéfiniment (jusqu'à annulation du contexte) en interrogeant
 // la boîte mail toutes les PollInterval.
 func Run(ctx context.Context, client *llm.Client, opts Options) error {
 	log.Printf("mailbot: démarrage — boîte %s@%s, poll toutes les %s", opts.IMAPUser, opts.imapAddr(), opts.PollInterval)
+
+	if opts.Conversations == nil {
+		opts.Conversations = make(map[string]*convo.Conversation)
+	}
 
 	ticker := time.NewTicker(opts.PollInterval)
 	defer ticker.Stop()
@@ -181,10 +259,7 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	userMessage := body
 	logBlock(fmt.Sprintf("requête mail › de %s", senderAddr), userMessage)
 
-	conv := convo.New(opts.SystemPrompt, opts.ContextMaxTokens, opts.ContextCompactAt, opts.ContextKeepLast)
-	if !opts.Tools.Empty() {
-		agent.AppendToolUsagePrompt(conv)
-	}
+	conv := opts.getOrCreateConversation(senderAddr, parsed.Subject)
 	conv.AddUser(userMessage)
 
 	var reply string
@@ -200,6 +275,11 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	} else {
 		if _, err := conv.CompactIfNeeded(ctx, client); err != nil {
 			log.Printf("mailbot: échec compaction contexte: %v", err)
+		}
+		// Filet de sécurité de dernier recours : voir le commentaire de
+		// convo.Conversation.EnsureFitsContext.
+		if dropped := conv.EnsureFitsContext(); dropped > 0 {
+			log.Printf("mailbot: contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé", dropped)
 		}
 		var usage llm.Usage
 		var msg llm.Message

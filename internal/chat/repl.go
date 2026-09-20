@@ -27,12 +27,12 @@ type ToolsConfig struct {
 	// aussi disponible pour le mode mail (qui relit ce même fichier, en
 	// lecture seule).
 	AllowedDirsFile string
-	// ShellSandboxEnabled : exécute run_shell sous le compte système
+	// SandboxUserEnabled : exécute run_shell sous le compte système
 	// restreint "llm" (internal/sandbox) plutôt que sous l'utilisateur
 	// courant. La configuration est vérifiée (et effectuée si besoin, avec
 	// confirmation) à chaque lancement.
-	ShellSandboxEnabled bool
-	ShellTimeout        time.Duration
+	SandboxUserEnabled bool
+	ShellTimeout       time.Duration
 	// ShellMaxTimeout : borne supérieure du timeout que le modèle peut
 	// demander pour une commande run_shell précise (voir
 	// tools.ShellTool.MaxTimeout).
@@ -40,7 +40,9 @@ type ToolsConfig struct {
 	// ShellNotifyThreshold : voir tools.ShellTool.NotifyThreshold.
 	ShellNotifyThreshold time.Duration
 	HTTPTimeout          time.Duration
-	MaxSteps             int
+	// BrowserFetchTimeout : voir tools.BrowserFetchTool.Timeout.
+	BrowserFetchTimeout time.Duration
+	MaxSteps            int
 	// WorkspaceDir : répertoire toujours accessible en lecture/écriture pour
 	// read_file/write_file (voir tools.DirPermissions.AlwaysAllow), sans
 	// passer par request_directory_access.
@@ -62,7 +64,7 @@ type chatLine struct {
 }
 
 // Run lance une boucle de lecture-évaluation-affichage sur la console.
-// Commandes spéciales : /exit, /reset, /stats.
+// Commandes spéciales : /exit, /reset, /stats, /compact.
 //
 // Si toolsCfg.Enabled, chaque tour passe par la boucle agentique
 // (internal/agent) : les appels d'outils et leurs résultats sont affichés
@@ -168,9 +170,9 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		// requis, ou s'il a été mis en place avec succès — jamais de repli
 		// silencieux vers une exécution non isolée quand l'utilisateur a
 		// explicitement demandé le sandbox.
-		shellAvailable := !toolsCfg.ShellSandboxEnabled
+		shellAvailable := !toolsCfg.SandboxUserEnabled
 		sandboxReady := false
-		if toolsCfg.ShellSandboxEnabled {
+		if toolsCfg.SandboxUserEnabled {
 			if err := sandbox.Ensure(out, func(prompt string) bool { return askYesNo(ctx, prompt) }); err != nil {
 				fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] indisponible, run_shell ne sera pas proposé cette session : %v", err)))
 			} else {
@@ -197,11 +199,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		if err := perms.WithPersistence(toolsCfg.AllowedDirsFile); err != nil {
 			fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[avertissement: lecture des répertoires autorisés (%s): %v]", toolsCfg.AllowedDirsFile, err)))
 		}
-		// Le workspace du bot est toujours accessible, indépendamment des
-		// accès accordés en direct par l'utilisateur (voir AlwaysAllow).
+		// Le workspace du bot (et /tmp, pour les fichiers vraiment
+		// éphémères — voir agent.WorkspacePrompt) sont toujours accessibles,
+		// indépendamment des accès accordés en direct par l'utilisateur
+		// (voir AlwaysAllow).
 		gitConfigPath := ""
+		homeDir := ""
 		if toolsCfg.WorkspaceDir != "" {
-			perms.AlwaysAllow(toolsCfg.WorkspaceDir)
+			perms.AlwaysAllow(toolsCfg.WorkspaceDir, os.TempDir())
 			if sandboxReady {
 				if toolsCfg.SandboxSSHKey != "" {
 					if err := sandbox.EnsureSSHKeyAccess(toolsCfg.SandboxSSHKey); err != nil {
@@ -211,22 +216,33 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				if err := sandbox.EnsureGitConfig(toolsCfg.WorkspaceDir, toolsCfg.SandboxSSHKey); err != nil {
 					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de la préparation de la config git (%s) : %v", toolsCfg.WorkspaceDir, err)))
 				}
+				// Doit être créé AVANT GrantDirectory : c'est ce dernier qui
+				// pose rétroactivement les droits groupe nécessaires sur tout
+				// ce qui existe déjà sous le workspace au moment où il
+				// s'exécute (voir son commentaire) — un répertoire créé après
+				// coup n'en bénéficierait pas.
+				if err := sandbox.EnsureSandboxHome(toolsCfg.WorkspaceDir); err != nil {
+					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de la préparation du HOME sandbox (%s) : %v", toolsCfg.WorkspaceDir, err)))
+				}
 				if err := sandbox.GrantDirectory(toolsCfg.WorkspaceDir); err != nil {
 					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de l'ouverture du workspace (%s) au compte %q : %v", toolsCfg.WorkspaceDir, sandbox.User, err)))
 				} else {
 					gitConfigPath = sandbox.GitConfigPath(toolsCfg.WorkspaceDir)
+					homeDir = sandbox.SandboxHomeDir(toolsCfg.WorkspaceDir)
 				}
 			}
 		}
 
 		toolList := []tools.Tool{
 			&tools.ReadFileTool{Perms: perms},
-			&tools.WriteFileTool{Perms: perms},
+			&tools.WriteFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout},
+			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout},
 			&tools.RequestDirectoryAccessTool{Perms: perms},
+			&tools.ListDirTool{},
 		}
 		if shellAvailable {
-			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath})
+			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir})
 		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
@@ -335,6 +351,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			} else if compacted {
 				fmt.Fprintln(out, "[contexte compacté automatiquement]")
 			}
+			// Filet de sécurité de dernier recours : voir le commentaire de
+			// convo.Conversation.EnsureFitsContext.
+			if dropped := conv.EnsureFitsContext(); dropped > 0 {
+				errorLine("[avertissement: contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé]", dropped)
+			}
 
 			reply, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), func(delta string) {
 				fmt.Fprint(out, delta)
@@ -351,11 +372,49 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}()
 	}
 
+	// dispatchCompact force une compaction (résumé + extraction mémoire, en
+	// parallèle — voir convo.Conversation.Compact) comme si le seuil venait
+	// d'être atteint, puis le filet de sécurité de dernier recours (voir
+	// EnsureFitsContext), en tâche de fond comme dispatchTurn : un appel LLM,
+	// ne doit donc pas bloquer la boucle principale. Contrairement à
+	// dispatchTurn, ne touche jamais conv.Messages via AddUser : "/compact"
+	// n'est pas un message envoyé au modèle.
+	dispatchCompact := func() {
+		go func() {
+			cancelled := false
+			defer func() { doneCh <- cancelled }()
+
+			reqCtx, endReq := interrupt.begin(ctx)
+			defer endReq()
+
+			compacted, err := conv.Compact(reqCtx, client)
+			if err != nil {
+				cancelled = errors.Is(err, context.Canceled)
+				reqErrorLine(err)
+				return
+			}
+			if compacted {
+				fmt.Fprintln(out, "[contexte compacté manuellement]")
+			} else {
+				fmt.Fprintln(out, "[rien à compacter : historique trop court, ou tout fait partie d'un même groupe d'appel d'outil]")
+			}
+			// Même filet de sécurité qu'après une compaction automatique :
+			// voir le commentaire de convo.Conversation.EnsureFitsContext.
+			if dropped := conv.EnsureFitsContext(); dropped > 0 {
+				errorLine("[avertissement: contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé]", dropped)
+			}
+		}()
+	}
+
 	// dispatchOrHandle traite line comme une commande spéciale si elle en
 	// est une, sinon lance un tour via dispatchTurn. dispatched=true signale
 	// qu'un tour a été lancé (donc que la boucle principale ne doit pas
 	// réafficher le prompt tout de suite : il faut attendre doneCh).
 	dispatchOrHandle := func(line string) (dispatched, exit bool) {
+		if line == "/compact" {
+			dispatchCompact()
+			return true, false
+		}
 		if handled, ex := runCommand(line); handled {
 			return false, ex
 		}
@@ -387,7 +446,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}()
 
-	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique.")
+	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique, /compact pour compacter maintenant.")
 	fmt.Fprint(out, promptIdle)
 
 	var queue []string

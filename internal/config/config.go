@@ -51,12 +51,16 @@ type Config struct {
 	ChatToolsEnabled bool // mode chat : shell + fichiers + http (supervisé par un humain)
 	MailToolsEnabled bool // mode mail : uniquement lecture fichier + http (jamais shell/écriture, contenu non fiable)
 
-	// ShellSandboxEnabled : si vrai, run_shell (mode chat uniquement) est
+	// SandboxUserEnabled : si vrai, run_shell (mode chat uniquement) est
 	// exécuté sous le compte système restreint "llm" (voir internal/sandbox)
-	// plutôt que sous l'identité de l'utilisateur courant. La configuration
+	// plutôt que sous l'identité de l'utilisateur courant. Contrôle aussi le
+	// contrôle d'accès de read_file/write_file : quand actif, un répertoire
+	// est considéré autorisé si ce compte y a réellement accès au niveau OS
+	// (voir tools.DirPermissions), pas seulement listé dans un fichier —
+	// donc pas seulement "shell" malgré le nom. La configuration
 	// (utilisateur/groupe système, règle sudo) est vérifiée à chaque
 	// lancement et effectuée si besoin, avec confirmation explicite.
-	ShellSandboxEnabled bool
+	SandboxUserEnabled bool
 
 	// SandboxSSHKey : chemin d'une clé privée SSH de l'utilisateur courant,
 	// à laquelle le compte sandbox "llm" reçoit un accès en lecture seule
@@ -65,7 +69,7 @@ type Config struct {
 	// puissent s'authentifier avec la véritable identité de l'utilisateur.
 	// Affaiblit délibérément l'isolation du sandbox pour ce cas précis : "" =
 	// désactivé (défaut si aucune clé usuelle n'est trouvée). Sans effet si
-	// ShellSandboxEnabled est faux.
+	// SandboxUserEnabled est faux.
 	SandboxSSHKey string
 
 	ToolsShellTimeout time.Duration
@@ -81,7 +85,12 @@ type Config struct {
 	// 0 = désactivé.
 	ToolsShellNotifyThreshold time.Duration
 	ToolsHTTPTimeout          time.Duration
-	AgentMaxSteps             int
+	// ToolsBrowserFetchTimeout : voir internal/tools.BrowserFetchTool.Timeout
+	// — plus long que ToolsHTTPTimeout par défaut, le démarrage d'un
+	// navigateur (et de geckodriver pour Firefox) prenant plus de temps
+	// qu'une simple requête HTTP.
+	ToolsBrowserFetchTimeout time.Duration
+	AgentMaxSteps            int
 
 	// WorkspaceDir : répertoire toujours accessible en lecture/écriture pour
 	// read_file/write_file (voir internal/tools.DirPermissions.AlwaysAllow),
@@ -91,10 +100,27 @@ type Config struct {
 	WorkspaceDir string
 }
 
-// SkillsDir retourne le sous-répertoire "skills" du workspace, où les skills
-// sont déclarées (voir internal/skills).
+// SkillsDir retourne le sous-répertoire "skills" du workspace, où les
+// skills sont déclarées (voir internal/skills).
 func (c Config) SkillsDir() string {
 	return filepath.Join(c.WorkspaceDir, "skills")
+}
+
+// ScratchpadDir retourne le sous-répertoire "scratchpad" du workspace,
+// destiné aux fichiers de travail du modèle lui-même (brouillons, résultats
+// intermédiaires...) — voir agent.WorkspacePrompt.
+func (c Config) ScratchpadDir() string {
+	return filepath.Join(c.WorkspaceDir, "scratchpad")
+}
+
+// MemoryFile retourne le chemin du fichier "MEMORY.md" à la racine du
+// workspace : mémoire long terme du modèle, à la fois consultable et
+// modifiable par lui (read_file/write_file, voir agent.WorkspacePrompt) et
+// alimentée automatiquement par convo.Conversation.Compact quand elle
+// identifie quelque chose qui mérite de survivre à la conversation en
+// cours.
+func (c Config) MemoryFile() string {
+	return filepath.Join(c.WorkspaceDir, "MEMORY.md")
 }
 
 // defaultWorkspaceDir retourne "<home>/bot-workspace", ou "bot-workspace"
@@ -106,6 +132,46 @@ func defaultWorkspaceDir() string {
 		return "bot-workspace"
 	}
 	return filepath.Join(home, "bot-workspace")
+}
+
+// ConfigFilePath retourne le chemin du fichier de configuration (.env) du
+// harnais — toujours dans le workspace, jamais relatif au répertoire depuis
+// lequel le programme est lancé (qui change d'une invocation à l'autre,
+// contrairement au workspace — même raison que WorkspaceDir/allowedDirsFile
+// dans main.go : lancer ./bot depuis un dossier différent d'une fois sur
+// l'autre ne doit "perdre" ni la config ni rien d'autre).
+//
+// Respecte une variable d'environnement WORKSPACE_DIR déjà présente au
+// niveau du process (réglée par le shell/l'appelant, PAS par le fichier de
+// config lui-même : sa propre localisation ne peut pas dépendre de son
+// propre contenu, ce serait circulaire) ; sinon, ~/bot-workspace, comme la
+// valeur par défaut de WorkspaceDir lui-même — cohérent : sans rien régler
+// nulle part, le fichier de config attendu et le workspace effectif sont le
+// même répertoire.
+func ConfigFilePath() string {
+	return filepath.Join(getenv("WORKSPACE_DIR", defaultWorkspaceDir()), ".env")
+}
+
+// EnsureConfigFile crée path avec defaultContent s'il est absent — jamais
+// s'il existe déjà, y compris vidé/modifié par l'utilisateur (même principe
+// que skills.EnsureDefaults/MEMORY.md). Au tout premier lancement, ça
+// initialise la configuration avec des valeurs d'exemple plutôt que de
+// démarrer sans aucun fichier. Mode 0600 (pas 0644 comme MEMORY.md) : ce
+// fichier contient potentiellement des secrets (clé API, mots de passe
+// IMAP/SMTP...).
+func EnsureConfigFile(path string, defaultContent []byte) error {
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("création de %q: %w", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, defaultContent, 0o600); err != nil {
+		return fmt.Errorf("création de %q: %w", path, err)
+	}
+	return nil
 }
 
 // defaultSandboxSSHKey retourne le premier fichier de clé privée SSH usuel
@@ -219,9 +285,9 @@ func Load() Config {
 		contextMaxTokens = 8192
 	}
 
-	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.9"), 64)
+	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.95"), 64)
 	if err != nil || contextCompactAt <= 0 || contextCompactAt > 1 {
-		contextCompactAt = 0.9
+		contextCompactAt = 0.95
 	}
 
 	contextKeepLast, err := strconv.Atoi(getenv("CONTEXT_KEEP_LAST", "6"))
@@ -254,6 +320,10 @@ func Load() Config {
 	toolsHTTPTimeout, err := time.ParseDuration(getenv("TOOLS_HTTP_TIMEOUT", "20s"))
 	if err != nil || toolsHTTPTimeout <= 0 {
 		toolsHTTPTimeout = 20 * time.Second
+	}
+	toolsBrowserFetchTimeout, err := time.ParseDuration(getenv("TOOLS_BROWSER_FETCH_TIMEOUT", "45s"))
+	if err != nil || toolsBrowserFetchTimeout <= 0 {
+		toolsBrowserFetchTimeout = 45 * time.Second
 	}
 	agentMaxSteps, err := strconv.Atoi(getenv("AGENT_MAX_STEPS", "8"))
 	if err != nil || agentMaxSteps <= 0 {
@@ -292,14 +362,15 @@ func Load() Config {
 		ChatToolsEnabled: getenvBool("CHAT_TOOLS_ENABLED", true),
 		MailToolsEnabled: getenvBool("MAIL_TOOLS_ENABLED", false),
 
-		ShellSandboxEnabled: getenvBool("SHELL_SANDBOX_USER_ENABLED", true),
-		SandboxSSHKey:       getenv("SANDBOX_SSH_KEY", defaultSandboxSSHKey()),
+		SandboxUserEnabled: getenvBool("SANDBOX_USER_ENABLED", true),
+		SandboxSSHKey:      getenv("SANDBOX_SSH_KEY", defaultSandboxSSHKey()),
 
-		ToolsShellTimeout:    toolsShellTimeout,
+		ToolsShellTimeout:         toolsShellTimeout,
 		ToolsShellMaxTimeout:      toolsShellMaxTimeout,
 		ToolsShellNotifyThreshold: toolsShellNotifyThreshold,
-		ToolsHTTPTimeout:     toolsHTTPTimeout,
-		AgentMaxSteps:     agentMaxSteps,
+		ToolsHTTPTimeout:          toolsHTTPTimeout,
+		ToolsBrowserFetchTimeout:  toolsBrowserFetchTimeout,
+		AgentMaxSteps:             agentMaxSteps,
 
 		WorkspaceDir: getenv("WORKSPACE_DIR", defaultWorkspaceDir()),
 	}

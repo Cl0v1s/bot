@@ -9,6 +9,17 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"bot/internal/sandbox"
+)
+
+// sandboxReady/sandboxCanAccess indirectent sandbox.Ready/sandbox.CanAccess :
+// des variables plutôt que des appels directs, pour que les tests puissent
+// simuler un sandbox prêt ou non sans dépendre de l'état réel de la machine
+// qui les exécute (qui peut très bien avoir un compte "llm" déjà configuré).
+var (
+	sandboxReady     = sandbox.Ready
+	sandboxCanAccess = sandbox.CanAccess
 )
 
 // DirGrantFunc demande à un humain l'autorisation d'accéder au répertoire
@@ -126,9 +137,48 @@ func (p *DirPermissions) Preallow(dirs ...string) {
 		if d == "" {
 			continue
 		}
-		if abs, err := filepath.Abs(d); err == nil {
-			p.allowed = append(p.allowed, filepath.Clean(abs))
+		if abs, err := canonicalPath(d); err == nil {
+			p.allowed = append(p.allowed, abs)
 		}
+	}
+}
+
+// canonicalPath retourne le chemin absolu de path, liens symboliques résolus
+// sur la plus grande partie existante du chemin (comme `realpath -m`) —
+// nécessaire sur un système où un chemin usuel (ex: /home/<user>) est en
+// réalité un lien symbolique vers un autre emplacement (ex: /var/home/<user>,
+// cas des systèmes ostree/Silverblue/uCore) : sans ça, un même répertoire
+// réel accordé via un alias (ex: /var/home/... en mode chat) n'est pas
+// reconnu comme déjà autorisé quand il est redemandé via l'autre alias (ex:
+// /home/... depuis un mail), et inversement — refusant à tort un accès déjà
+// donné. Le suffixe qui n'existe pas encore (ex: un nouveau fichier pour
+// write_file) est conservé tel quel, non résolu.
+func canonicalPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+
+	dir := filepath.Dir(abs)
+	base := filepath.Base(abs)
+	for {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(resolved, base), nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Racine atteinte sans rien pouvoir résoudre (chemin totalement
+			// inexistant) : retombe sur le chemin nettoyé tel quel plutôt
+			// que d'échouer.
+			return abs, nil
+		}
+		base = filepath.Join(filepath.Base(dir), base)
+		dir = parent
 	}
 }
 
@@ -144,6 +194,47 @@ func (p *DirPermissions) isAllowedLocked(abs string) bool {
 		}
 	}
 	return false
+}
+
+// checkAccess vérifie si dir (un répertoire, éventuellement pas encore créé
+// — voir nearestExisting) est effectivement accessible. Si le sandbox est
+// prêt, la vérité vient du système : sandboxCanAccess teste réellement, sous
+// l'identité du compte sandbox, l'accès à dir — pas d'un fichier séparé
+// censé refléter ce qui a été accordé, qui pourrait avoir divergé (accès
+// révoqué manuellement, répertoire recréé, fichier corrompu...). Le
+// répertoire accordé au sandbox l'est en lecture+écriture d'un coup (voir
+// sandbox.GrantDirectory), donc write ne change que le bit testé, jamais le
+// résultat en pratique.
+//
+// Sans sandbox prêt (désactivé, ou pas encore configuré), aucune identité
+// séparée à interroger : on retombe sur la liste des répertoires
+// explicitement accordés (fichier JSON partagé, voir isAllowedLocked) —
+// seul mécanisme disponible dans ce cas.
+func (p *DirPermissions) checkAccess(dir string, write bool) bool {
+	if sandboxReady() {
+		return sandboxCanAccess(nearestExisting(dir), write)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.isAllowedLocked(dir)
+}
+
+// nearestExisting retourne path s'il existe, sinon son plus proche ancêtre
+// existant — nécessaire pour tester un chemin que write_file s'apprête à
+// créer (fichier et/ou répertoires parents), puisque tester l'accès à
+// quelque chose qui n'existe pas encore échoue toujours.
+func nearestExisting(path string) string {
+	dir := path
+	for {
+		if _, err := os.Stat(dir); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir // racine atteinte sans rien trouver ; le test échouera, ce qui est correct
+		}
+		dir = parent
+	}
 }
 
 // AlwaysAllow accorde un accès permanent à dirs (ex: le workspace du bot),
@@ -163,27 +254,35 @@ func (p *DirPermissions) AlwaysAllow(dirs ...string) {
 		if d == "" {
 			continue
 		}
-		if abs, err := filepath.Abs(d); err == nil {
-			p.always = append(p.always, filepath.Clean(abs))
+		if abs, err := canonicalPath(d); err == nil {
+			p.always = append(p.always, abs)
 		}
 	}
 }
 
-// CheckFile vérifie que path (fichier à lire ou écrire) se trouve dans un
+// CheckFileRead vérifie que path (fichier à lire) se trouve dans un
 // répertoire autorisé, et retourne son chemin absolu. Ne déclenche jamais de
 // demande d'autorisation elle-même : c'est le rôle exclusif du tool
 // request_directory_access, pour que la décision reste toujours explicite.
-func (p *DirPermissions) CheckFile(path string) (string, error) {
-	abs, err := filepath.Abs(path)
+func (p *DirPermissions) CheckFileRead(path string) (string, error) {
+	return p.checkFile(path, false)
+}
+
+// CheckFileWrite est l'équivalent de CheckFileRead pour un fichier à écrire
+// (créer ou remplacer) : path lui-même n'a donc pas besoin d'exister déjà,
+// contrairement à CheckFileRead — seul son répertoire (ou le plus proche
+// ancêtre existant, voir nearestExisting) doit être autorisé.
+func (p *DirPermissions) CheckFileWrite(path string) (string, error) {
+	return p.checkFile(path, true)
+}
+
+func (p *DirPermissions) checkFile(path string, write bool) (string, error) {
+	abs, err := canonicalPath(path)
 	if err != nil {
 		return "", fmt.Errorf("chemin invalide %q: %w", path, err)
 	}
-	abs = filepath.Clean(abs)
 
-	p.mu.Lock()
-	ok := p.isAllowedLocked(abs)
-	p.mu.Unlock()
-	if !ok {
+	if !p.checkAccess(filepath.Dir(abs), write) {
 		return "", fmt.Errorf(
 			`accès refusé : le répertoire %q n'est pas autorisé. Utilise l'outil "request_directory_access" pour demander l'accès à l'utilisateur avant de réessayer.`,
 			filepath.Dir(abs),
@@ -199,16 +298,12 @@ func (p *DirPermissions) CheckFile(path string) (string, error) {
 // automatiquement refusée, sans jamais toucher à la liste ni au fichier
 // partagé.
 func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) (bool, error) {
-	abs, err := filepath.Abs(dir)
+	abs, err := canonicalPath(dir)
 	if err != nil {
 		return false, fmt.Errorf("chemin invalide %q: %w", dir, err)
 	}
-	abs = filepath.Clean(abs)
 
-	p.mu.Lock()
-	already := p.isAllowedLocked(abs)
-	p.mu.Unlock()
-	if already {
+	if p.checkAccess(abs, false) {
 		return true, nil
 	}
 

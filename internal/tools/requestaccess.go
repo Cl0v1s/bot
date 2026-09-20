@@ -25,7 +25,7 @@ func (t *RequestDirectoryAccessTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"directory": {"type": "string", "description": "Chemin du répertoire pour lequel demander l'accès."},
+			"directory": {"type": "string", "description": "Chemin ABSOLU du répertoire pour lequel demander l'accès. Un chemin relatif est refusé."},
 			"reason": {"type": "string", "description": "Explication brève, montrée à l'utilisateur, de la raison de cette demande."}
 		},
 		"required": ["directory"],
@@ -45,6 +45,9 @@ func (t *RequestDirectoryAccessTool) Call(ctx context.Context, argsJSON string) 
 	}
 	if args.Directory == "" {
 		return "", fmt.Errorf(`paramètre "directory" requis`)
+	}
+	if err := requireAbsolutePath("directory", args.Directory); err != nil {
+		return "", err
 	}
 
 	granted, err := t.Perms.RequestAccess(ctx, args.Directory, args.Reason)
