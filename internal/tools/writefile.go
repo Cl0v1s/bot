@@ -18,16 +18,19 @@ type WriteFileTool struct {
 	Perms    *DirPermissions
 	MaxBytes int
 
-	// Sandboxed : si vrai, resynchronise après coup (via
-	// sandbox.GrantDirectory) l'accès du compte sandbox sur tout ce que cet
-	// appel vient de créer — write_file s'exécute toujours sous l'identité
-	// réelle de l'utilisateur (jamais sous le compte sandbox, contrairement
-	// à run_shell), donc un nouveau fichier/répertoire créé ici garde par
-	// défaut des droits classiques (umask du processus), pas forcément
-	// accessibles en écriture au compte sandbox — symétrique au correctif
-	// de umask dans sandbox.WrapCommand (qui traite le sens inverse : du
-	// contenu créé par run_shell, pas toujours accessible en écriture à
-	// l'utilisateur réel).
+	// Sandboxed : si vrai, resynchronise (via sandbox.GrantDirectory) l'accès
+	// entre l'utilisateur réel et le compte sandbox, dans les deux sens :
+	//   - AVANT l'écriture : un fichier déjà présent au chemin visé peut avoir
+	//     été créé ou réécrit depuis par run_shell (donc appartenir au compte
+	//     sandbox, pas à l'utilisateur réel) avec un mode qui n'accorde pas
+	//     l'écriture au groupe — l'écriture ci-dessous échouerait sinon avec
+	//     un "permission denied" pourtant surprenant pour l'utilisateur réel
+	//     sur SON PROPRE système de fichiers (observé en pratique).
+	//   - APRÈS l'écriture : write_file s'exécute toujours sous l'identité
+	//     réelle (jamais sous le compte sandbox, contrairement à run_shell),
+	//     donc un nouveau fichier/répertoire créé ici garde par défaut des
+	//     droits classiques (umask du processus), pas forcément accessibles
+	//     en écriture au compte sandbox.
 	Sandboxed bool
 }
 
@@ -83,9 +86,21 @@ func (t *WriteFileTool) Call(ctx context.Context, argsJSON string) (string, erro
 	}
 
 	// Capturé AVANT MkdirAll : le plus proche ancêtre déjà existant, pour
-	// resynchroniser seulement à partir de là ensuite (voir plus bas), sans
+	// resynchroniser à partir de là (voir plus bas, dans les deux sens), sans
 	// remonter plus haut que nécessaire.
 	existingAncestor := nearestExisting(filepath.Dir(resolved))
+
+	if t.Sandboxed {
+		// Voir le commentaire de Sandboxed : un fichier déjà présent à ce
+		// chemin peut appartenir au compte sandbox (créé/réécrit depuis par
+		// run_shell) sans que l'écriture groupe soit accordée. Best-effort,
+		// avant même de tenter l'écriture : un échec ici ne doit pas
+		// empêcher d'essayer quand même (l'écriture elle-même échouera
+		// alors normalement si l'accès manque réellement).
+		if err := sandbox.GrantDirectory(existingAncestor); err != nil {
+			log.Printf("write_file: échec de la resynchronisation sandbox de %q: %v", existingAncestor, err)
+		}
+	}
 
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 		return "", fmt.Errorf("création du répertoire parent: %w", err)

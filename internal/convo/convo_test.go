@@ -14,7 +14,7 @@ import (
 )
 
 // fakeCompactionServer route la réponse selon le system prompt reçu : celui
-// de memoryExtractionSystemPrompt renvoie memoryReply, tout le reste (le
+// de memoryMaintenanceSystemPrompt renvoie memoryReply, tout le reste (le
 // résumé de compaction) renvoie summaryReply — pour pouvoir tester les deux
 // appels séparément sans dépendre de leur ordre d'exécution.
 func fakeCompactionServer(t *testing.T, summaryReply, memoryReply string) *httptest.Server {
@@ -27,7 +27,7 @@ func fakeCompactionServer(t *testing.T, summaryReply, memoryReply string) *httpt
 			t.Fatalf("décodage de la requête: %v", err)
 		}
 		reply := summaryReply
-		if len(req.Messages) > 0 && req.Messages[0].Content == memoryExtractionSystemPrompt {
+		if len(req.Messages) > 0 && req.Messages[0].Content == memoryMaintenanceSystemPrompt {
 			reply = memoryReply
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -136,8 +136,8 @@ func TestCompactNeverSplitsAToolCallGroup(t *testing.T) {
 	}
 }
 
-// Quand MemoryFile est configuré et que l'appel d'extraction trouve quelque
-// chose à retenir, Compact doit l'ajouter au fichier — sans toucher au
+// Quand MemoryFile est configuré et que la maintenance mémoire produit un
+// contenu à garder, Compact doit l'écrire dans le fichier — sans toucher au
 // résumé de compaction, produit par un appel séparé.
 func TestCompactPersistsMemoryWhenSomethingWorthKeeping(t *testing.T) {
 	server := fakeCompactionServer(t, "résumé de la conversation", "- préfère les réponses en français")
@@ -158,11 +158,127 @@ func TestCompactPersistsMemoryWhenSomethingWorthKeeping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lecture de %q: %v", memoryFile, err)
 	}
-	if !strings.Contains(string(data), "préfère les réponses en français") {
-		t.Fatalf("MEMORY.md = %q, attendu qu'il contienne l'extraction", data)
+	// Remplacement intégral du fichier par la réponse du modèle (voir
+	// persistMemory), pas un ajout dans un gabarit : contenu attendu
+	// exactement égal, pas seulement "contient".
+	if got := strings.TrimSpace(string(data)); got != "- préfère les réponses en français" {
+		t.Fatalf("MEMORY.md = %q, attendu exactement le contenu renvoyé par la maintenance mémoire", got)
 	}
 	if !strings.Contains(c.Messages[0].Content, "résumé de la conversation") {
-		t.Fatalf("résumé de compaction = %q, attendu le résumé (pas l'extraction mémoire)", c.Messages[0].Content)
+		t.Fatalf("résumé de compaction = %q, attendu le résumé (pas la maintenance mémoire)", c.Messages[0].Content)
+	}
+}
+
+// persistMemory doit transmettre le contenu déjà présent dans MEMORY.md au
+// modèle (voir memoryMaintenanceSystemPrompt) — c'est ce qui lui permet de
+// juger quoi garder, fusionner ou retirer, pas seulement d'éviter un
+// doublon exact avec ce qu'il ajouterait.
+func TestCompactPassesExistingMemoryForMaintenance(t *testing.T) {
+	var gotMemoryReqUser string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []llm.Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("décodage de la requête: %v", err)
+		}
+		reply := "résumé"
+		if len(req.Messages) > 0 && req.Messages[0].Content == memoryMaintenanceSystemPrompt {
+			gotMemoryReqUser = req.Messages[1].Content
+			reply = memoryNothingSentinel
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": reply}}},
+		})
+	}))
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	memoryFile := filepath.Join(t.TempDir(), "MEMORY.md")
+	if err := os.WriteFile(memoryFile, []byte("## Préférences\n- préfère les réponses en français\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := New("", 8192, 0.9, 0)
+	c.MemoryFile = memoryFile
+	c.AddUser("bonjour")
+	c.AddAssistant("salut")
+
+	if _, err := c.Compact(context.Background(), client); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	if !strings.Contains(gotMemoryReqUser, "préfère les réponses en français") {
+		t.Fatalf("requête de maintenance mémoire = %q, attendu qu'elle contienne le contenu déjà enregistré", gotMemoryReqUser)
+	}
+}
+
+// Le cœur du changement demandé : la maintenance mémoire doit pouvoir
+// RETIRER une entrée existante devenue inutile, pas seulement ajouter sans
+// dupliquer — remplace tout le fichier par ce que le modèle renvoie, y
+// compris quand ça laisse de côté une partie de ce qui existait avant.
+func TestCompactMemoryMaintenanceCanPruneExistingContent(t *testing.T) {
+	// Le modèle ne garde qu'UNE des deux entrées existantes : simule une
+	// vraie révision qui retire quelque chose devenu obsolète/inutile.
+	server := fakeCompactionServer(t, "résumé", "- préfère les réponses en français")
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	memoryFile := filepath.Join(t.TempDir(), "MEMORY.md")
+	if err := os.WriteFile(memoryFile, []byte(
+		"- préfère les réponses en français\n- détail obsolète d'une tâche ponctuelle passée, à retirer\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := New("", 8192, 0.9, 0)
+	c.MemoryFile = memoryFile
+	c.AddUser("bonjour")
+	c.AddAssistant("salut")
+
+	if _, err := c.Compact(context.Background(), client); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	data, err := os.ReadFile(memoryFile)
+	if err != nil {
+		t.Fatalf("lecture de %q: %v", memoryFile, err)
+	}
+	if strings.Contains(string(data), "obsolète") {
+		t.Fatalf("MEMORY.md = %q, attendu que l'entrée obsolète ait été retirée par la maintenance", data)
+	}
+	if !strings.Contains(string(data), "préfère les réponses en français") {
+		t.Fatalf("MEMORY.md = %q, attendu que l'entrée toujours utile soit conservée", data)
+	}
+}
+
+// Une mémoire existante entièrement vidée par la maintenance (sentinel) doit
+// se traduire par un fichier vide, pas laisser l'ancien contenu en place.
+func TestCompactMemoryMaintenanceCanEmptyExistingFile(t *testing.T) {
+	server := fakeCompactionServer(t, "résumé", memoryNothingSentinel)
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	memoryFile := filepath.Join(t.TempDir(), "MEMORY.md")
+	if err := os.WriteFile(memoryFile, []byte("- plus rien d'utile ici\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := New("", 8192, 0.9, 0)
+	c.MemoryFile = memoryFile
+	c.AddUser("bonjour")
+	c.AddAssistant("salut")
+
+	if _, err := c.Compact(context.Background(), client); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	data, err := os.ReadFile(memoryFile)
+	if err != nil {
+		t.Fatalf("lecture de %q: %v", memoryFile, err)
+	}
+	if strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("MEMORY.md = %q, attendu vide (sentinel \"rien à garder\")", data)
 	}
 }
 

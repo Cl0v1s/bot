@@ -244,7 +244,7 @@ func Summary(list []Skill) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("Skills disponibles (lis le fichier indiqué via read_file pour les instructions complètes avant de l'utiliser) :\n")
+	b.WriteString("Skills disponibles. Dès qu'une demande correspond à la description de l'une d'elles, ta TOUTE PREMIÈRE action doit être de lire son fichier (read_file sur le chemin indiqué) — avant tout autre outil, avant d'explorer par toi-même, avant d'essayer une commande à main levée pour voir si ça marche. Ne tente jamais la tâche à ta façon en te rabattant sur la skill seulement si ça échoue : lis-la d'abord, applique ensuite exactement ce qu'elle indique.\n")
 	for _, s := range list {
 		if s.Description != "" {
 			b.WriteString("- " + s.Name + " : " + s.Description + " [" + s.Path + "]\n")

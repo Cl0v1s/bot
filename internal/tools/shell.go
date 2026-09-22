@@ -61,6 +61,22 @@ type ShellTool struct {
 	// config/un cache (ex: `glab auth login`) échoue sinon (voir
 	// sandbox.SandboxHomeDir).
 	HomeDir string
+
+	// ConfirmRealUser : si non nil (et Sandboxed actif), permet au modèle de
+	// demander, via le paramètre "as_real_user" (voir ParametersSchema), à
+	// exécuter UNE commande précise sous l'identité réelle plutôt que sous
+	// le compte sandbox — pour un outil interactif (ex: `glab auth login`)
+	// que la synchronisation de permissions entre les deux identités ne
+	// suffit pas toujours à satisfaire (ex: un fichier de config que l'outil
+	// exige en 600, incompatible avec un accès groupe partagé — voir
+	// sandbox.GrantDirectory). Reçoit la commande exacte à exécuter, appelé
+	// à CHAQUE commande "as_real_user" (jamais court-circuité par ShellTool
+	// lui-même) — c'est à l'implémentation de décider si/combien de temps
+	// une confirmation reste valable sans redemander (ex: le mode chat
+	// accorde une fenêtre de quelques minutes après un "oui", plutôt que de
+	// reprompter à chaque appel). nil (ex: mode mail, aucun humain
+	// disponible pour confirmer) désactive purement et simplement ce mode.
+	ConfirmRealUser func(ctx context.Context, command string) (granted bool, err error)
 }
 
 func (t *ShellTool) Name() string { return "run_shell" }
@@ -69,6 +85,9 @@ func (t *ShellTool) Description() string {
 	base := "Exécute une commande shell locale (via `sh -c`) et retourne sa sortie standard et d'erreur combinées."
 	if t.Sandboxed {
 		base += fmt.Sprintf(" Exécutée sous le compte système restreint %q, pas sous celui de l'utilisateur.", sandbox.User)
+		if t.ConfirmRealUser != nil {
+			base += " Le paramètre \"as_real_user\" existe pour un cas précis (identité réelle plutôt que le compte sandbox, ex: un outil qui exige des permissions de fichier strictes incompatibles avec un accès partagé, comme `glab auth login`) — mais NE L'UTILISE QUE si l'utilisateur te le demande explicitement, ou si les instructions d'une skill (SKILL.md) le demandent explicitement pour cet outil précis. Ne l'utilise JAMAIS de ta propre initiative simplement parce qu'une commande sandboxée échoue ou que ça semble plus simple : une commande sandboxée qui échoue a presque toujours une autre cause (répertoire non accordé, syntaxe, outil manquant...) à diagnostiquer normalement d'abord."
+		}
 	} else {
 		base += " Accès complet au système : à utiliser avec prudence."
 	}
@@ -84,7 +103,8 @@ func (t *ShellTool) ParametersSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"command": {"type": "string", "description": "Commande shell à exécuter, interprétée par sh -c."},
-			"timeout_seconds": {"type": "integer", "description": "Timeout pour cette commande, en secondes. Optionnel : par défaut, timeout standard du tool. Plafonné à une valeur maximale fixée par la configuration.", "minimum": 1}
+			"timeout_seconds": {"type": "integer", "description": "Timeout pour cette commande, en secondes. Optionnel : par défaut, timeout standard du tool. Plafonné à une valeur maximale fixée par la configuration.", "minimum": 1},
+			"as_real_user": {"type": "boolean", "description": "Si vrai, exécute cette commande précise sous l'identité réelle plutôt que sous le compte sandbox (aucun effet si le tool n'est pas sandboxé) — ne change AUCUN droit de fichier/répertoire, juste l'identité de ce seul appel. Demande une confirmation interactive à l'utilisateur (valable ensuite quelques minutes pour les appels suivants, pas reprompée systématiquement) ; refusé sans confirmation possible (ex: mode mail). N'UTILISE CE PARAMÈTRE QUE si l'utilisateur te le demande explicitement, ou si les instructions d'une skill l'exigent explicitement pour cet outil précis (ex: un outil dont l'authentification/les identifiants sont liés à l'identité réelle, comme glab). Ne l'active JAMAIS simplement parce qu'une commande sandboxée a échoué ou par réflexe — diagnostique d'abord la vraie cause de l'échec."}
 		},
 		"required": ["command"],
 		"additionalProperties": false
@@ -94,6 +114,7 @@ func (t *ShellTool) ParametersSchema() json.RawMessage {
 type shellArgs struct {
 	Command        string `json:"command"`
 	TimeoutSeconds int    `json:"timeout_seconds"`
+	AsRealUser     bool   `json:"as_real_user"`
 }
 
 // effectiveTimeout retourne t.Timeout, ou 30s par défaut si non configuré.
@@ -148,7 +169,27 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		}
 	}
 
-	if t.Sandboxed {
+	// runAsRealUser : cette commande précise s'exécute sous l'identité réelle
+	// plutôt que sous le compte sandbox (voir ConfirmRealUser) — jamais vrai
+	// si le tool n'est pas sandboxé (rien à contourner, déjà l'identité
+	// réelle par défaut). Toujours reconfirmé ici, jamais mémorisé d'un appel
+	// à l'autre : voir le commentaire de ConfirmRealUser.
+	runAsRealUser := false
+	if args.AsRealUser && t.Sandboxed {
+		if t.ConfirmRealUser == nil {
+			return "", fmt.Errorf(`"as_real_user" demandé mais indisponible : confirmation interactive requise, aucun humain disponible pour la donner dans ce contexte`)
+		}
+		granted, err := t.ConfirmRealUser(ctx, args.Command)
+		if err != nil {
+			return "", fmt.Errorf("confirmation pour l'exécution sous l'identité réelle: %w", err)
+		}
+		if !granted {
+			return "", fmt.Errorf("exécution sous l'identité réelle refusée par l'utilisateur — commande non exécutée")
+		}
+		runAsRealUser = true
+	}
+
+	if t.Sandboxed && !runAsRealUser {
 		// Resynchronise avant chaque exécution, pas seulement une fois au
 		// moment de l'octroi initial : un fichier créé ou modifié depuis en
 		// dehors du harnais (édition manuelle, git pull/checkout lancé hors
@@ -159,6 +200,8 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		// personne ne relance GrantDirectory. Best-effort : un échec ici ne
 		// doit pas empêcher la commande de s'exécuter (elle échouera d'elle-
 		// même si l'accès manque réellement, avec une erreur normale).
+		// Inutile en mode runAsRealUser : cette commande précise n'utilise
+		// pas le compte sandbox, rien à synchroniser pour elle.
 		if err := sandbox.GrantDirectory(workDir); err != nil {
 			log.Printf("run_shell: échec de la resynchronisation sandbox de %q: %v", workDir, err)
 		}
@@ -176,7 +219,7 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 	defer cancel()
 
 	var cmd *exec.Cmd
-	if t.Sandboxed {
+	if t.Sandboxed && !runAsRealUser {
 		cmd = sandbox.WrapCommand(cctx, args.Command, t.GitConfigPath, t.HomeDir)
 	} else {
 		cmd = exec.CommandContext(cctx, "sh", "-c", args.Command)

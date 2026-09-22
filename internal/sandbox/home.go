@@ -35,7 +35,10 @@ func SandboxHomeDir(dir string) string {
 // (configs/caches écrits par les outils qui s'en servent comme HOME) doit
 // persister d'une session à l'autre comme n'importe quel autre cache. dir
 // doit déjà être un répertoire accordé à User (voir GrantDirectory), qui
-// couvre alors aussi ce sous-répertoire.
+// donne alors à User le droit d'y créer des fichiers/sous-répertoires — mais
+// SANS descendre dans ce sous-répertoire lui-même (voir le commentaire de
+// GrantDirectory sur sandboxHomeDirName) : son contenu reste aux permissions
+// que les outils de User lui-même leur donnent, jamais élargi.
 func EnsureSandboxHome(dir string) error {
 	home := SandboxHomeDir(dir)
 	if home == "" {

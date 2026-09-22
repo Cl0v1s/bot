@@ -3,10 +3,13 @@ package sandbox
 import (
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -22,16 +25,34 @@ import (
 // aucun privilège particulier tant que l'appelant est déjà propriétaire de
 // ces fichiers et membre du groupe Group (mis en place par Ensure).
 //
-// Un fichier déjà possédé par quelqu'un d'autre est ignoré (ni chgrp ni
-// chmod), plutôt que de faire échouer tout l'appel : chgrp/chmod exigent
-// d'être propriétaire du fichier (ou root), donc impossibles à appliquer
-// sans privilège particulier — mais aussi inutiles, son propriétaire ayant
-// déjà pleinement accès. Cas concret : une fois dir accordé, User lui-même
-// (voir WrapCommand) peut y avoir écrit des fichiers via run_shell, qui lui
-// appartiennent alors en propre. Sans ce contournement, un seul tel fichier
-// interromprait tout le parcours (filepath.WalkDir s'arrête à la première
-// erreur) et laisserait le reste de l'arborescence — tout ce qui vient
-// après, dans l'ordre de parcours — sans les droits nécessaires pour User.
+// Un fichier possédé par quelqu'un d'autre que l'appelant n'est ni chgrp ni
+// chmod directement (ça exigerait d'être root ou propriétaire) — mais si ce
+// propriétaire est justement User (cas concret et quasi unique ici : un
+// fichier créé ou réécrit par run_shell, voir WrapCommand), on peut lui
+// demander de s'ouvrir lui-même le bit d'écriture groupe, via le même sudo
+// déjà utilisé pour WrapCommand (voir ensureGroupWritableAsUser) : sans ça,
+// un tel fichier resterait accessible à User mais pas à l'utilisateur réel
+// via write_file — un umask permissif (voir le commentaire de WrapCommand)
+// n'aide pas quand l'outil qui a écrit ce fichier a demandé un mode
+// explicite (ex: 0644, comme le fait couramment un éditeur ou un outil qui
+// recrée un fichier plutôt que d'en modifier le contenu en place) : il n'y a
+// alors aucun bit d'écriture groupe à laisser passer, umask ou pas.
+// Tout autre propriétaire (ni l'appelant, ni User — cas rare, ex: un fichier
+// système croisé en travaillant dans un dossier partagé) reste ignoré comme
+// avant : ni chgrp/chmod possible, ni sudo applicable, mais aussi sans
+// conséquence pour cet appelant précis.
+//
+// Plus généralement, AUCUNE erreur sur un fichier précis (chown/chmod qui
+// échoue, propriétaire inattendu...) n'est jamais remontée comme faisant
+// échouer tout GrantDirectory : elle est journalisée et le parcours
+// continue. Nécessaire y compris pour un fichier qu'on POSSÈDE et qu'on
+// pourrait légitimement modifier : filepath.WalkDir s'arrête net à la
+// première erreur renvoyée par son callback, et un chemin comme /tmp est
+// partagé avec potentiellement de nombreux autres processus qui créent et
+// suppriment sans arrêt des fichiers sans rapport avec nous (observé en
+// pratique : une course avec un fichier temporaire d'une application tierce
+// a fait échouer, avant ce correctif, la synchronisation d'un fichier qui
+// nous intéressait vraiment, situé plus loin dans le même parcours).
 func GrantDirectory(dir string) error {
 	grp, err := user.LookupGroup(Group)
 	if err != nil {
@@ -58,6 +79,12 @@ func GrantDirectory(dir string) error {
 		}
 	}
 
+	// Rempli pendant le parcours (voir plus bas), traité en une poignée
+	// d'appels sudo groupés APRÈS le parcours plutôt qu'un par fichier
+	// pendant celui-ci — voir needsGroupWriteAsUser.
+	var ownedByUserNeedingFix []string
+	sandboxUID, sandboxUIDErr := lookupSandboxUID()
+
 	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -71,12 +98,50 @@ func GrantDirectory(dir string) error {
 		if err != nil {
 			return err
 		}
+
+		// .sandbox-home est le HOME dédié de User (voir home.go) : lui-même
+		// (ce répertoire) a besoin du droit d'écriture groupe pour que User
+		// puisse y créer des fichiers/sous-répertoires — mais SON CONTENU,
+		// lui, ne doit JAMAIS être touché : des outils comme glab refusent
+		// purement et simplement de fonctionner si leur fichier de
+		// config/identifiants a des permissions plus larges que 600
+		// (observé en pratique avec ~/.config/glab-cli/config.yml, remis en
+		// 660 par ce parcours avant ce correctif) — même logique que ssh ou
+		// gpg pour leurs propres fichiers sensibles. L'utilisateur réel n'a
+		// de toute façon aucun besoin d'accéder au contenu du HOME de User
+		// (configs/caches internes à SES outils à lui, jamais consultés via
+		// write_file/read_file).
+		skipContent := d.IsDir() && d.Name() == sandboxHomeDirName
+
 		if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+			if sandboxUIDErr == nil && int(st.Uid) == sandboxUID && needsGroupWriteAsUser(info) {
+				ownedByUserNeedingFix = append(ownedByUserNeedingFix, path)
+			}
+			if skipContent {
+				return fs.SkipDir
+			}
 			return nil
 		}
 
+		// best-effort à partir d'ici, pour CE chemin précis : un chown/chmod
+		// qui échoue (ex: le fichier vient de disparaître entre le listing
+		// et l'appel — TOCTOU banal dans un dossier partagé et volatil comme
+		// /tmp, où d'autres processus créent/suppriment sans arrêt des
+		// fichiers qui n'ont rien à voir avec nous) ne doit jamais
+		// interrompre tout le parcours (filepath.WalkDir s'arrête net à la
+		// première erreur remontée par le callback) : ça laisserait le
+		// reste de l'arborescence — tout ce qui vient après, dans l'ordre
+		// de parcours, potentiellement le fichier qu'on voulait vraiment
+		// accorder — sans les droits nécessaires, à cause d'un fichier sans
+		// rapport. Observé en pratique : une course avec un cookie temporaire
+		// Steam dans /tmp a empêché la resynchronisation d'un fichier
+		// fraîchement écrit par write_file juste après lui dans le parcours.
 		if err := os.Chown(path, -1, gid); err != nil {
-			return fmt.Errorf("changement de groupe de %q: %w", path, err)
+			log.Printf("sandbox: changement de groupe de %q ignoré (best-effort) : %v", path, err)
+			if skipContent {
+				return fs.SkipDir
+			}
+			return nil
 		}
 
 		mode := info.Mode().Perm()
@@ -89,12 +154,19 @@ func GrantDirectory(dir string) error {
 			}
 		}
 		if err := os.Chmod(path, mode); err != nil {
-			return fmt.Errorf("changement des droits de %q: %w", path, err)
+			log.Printf("sandbox: changement des droits de %q ignoré (best-effort) : %v", path, err)
+		}
+		if skipContent {
+			return fs.SkipDir
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
+
+	// Best-effort, comme documenté plus haut : un échec ici ne doit jamais
+	// faire échouer tout GrantDirectory.
+	_ = ensureGroupWritableAsUser(ownedByUserNeedingFix)
 
 	// setgid sur le répertoire racine accordé : les fichiers créés dedans
 	// par la suite héritent automatiquement du groupe Group.
@@ -106,6 +178,66 @@ func GrantDirectory(dir string) error {
 		return fmt.Errorf("pose du bit setgid sur %q: %w", dir, err)
 	}
 
+	return nil
+}
+
+// lookupSandboxUID retourne l'UID numérique de User (voir sandbox.go), pour
+// distinguer, dans GrantDirectory, "possédé par User lui-même" (cas où
+// ensureGroupWritableAsUser peut aider) de "possédé par un tiers
+// quelconque" (cas où rien n'est possible sans privilège particulier).
+func lookupSandboxUID() (int, error) {
+	u, err := user.Lookup(User)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(u.Uid)
+}
+
+// needsGroupWriteAsUser indique si info (déjà connu comme possédé par User,
+// voir l'appelant) manque du bit d'écriture groupe — évite de retraiter à
+// chaque appel de GrantDirectory des fichiers déjà corrigés par un appel
+// précédent (voir ensureGroupWritableAsUser : un dépôt git à l'intérieur
+// d'un dossier accordé, par exemple, peut compter des milliers d'objets
+// possédés par User une fois cloné via run_shell — sans ce filtre, chaque
+// futur appel à GrantDirectory sur ce même dossier retraiterait tous ces
+// objets pour rien).
+func needsGroupWriteAsUser(info os.FileInfo) bool {
+	return info.Mode().Perm()&0o020 == 0
+}
+
+// ensureGroupWritableAsUser demande à User (via le même sudo -n -u utilisé
+// pour WrapCommand, sans mot de passe) d'ajouter lui-même le bit d'écriture
+// groupe sur chacun de paths, des fichiers/répertoires qu'il possède déjà :
+// GrantDirectory, lui, tourne sous l'identité réelle de l'utilisateur et ne
+// peut PAS le faire directement (chmod exige d'être propriétaire du fichier,
+// ou root) — mais User, propriétaire, l'est. No-op si paths est vide.
+//
+// Groupé en un minimum d'appels sudo plutôt qu'un par fichier — nécessaire
+// en pratique : un dépôt git cloné via run_shell à l'intérieur d'un dossier
+// accordé compte facilement plusieurs milliers d'objets possédés par User,
+// et lancer un sous-processus sudo par fichier rendait GrantDirectory (donc
+// write_file et run_shell, qui l'appellent à chaque invocation) visiblement
+// bloqué le temps de tous les lancer un par un. batchSize garde chaque
+// ligne de commande à une taille raisonnable (bien en dessous d'ARG_MAX),
+// pas pour la vitesse de sudo lui-même.
+//
+// "g+rwX" plutôt que "g+rw" : le X majuscule n'ajoute le bit d'exécution
+// pour le groupe que si le chemin est un répertoire ou déjà exécutable pour
+// au moins une catégorie — même logique que la pose de mode faite plus haut
+// dans GrantDirectory pour un fichier possédé par l'appelant, appliquée ici
+// en une commande plutôt que répliquée en Go.
+func ensureGroupWritableAsUser(paths []string) error {
+	const batchSize = 200
+	for start := 0; start < len(paths); start += batchSize {
+		end := min(start+batchSize, len(paths))
+		batch := paths[start:end]
+
+		args := append([]string{"-n", "-u", User, "--", "chmod", "g+rwX"}, batch...)
+		out, err := exec.Command("sudo", args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("chmod de %d chemin(s) en tant que %q: %s: %w", len(batch), User, strings.TrimSpace(string(out)), err)
+		}
+	}
 	return nil
 }
 

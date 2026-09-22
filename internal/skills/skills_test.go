@@ -3,6 +3,7 @@ package skills
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +86,26 @@ func TestEnsureDefaultsCreatesOwnSubdirectory(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Name != defaultSkillDir {
 		t.Fatalf("Load() = %+v, attendu la skill par défaut", got)
+	}
+}
+
+// Summary doit instruire le modèle de lire une skill pertinente EN PREMIER
+// (avant tout autre outil/exploration), pas seulement "avant de l'utiliser"
+// — observé en pratique : cette dernière formulation laissait un modèle
+// tenter la tâche à sa façon (commandes à main levée) et ne consulter la
+// skill qu'après coup, voire jamais.
+func TestSummaryInstructsReadingSkillFirst(t *testing.T) {
+	list := []Skill{{Name: "exemple", Description: "fait un truc", Path: "/chemin/SKILL.md"}}
+	got := Summary(list)
+	for _, want := range []string{"TOUTE PREMIÈRE action", "read_file", "/chemin/SKILL.md"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Summary() = %q, attendu qu'il contienne %q", got, want)
+		}
+	}
+}
+
+func TestSummaryEmptyWhenNoSkills(t *testing.T) {
+	if got := Summary(nil); got != "" {
+		t.Fatalf("Summary(nil) = %q, attendu \"\"", got)
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"bot/internal/llm"
 )
@@ -160,33 +159,50 @@ Structure ta réponse en trois parties :
 Ne dis pas "voici un résumé", ne commente pas la demande : donne directement le contenu, en français.
 Réponds uniquement par du texte, jamais par un appel d'outil ni par une syntaxe qui y ressemble (ex: balises <tool_call>, <function=...>), même si le journal fourni en comporte : ta seule tâche ici est de résumer ce journal, pas de continuer la session ni d'agir.`
 
-// memoryNothingSentinel : réponse attendue de memoryExtractionSystemPrompt
-// quand rien ne mérite d'être retenu à long terme — un texte vide ferait
-// tout aussi bien l'affaire, mais un sentinel explicite évite de compter
-// comme "mémoire" un modèle qui répondrait par un simple espace ou un
-// commentaire vide de sens.
+// memoryNothingSentinel : réponse attendue de memoryMaintenanceSystemPrompt
+// quand rien ne mérite d'être gardé du tout (mémoire vidée) — un texte vide
+// ferait tout aussi bien l'affaire, mais un sentinel explicite évite de
+// compter comme "mémoire" un modèle qui répondrait par un simple espace ou
+// un commentaire vide de sens.
 const memoryNothingSentinel = "RIEN"
 
-// memoryExtractionSystemPrompt : appel séparé du résumé de compaction
+// memoryMaintenanceSystemPrompt : appel séparé du résumé de compaction
 // (summarizeSystemPrompt) — un résumé de conversation et une note de
 // mémoire long terme n'ont pas le même public ni la même durée de vie (le
 // premier vit et meurt avec cette conversation, la seconde est censée
 // survivre à un /reset ou à une future session) ni le même format souhaité,
 // les mélanger dans un seul appel aurait rendu l'un ou l'autre bâclé.
-var memoryExtractionSystemPrompt = fmt.Sprintf(`Le journal d'une session de travail est en train d'être compacté (un résumé en est produit séparément, ne le duplique pas ici). Cette mémoire est partagée entre TOUTES les tâches futures, même sans aucun rapport avec celle-ci : sois très sélectif, ce n'est pas un second résumé de la session.
+//
+// Volontairement une opération de MAINTENANCE (révision complète de ce qui
+// existe déjà + ce qui vient de cette session), pas une simple extraction
+// qui ajoute au fil de l'eau : le modèle reçoit toute la mémoire actuelle et
+// renvoie son contenu final complet, avec le pouvoir de retirer/fusionner ce
+// qui n'est plus utile, pas seulement d'éviter d'ajouter un doublon. Sans
+// ça, une mémoire purement en ajout ne fait que grossir indéfiniment, même
+// en évitant les doublons exacts (une préférence reformulée légèrement
+// différemment à chaque fois, une entrée devenue obsolète mais jamais
+// retirée...).
+var memoryMaintenanceSystemPrompt = fmt.Sprintf(`Tu fais la maintenance de la mémoire long terme, partagée entre TOUTES les tâches futures, même sans aucun rapport avec la session en cours en train d'être compactée. Ce n'est PAS un journal de compactions successives où l'on empile : c'est une révision complète à chaque fois.
 
-Ne retiens QUE ce qui resterait utile pour une tâche complètement différente, plus tard :
+On te donne, ci-dessous : (1) le contenu ACTUEL de cette mémoire (vide s'il n'y a encore rien), puis (2) le journal de la session en cours. Ta tâche : produire le contenu COMPLET et FINAL de la mémoire après révision — pas seulement ce qui change, pas un résumé de ce qui change, le contenu entier tel qu'il doit exister après cette révision.
+
+Pour chaque idée, existante ou candidate depuis le journal de cette session, ne la garde que si elle resterait utile pour une tâche complètement différente, plus tard :
 - préférences de travail de l'utilisateur (formats, conventions, outils préférés, façon dont il aime que tu procèdes...)
 - contraintes ou règles qu'il a demandé de respecter systématiquement
 - corrections qu'il t'a faites sur ton comportement
 - emplacements de fichiers/dossiers récurrents (le chemin lui-même, pas leur contenu)
 
-Ne retiens JAMAIS le contenu ou le sujet traité pendant cette session (l'histoire, les personnages, l'intrigue, les détails d'un projet ponctuel, ce qui a été fait ou produit...) : ça n'aide en rien pour une tâche différente, et alourdit cette mémoire un peu plus à chaque compaction pour rien. Le résumé de compaction s'occupe déjà de conserver le détail de LA tâche en cours.
+Retire activement (pas seulement "n'ajoute pas") :
+- ce qui est devenu obsolète ou contredit par quelque chose de plus récent
+- ce qui fait doublon ou quasi-doublon avec une autre entrée — fusionne en une seule entrée claire plutôt que d'en garder plusieurs versions
+- le contenu ou le sujet traité pendant CETTE session (l'histoire, les personnages, l'intrigue, les détails d'un projet ponctuel, ce qui a été fait ou produit...) : ça n'aide en rien pour une tâche différente, que ce soit déjà présent dans la mémoire actuelle ou candidat depuis le journal de cette session. Le résumé de compaction s'occupe déjà de conserver le détail de LA tâche en cours.
+- tout ce qui, en te relisant, ne passerait pas le test "utile pour une tâche complètement différente" même si ça y figurait déjà avant
 
-Le cas normal est qu'il n'y a RIEN à retenir ici : dans le doute, ne retiens rien plutôt que trop.
-Si rien de tel ne s'en dégage, réponds exactement %q et rien d'autre.
-Sinon, réponds uniquement par une liste à puces très concise (une idée par puce, jamais plus de 3-4 puces), sans préambule ni commentaire.
-Réponds uniquement par du texte, jamais par un appel d'outil ni par une syntaxe qui y ressemble (ex: balises <tool_call>, <function=...>), même si le journal fourni en comporte : ta seule tâche ici est d'extraire de ce journal, pas de continuer la session ni d'agir.`, memoryNothingSentinel)
+Le cas normal est une mémoire COURTE, et qui reste courte au fil du temps plutôt que de grossir sans fin : dans le doute, retire plutôt que garder. Une mémoire qui ne fait qu'accumuler est un échec de cette tâche de maintenance, pas une réussite prudente.
+
+Format : liste à puces concise, groupée par thème si plusieurs sujets distincts, sans horodatage ni mention de session (ce n'est pas un journal, juste l'état actuel des choses qui comptent).
+Si rien ne mérite d'être gardé au final (mémoire actuelle vide et rien de nouveau ne le mérite, OU plus rien de l'existant ne passe la révision), réponds exactement %q et rien d'autre.
+Réponds uniquement par le contenu final de la mémoire (ou le sentinel), jamais un commentaire sur ta démarche ("voici la mémoire mise à jour" etc.), jamais un appel d'outil ni une syntaxe qui y ressemble (ex: balises <tool_call>, <function=...>), même si le journal fourni en comporte.`, memoryNothingSentinel)
 
 // serializeForSummary transforme messages en un journal texte lisible, à
 // donner comme DONNÉE dans un unique message "user" plutôt que de rejouer
@@ -247,47 +263,77 @@ func looksLikeToolCallArtifact(s string) bool {
 	return false
 }
 
-// persistMemory extrait, via un appel LLM séparé du résumé de compaction,
-// ce qui parmi messages mérite de survivre à cette conversation (voir
-// memoryExtractionSystemPrompt), et l'ajoute à c.MemoryFile si le modèle en
-// a trouvé. Ne fait rien si c.MemoryFile est vide.
+// memoryContextCap : nombre max de caractères de c.MemoryFile transmis au
+// modèle (voir persistMemory) — garde-fou contre un fichier devenu
+// pathologiquement gros (corruption, écriture manuelle malheureuse...), pas
+// un mécanisme normal : maintenant que persistMemory renvoie le contenu
+// COMPLET de la mémoire (voir memoryMaintenanceSystemPrompt), tronquer
+// l'entrée revient à supprimer silencieusement tout ce qui dépasse — jamais
+// anodin comme ça l'était quand la mémoire ne faisait que s'accumuler par
+// ajout. Volontairement généreux (une mémoire qui a besoin d'plus que ça est
+// déjà le signe que la maintenance elle-même a échoué à la garder courte) ;
+// un dépassement est journalisé (voir persistMemory), jamais silencieux.
+const memoryContextCap = 60000
+
+// persistMemory fait la maintenance de c.MemoryFile via un appel LLM séparé
+// du résumé de compaction (voir memoryMaintenanceSystemPrompt) : lui donne
+// le contenu actuel de la mémoire ainsi que le journal de cette session, et
+// REMPLACE tout le fichier par ce que le modèle renvoie — pas un ajout, une
+// révision complète qui peut aussi bien retirer/fusionner de l'existant
+// qu'ajouter du nouveau. Ne fait rien si c.MemoryFile est vide.
 //
-// Purement best-effort : toute erreur (appel LLM, écriture disque) est
-// journalisée puis ignorée plutôt que remontée à l'appelant — le résultat
-// de Compact (la compaction elle-même a réussi ou non) ne doit jamais
-// dépendre du succès de cet à-côté.
+// Purement best-effort : toute erreur (lecture ou écriture disque, appel
+// LLM) est journalisée puis ignorée plutôt que remontée à l'appelant — le
+// résultat de Compact (la compaction elle-même a réussi ou non) ne doit
+// jamais dépendre du succès de cet à-côté.
 func (c *Conversation) persistMemory(ctx context.Context, client *llm.Client, messages []llm.Message) {
 	if c.MemoryFile == "" {
 		return
 	}
 
+	existing := ""
+	if data, err := os.ReadFile(c.MemoryFile); err == nil {
+		existing = strings.TrimSpace(string(data))
+		if len(existing) > memoryContextCap {
+			log.Printf("convo: mémoire (%s) tronquée à %d caractères avant maintenance (%d au total) — le surplus ne sera pas revu et pourrait être perdu de la révision", c.MemoryFile, memoryContextCap, len(existing))
+			existing = existing[len(existing)-memoryContextCap:]
+		}
+	}
+
+	userContent := "Mémoire actuelle : (vide, rien n'est encore enregistré)\n\n--- fin de la mémoire actuelle ---\n\n"
+	if existing != "" {
+		userContent = "Mémoire actuelle :\n\n" + existing + "\n\n--- fin de la mémoire actuelle ---\n\n"
+	}
+	userContent += serializeForSummary(messages) + "\n\n--- fin du journal de cette session ---\n\nProduis le contenu complet et final de la mémoire après révision, selon les instructions données."
+
 	req := []llm.Message{
-		{Role: "system", Content: memoryExtractionSystemPrompt},
-		{Role: "user", Content: serializeForSummary(messages) + "\n\n--- fin du journal ---\n\nExtrais-en ce qui mérite d'être retenu, selon les instructions données."},
+		{Role: "system", Content: memoryMaintenanceSystemPrompt},
+		{Role: "user", Content: userContent},
 	}
 
 	msg, _, err := client.ChatCompletion(ctx, req, nil)
 	if err != nil {
-		log.Printf("convo: extraction mémoire (compaction): %v", err)
+		log.Printf("convo: maintenance mémoire (compaction): %v", err)
 		return
 	}
 	content := strings.TrimSpace(msg.Content)
-	if content == "" || strings.EqualFold(content, memoryNothingSentinel) {
+	if looksLikeToolCallArtifact(content) {
+		log.Printf("convo: maintenance mémoire ignorée (appel d'outil échappé en texte au lieu d'un contenu de mémoire valide) : %s", content)
 		return
 	}
-	if looksLikeToolCallArtifact(content) {
-		log.Printf("convo: extraction mémoire ignorée (appel d'outil échappé en texte au lieu d'une extraction valide) : %s", content)
+	if strings.EqualFold(content, memoryNothingSentinel) {
+		content = ""
+	}
+
+	if content == existing {
+		// Rien à écrire : évite une écriture disque et une resynchronisation
+		// sandbox (voir write_file, dont la logique n'est pas dupliquée ici —
+		// persistMemory écrit toujours sous l'identité réelle) pour un
+		// contenu identique, cas courant quand la révision ne change rien.
 		return
 	}
 
-	entry := fmt.Sprintf("\n## %s (compaction automatique)\n%s\n", time.Now().Format("2006-01-02 15:04"), content)
-	f, err := os.OpenFile(c.MemoryFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
-		log.Printf("convo: écriture mémoire (%s): %v", c.MemoryFile, err)
-		return
-	}
-	defer f.Close()
-	if _, err := f.WriteString(entry); err != nil {
+	if err := os.WriteFile(c.MemoryFile, []byte(content), 0o644); err != nil {
 		log.Printf("convo: écriture mémoire (%s): %v", c.MemoryFile, err)
 	}
 }

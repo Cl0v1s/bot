@@ -164,6 +164,32 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}
 
+	// realUserGrantWindow : une fois confirmée, la fenêtre pendant laquelle les
+	// commandes "as_real_user" suivantes sont autorisées sans redemander (voir
+	// confirmRealUser) — une tâche qui enchaîne plusieurs commandes sous
+	// l'identité réelle (ex: `glab auth login` puis une vérification juste
+	// après) ne redemande pas à chaque appel. Volontairement court plutôt
+	// qu'une mémorisation permanente comme DirPermissions : l'accès accordé
+	// ici est bien plus large (n'importe quelle commande, pas un répertoire
+	// précis).
+	const realUserGrantWindow = 5 * time.Minute
+	var realUserGrantedUntil time.Time
+
+	// confirmRealUser : voir tools.ShellTool.ConfirmRealUser.
+	confirmRealUser := func(ctx context.Context, command string) (bool, error) {
+		if time.Now().Before(realUserGrantedUntil) {
+			return true, nil
+		}
+		fmt.Fprintln(out, color(ansiMagenta, "\n[run_shell] le modèle demande à exécuter cette commande sous l'identité réelle (hors sandbox, accès complet) :"))
+		fmt.Fprintln(out, color(ansiMagenta, "  "+command))
+		fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  (une fois autorisé, valable %s pour les commandes suivantes sous l'identité réelle, sans redemander)", realUserGrantWindow)))
+		if !askYesNo(ctx, "  autoriser ? [o/N] ") {
+			return false, nil
+		}
+		realUserGrantedUntil = time.Now().Add(realUserGrantWindow)
+		return true, nil
+	}
+
 	var registry *tools.Registry
 	if toolsCfg.Enabled {
 		// shellAvailable : run_shell n'est proposé que si le sandbox n'est pas
@@ -242,7 +268,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.ListDirTool{},
 		}
 		if shellAvailable {
-			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir})
+			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, ConfirmRealUser: confirmRealUser})
 		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {

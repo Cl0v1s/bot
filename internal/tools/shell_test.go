@@ -138,3 +138,96 @@ func TestShellNotifyDisabledByDefault(t *testing.T) {
 		t.Fatalf("notification envoyée alors que NotifyThreshold est désactivé (0): %q", string(data))
 	}
 }
+
+// "as_real_user" n'a aucun effet particulier quand le tool n'est pas
+// sandboxé (déjà l'identité réelle par défaut) : ConfirmRealUser ne doit
+// même pas être consulté.
+func TestShellAsRealUserNoOpWhenNotSandboxed(t *testing.T) {
+	called := false
+	tool := &ShellTool{
+		Timeout:         2 * time.Second,
+		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) { called = true; return true, nil },
+	}
+	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if called {
+		t.Fatal("ConfirmRealUser appelé alors que le tool n'est pas sandboxé")
+	}
+	if !strings.Contains(out, "bonjour") {
+		t.Fatalf("sortie = %q, attendu qu'elle contienne bonjour", out)
+	}
+}
+
+// Sandboxé, mais sans ConfirmRealUser configuré (ex: mode mail, aucun humain
+// disponible) : "as_real_user" doit échouer explicitement, pas se rabattre
+// silencieusement sur le compte sandbox ni sur l'identité réelle sans
+// confirmation.
+func TestShellAsRealUserFailsWithoutConfirmCallback(t *testing.T) {
+	tool := &ShellTool{Timeout: 2 * time.Second, Sandboxed: true}
+	_, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
+	if err == nil {
+		t.Fatal("attendu une erreur (ConfirmRealUser non configuré)")
+	}
+	if !strings.Contains(err.Error(), "confirmation interactive") {
+		t.Fatalf("erreur = %q, attendu qu'elle mentionne l'absence de confirmation interactive possible", err.Error())
+	}
+}
+
+// Un refus explicite de ConfirmRealUser doit faire échouer l'appel avec un
+// message clair, sans jamais retomber sur le compte sandbox à la place.
+func TestShellAsRealUserFailsWhenConfirmationDenied(t *testing.T) {
+	tool := &ShellTool{
+		Timeout:         2 * time.Second,
+		Sandboxed:       true,
+		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) { return false, nil },
+	}
+	_, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
+	if err == nil {
+		t.Fatal("attendu une erreur (confirmation refusée)")
+	}
+	if !strings.Contains(err.Error(), "refusée") {
+		t.Fatalf("erreur = %q, attendu qu'elle mentionne le refus", err.Error())
+	}
+}
+
+// ConfirmRealUser doit recevoir exactement la commande demandée.
+func TestShellAsRealUserPassesExactCommandToConfirm(t *testing.T) {
+	var gotCommand string
+	tool := &ShellTool{
+		Timeout:   2 * time.Second,
+		Sandboxed: true,
+		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) {
+			gotCommand = command
+			return true, nil
+		},
+	}
+	if _, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if gotCommand != "echo bonjour" {
+		t.Fatalf("commande reçue par ConfirmRealUser = %q, attendu %q", gotCommand, "echo bonjour")
+	}
+}
+
+// Une fois la confirmation accordée, la commande doit s'exécuter comme un
+// run_shell non sandboxé (sh -c direct) — pas via sandbox.WrapCommand (qui
+// exigerait un compte sandbox réellement configuré sur la machine de test,
+// absent ici) : une régression qui continuerait à passer par WrapCommand
+// malgré la confirmation ferait échouer cet appel plutôt que de renvoyer la
+// sortie attendue.
+func TestShellAsRealUserRunsCommandDirectlyOnceConfirmed(t *testing.T) {
+	tool := &ShellTool{
+		Timeout:         2 * time.Second,
+		Sandboxed:       true,
+		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) { return true, nil },
+	}
+	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if !strings.Contains(out, "bonjour") {
+		t.Fatalf("sortie = %q, attendu qu'elle contienne bonjour (commande exécutée directement)", out)
+	}
+}
