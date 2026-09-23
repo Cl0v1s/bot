@@ -232,7 +232,9 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		gitConfigPath := ""
 		homeDir := ""
 		if toolsCfg.WorkspaceDir != "" {
-			perms.AlwaysAllow(toolsCfg.WorkspaceDir, os.TempDir())
+			// "/tmp" explicitement : sur macOS, os.TempDir() est $TMPDIR
+			// (/var/folders/..., privé à l'utilisateur), pas /tmp.
+			perms.AlwaysAllow(toolsCfg.WorkspaceDir, "/tmp", os.TempDir())
 			if sandboxReady {
 				if toolsCfg.SandboxSSHKey != "" {
 					if err := sandbox.EnsureSSHKeyAccess(toolsCfg.SandboxSSHKey); err != nil {

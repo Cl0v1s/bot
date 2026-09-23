@@ -11,17 +11,19 @@ import (
 )
 
 // withFakeNotifySend place, en tête du PATH pour la durée du test, un faux
-// "notify-send" qui journalise ses arguments dans un fichier — pour vérifier
-// que le mécanisme de notification (best-effort, en tâche de fond) se
-// déclenche bien, sans dépendre d'une vraie session graphique.
+// "notify-send" (Linux) et un faux "osascript" (macOS, voir notifyOS) qui
+// journalisent leurs arguments dans un fichier — pour vérifier que le
+// mécanisme de notification (best-effort, en tâche de fond) se déclenche
+// bien, sans dépendre d'une vraie session graphique.
 func withFakeNotifySend(t *testing.T) (logPath string) {
 	t.Helper()
 	dir := t.TempDir()
 	logPath = filepath.Join(dir, "notify.log")
 	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
-	fake := filepath.Join(dir, "notify-send")
-	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
-		t.Fatalf("écriture du faux notify-send: %v", err)
+	for _, name := range []string{"notify-send", "osascript"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
+			t.Fatalf("écriture du faux %s: %v", name, err)
+		}
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return logPath

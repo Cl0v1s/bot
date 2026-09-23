@@ -96,6 +96,7 @@ func main() {
 	systemPrompt += "\n\n" + agent.WorkspacePrompt(cfg.WorkspaceDir, cfg.SkillsDir(), cfg.ScratchpadDir(), cfg.MemoryFile(), memoryContent)
 
 	client := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	client.HTTPClient.Timeout = cfg.LLMTimeout
 
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
 	// lancé : sinon, lancer le programme depuis un dossier différent d'une
@@ -187,7 +188,9 @@ func main() {
 			// voir agent.WorkspacePrompt) reste accessible même après un
 			// Refresh() (voir pollOnce), contrairement aux répertoires
 			// accordés dynamiquement.
-			perms.AlwaysAllow(cfg.WorkspaceDir, os.TempDir())
+			// "/tmp" explicitement : sur macOS, os.TempDir() est $TMPDIR
+			// (/var/folders/..., privé à l'utilisateur), pas /tmp.
+			perms.AlwaysAllow(cfg.WorkspaceDir, "/tmp", os.TempDir())
 
 			toolList := []tools.Tool{
 				&tools.ReadFileTool{Perms: perms},

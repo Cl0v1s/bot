@@ -106,7 +106,7 @@ func TestCheckFileRecognizesSymlinkAliases(t *testing.T) {
 // manuellement entre-temps).
 func TestCheckFileUsesRealSandboxAccessWhenReady(t *testing.T) {
 	withSandboxReady(t, true)
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	file := filepath.Join(dir, "note.txt")
 	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestCheckFileUsesRealSandboxAccessWhenReady(t *testing.T) {
 // que le fichier (ou ses répertoires parents) n'existent pas encore.
 func TestCheckFileWriteChecksNearestExistingAncestor(t *testing.T) {
 	withSandboxReady(t, true)
-	dir := t.TempDir()
+	dir := canonicalTempDir(t)
 	newFile := filepath.Join(dir, "sous-dossier", "encore", "note.txt")
 
 	prevCanAccess := sandboxCanAccess
@@ -148,4 +148,16 @@ func TestCheckFileWriteChecksNearestExistingAncestor(t *testing.T) {
 	if _, err := (&DirPermissions{}).checkFile(newFile, true); err != nil {
 		t.Fatalf("checkFile: %v", err)
 	}
+}
+
+// canonicalTempDir retourne t.TempDir() liens symboliques résolus : sur
+// macOS, il est sous /var/folders, alias de /private/var/folders — or
+// sandboxCanAccess reçoit toujours le chemin canonique (voir canonicalPath).
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

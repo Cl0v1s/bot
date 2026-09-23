@@ -4,7 +4,9 @@ package sandbox
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
+	"os/user"
 	"strconv"
 	"strings"
 )
@@ -14,15 +16,43 @@ import (
 // groupe fraîchement rejoint sans reconnexion complète ; on le signale
 // clairement plutôt que de laisser échouer GrantDirectory juste après avec
 // un message cryptique.
+//
+// groupStale seul ne suffit pas sur macOS : getgroups(2) n'y renvoie qu'au
+// plus 16 groupes (le reste est résolu à la demande par le noyau via
+// opendirectoryd), et un groupe tout juste rejoint via dseditgroup y est
+// souvent déjà pris en compte par le noyau pour chown(2) sans y apparaître.
+// Un "stale" est donc confirmé par un vrai chgrp d'essai (canChgrpTo) avant
+// d'être signalé — c'est exactement l'opération dont GrantDirectory a besoin.
 func ensureGroupActive(group string) error {
 	stale, err := groupStale(group)
 	if err != nil {
 		return err
 	}
-	if !stale {
+	if !stale || canChgrpTo(group) {
 		return nil
 	}
 	return fmt.Errorf("%q vient d'être rejoint mais n'est pas encore actif pour cette session : ouvrez un nouveau terminal (ou déconnectez-vous puis reconnectez-vous), puis relancez le programme", group)
+}
+
+// canChgrpTo teste, sur un fichier temporaire jetable, si le processus
+// courant peut réellement en changer le groupe vers group.
+func canChgrpTo(group string) bool {
+	grp, err := user.LookupGroup(group)
+	if err != nil {
+		return false
+	}
+	gid, err := strconv.Atoi(grp.Gid)
+	if err != nil {
+		return false
+	}
+	f, err := os.CreateTemp("", "bot-chgrp-probe-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	defer os.Remove(name)
+	return os.Chown(name, -1, gid) == nil
 }
 
 // createSystemUserAndGroup crée le groupe et l'utilisateur système "llm" via

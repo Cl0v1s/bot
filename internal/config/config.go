@@ -18,6 +18,11 @@ type Config struct {
 	LLMAPIKey    string // souvent une valeur factice pour un serveur local
 	LLMModel     string
 	SystemPrompt string
+	// LLMTimeout : durée maximale d'une requête au LLM, de l'envoi à la fin
+	// de la réponse (voir llm.DefaultTimeout). 0 = aucune limite (seule
+	// l'annulation du contexte, ex: Ctrl+C en mode chat, interrompt alors la
+	// requête).
+	LLMTimeout time.Duration
 
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
@@ -285,6 +290,14 @@ func Load() Config {
 		contextMaxTokens = 8192
 	}
 
+	// Comme TOOLS_SHELL_NOTIFY_THRESHOLD, 0 est une valeur valide (pas de
+	// limite) : seule une erreur de parsing ou une valeur négative retombe
+	// sur le défaut.
+	llmTimeout, err := time.ParseDuration(getenv("LLM_TIMEOUT", "10m"))
+	if err != nil || llmTimeout < 0 {
+		llmTimeout = 10 * time.Minute
+	}
+
 	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.95"), 64)
 	if err != nil || contextCompactAt <= 0 || contextCompactAt > 1 {
 		contextCompactAt = 0.95
@@ -335,6 +348,7 @@ func Load() Config {
 		LLMAPIKey:    getenvAllowEmpty("LLM_API_KEY", "sk-local"),
 		LLMModel:     getenv("LLM_MODEL", "local-model"),
 		SystemPrompt: getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
+		LLMTimeout:   llmTimeout,
 
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,

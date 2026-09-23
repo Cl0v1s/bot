@@ -87,16 +87,47 @@ func GrantDirectory(dir string) error {
 
 	if err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return err
+			// Seule une erreur sur dir lui-même fait échouer l'octroi : pour
+			// tout autre chemin (sous-répertoire illisible, entrée disparue
+			// entre le listing et l'appel...), on journalise et on continue,
+			// comme documenté plus haut — sinon WalkDir s'arrête net et laisse
+			// tout le reste de l'arborescence sans les droits nécessaires
+			// (observé sur macOS : octroi de ~/Documents interrompu à mi-
+			// parcours, sans setgid posé sur la racine).
+			if path == dir {
+				return err
+			}
+			log.Printf("sandbox: %q ignoré (best-effort) : %v", path, err)
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 
 		if isProtectedFromGrant(d.Name()) {
 			return nil
 		}
 
+		// Un lien symbolique n'est jamais suivi : os.Chown/os.Chmod
+		// agiraient sur sa CIBLE, potentiellement hors du répertoire accordé
+		// (ex: node_modules -> ~/.meteor/..., fréquent dans un projet JS),
+		// ouvrant au compte sandbox un chemin que l'utilisateur n'a jamais
+		// accordé. Seul le groupe du lien lui-même est changé (Lchown) ; ses
+		// droits n'ont aucun effet sur macOS comme sur Linux.
+		if d.Type()&fs.ModeSymlink != 0 {
+			if !ownedByMe(d) {
+				return nil
+			}
+			if err := os.Lchown(path, -1, gid); err != nil {
+				log.Printf("sandbox: changement de groupe du lien %q ignoré (best-effort) : %v", path, err)
+			}
+			return nil
+		}
+
 		info, err := d.Info()
 		if err != nil {
-			return err
+			log.Printf("sandbox: %q ignoré (best-effort) : %v", path, err)
+			return nil
 		}
 
 		// .sandbox-home est le HOME dédié de User (voir home.go) : lui-même
@@ -179,6 +210,17 @@ func GrantDirectory(dir string) error {
 	}
 
 	return nil
+}
+
+// ownedByMe indique si d (sans suivre un éventuel lien symbolique)
+// appartient à l'utilisateur effectif du processus courant.
+func ownedByMe(d fs.DirEntry) bool {
+	info, err := d.Info()
+	if err != nil {
+		return false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	return ok && int(st.Uid) == os.Geteuid()
 }
 
 // lookupSandboxUID retourne l'UID numérique de User (voir sandbox.go), pour

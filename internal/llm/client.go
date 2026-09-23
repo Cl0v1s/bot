@@ -68,13 +68,20 @@ type Client struct {
 	HTTPClient *http.Client
 }
 
+// DefaultTimeout : durée maximale d'une requête complète au LLM (voir
+// config.Config.LLMTimeout). Large, car en mode non-streamé le serveur
+// (llama.cpp, vLLM...) n'envoie ses en-têtes qu'une fois toute la réponse
+// générée : sur une machine peu puissante, traitement du prompt + génération
+// dépassent facilement quelques minutes.
+const DefaultTimeout = 10 * time.Minute
+
 func New(baseURL, apiKey, model string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Model:   model,
 		HTTPClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: DefaultTimeout,
 		},
 	}
 }
