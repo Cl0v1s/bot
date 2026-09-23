@@ -66,6 +66,15 @@ type Client struct {
 	APIKey     string
 	Model      string
 	HTTPClient *http.Client
+
+	// ContextTokens : taille de contexte demandée lors d'un chargement
+	// automatique du modèle (voir tryLoadModel) — 0 = laisse le serveur
+	// choisir sa propre valeur par défaut au chargement, qui peut être
+	// nettement plus petite que le contexte natif du modèle (vu en
+	// pratique) : à régler explicitement (ex: depuis
+	// config.Config.ContextMaxTokens) pour obtenir le contexte réellement
+	// voulu plutôt qu'une valeur arbitraire choisie par le serveur.
+	ContextTokens int
 }
 
 // DefaultTimeout : durée maximale d'une requête complète au LLM (voir
@@ -108,10 +117,95 @@ type chatResponse struct {
 	} `json:"error"`
 }
 
+// modelNotLoadedSubstring identifie (sous-chaîne insensible à la casse, dans
+// le texte final de l'erreur remontée par chatCompletionOnce/
+// chatCompletionStreamOnce) l'erreur "aucun modèle chargé" que renvoient
+// certains serveurs d'inférence locaux à backend paresseux (ex: Unsloth
+// Studio — message d'origine observé : "No model loaded. Call POST
+// /inference/load first.") quand aucun modèle n'est en mémoire au moment de
+// la requête. Sur un tel serveur, ChatCompletion/ChatCompletionStream
+// tentent alors un chargement automatique (voir tryLoadModel) puis rejouent
+// la requête UNE fois, plutôt que de faire échouer tout de suite un mail ou
+// un tour de chat pour une simple absence de modèle chargé — sans effet sur
+// un serveur qui ne renvoie jamais ce message précis (ex: llama.cpp/vLLM,
+// où un modèle est chargé une fois pour toutes au démarrage) : le
+// comportement reste alors identique à avant, l'erreur d'origine remontée
+// telle quelle.
+const modelNotLoadedSubstring = "no model loaded"
+
+// tryLoadModel demande au serveur d'inférence de charger c.Model, via
+// l'endpoint propriétaire POST {BaseURL}/load (vu sur Unsloth Studio — non
+// standardisé OpenAI, mais servi sous la même base d'URL que
+// /chat/completions). c.Model peut porter un suffixe ":quant" (ex:
+// "org/modèle:UD-Q4_K_XL", convention déjà utilisée telle quelle comme
+// "model" dans les requêtes de complétion, et affichée sous cette forme par
+// GET {BaseURL}/models, où "id" et "quant" apparaissent comme deux champs
+// séparés) : il faut le scinder avant d'appeler /load, qui refuse un
+// "model_path" contenant ":" (vérifié empiriquement : il tente alors de le
+// résoudre comme un dépôt HuggingFace, pour lequel ':' est un caractère
+// invalide, et échoue). "max_seq_length" n'est transmis que si
+// ContextTokens est configuré (voir son commentaire) : l'omettre ne
+// "laisse rien inchangé", ça fait choisir au serveur une valeur par défaut
+// (vu en pratique : nettement plus petite que le contexte natif du modèle).
+func (c *Client) tryLoadModel(ctx context.Context) error {
+	modelPath, variant, _ := strings.Cut(c.Model, ":")
+
+	reqBody, err := json.Marshal(struct {
+		ModelPath    string `json:"model_path"`
+		GGUFVariant  string `json:"gguf_variant,omitempty"`
+		MaxSeqLength int    `json:"max_seq_length,omitempty"`
+	}{
+		ModelPath:    modelPath,
+		GGUFVariant:  variant,
+		MaxSeqLength: c.ContextTokens,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/load", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("chargement automatique du modèle %q: %w", c.Model, err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("chargement automatique du modèle %q refusé (status %d): %s", c.Model, resp.StatusCode, string(body))
+	}
+	return nil
+}
+
 // ChatCompletion envoie l'historique de messages (et, si fourni, la liste de
 // tools proposés) et retourne le message assistant complet (non-streamé,
-// avec ses éventuels tool_calls) ainsi que l'usage de tokens.
+// avec ses éventuels tool_calls) ainsi que l'usage de tokens — avec une
+// tentative de chargement automatique du modèle puis une seule relance si le
+// serveur répond "aucun modèle chargé" (voir modelNotLoadedSubstring).
 func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools []Tool) (Message, Usage, error) {
+	msg, usage, err := c.chatCompletionOnce(ctx, messages, tools)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), modelNotLoadedSubstring) {
+		if loadErr := c.tryLoadModel(ctx); loadErr == nil {
+			return c.chatCompletionOnce(ctx, messages, tools)
+		}
+		// Le chargement automatique a lui-même échoué (serveur sans cet
+		// endpoint, modèle introuvable...) : on retombe sur l'erreur
+		// d'origine, plus parlante pour un serveur qui ne supporte de toute
+		// façon pas ce mécanisme, plutôt que de la masquer derrière l'échec
+		// du chargement.
+	}
+	return msg, usage, err
+}
+
+func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, tools []Tool) (Message, Usage, error) {
 	reqBody, err := json.Marshal(chatRequest{
 		Model:    c.Model,
 		Messages: messages,
@@ -168,8 +262,28 @@ func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools [
 // fragment de texte reçu (format SSE "data: {...}"). Retourne le texte
 // complet et l'usage de tokens rapporté par le serveur (demandé via
 // stream_options.include_usage, supporté par les serveurs llama.cpp/vLLM/etc.
-// compatibles OpenAI récents).
+// compatibles OpenAI récents) — avec la même tentative de chargement
+// automatique + relance unique que ChatCompletion (voir
+// modelNotLoadedSubstring) si le serveur répond "aucun modèle chargé".
+//
+// Si le premier essai a déjà appelé onDelta avant d'échouer (peu probable
+// pour cette erreur précise, qui survient avant tout token produit, mais pas
+// structurellement impossible), la relance rappelle onDelta depuis le début
+// : un onDelta idempotent-à-l'affichage (ex: impression directe sur la
+// sortie, comme le fait le mode chat) afficherait alors un double texte
+// partiel — cas non observé en pratique pour cette erreur précise, donc pas
+// traité spécifiquement ici.
 func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, onDelta func(string)) (string, Usage, error) {
+	full, usage, err := c.chatCompletionStreamOnce(ctx, messages, onDelta)
+	if err != nil && strings.Contains(strings.ToLower(err.Error()), modelNotLoadedSubstring) {
+		if loadErr := c.tryLoadModel(ctx); loadErr == nil {
+			return c.chatCompletionStreamOnce(ctx, messages, onDelta)
+		}
+	}
+	return full, usage, err
+}
+
+func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Message, onDelta func(string)) (string, Usage, error) {
 	reqBody, err := json.Marshal(chatRequest{
 		Model:         c.Model,
 		Messages:      messages,

@@ -97,6 +97,26 @@ type Config struct {
 	ToolsBrowserFetchTimeout time.Duration
 	AgentMaxSteps            int
 
+	// AgentMaxConsecutiveShellFailures : nombre d'échecs run_shell d'affilée
+	// (code de sortie non nul, timeout, ou erreur du tool lui-même — voir
+	// agent.shellCallFailed) au-delà duquel le harnais injecte un message
+	// poussant le modèle à arrêter d'insister sur la même approche et à en
+	// chercher une différente, plutôt que de le laisser retenter
+	// indéfiniment une commande qui échoue de la même façon. Remis à zéro
+	// dès qu'un run_shell réussit. <= 0 = désactivé (jamais de message
+	// injecté, quel que soit le nombre d'échecs).
+	AgentMaxConsecutiveShellFailures int
+
+	// AgentRealUserWindow : durée de la fenêtre ouverte quand le modèle
+	// demande "as_real_user_window: true" sur run_shell et que
+	// l'utilisateur confirme (voir internal/tools.ShellTool.ConfirmRealUser
+	// et internal/chat.confirmRealUser) — les commandes "as_real_user"
+	// suivantes sont alors autorisées sans redemander tant que la fenêtre
+	// est ouverte. Sans "as_real_user_window", chaque commande
+	// "as_real_user" redemande confirmation individuellement (mode
+	// "oneshot"), quelle que soit cette valeur. <= 0 = défaut (5 min).
+	AgentRealUserWindow time.Duration
+
 	// WorkspaceDir : répertoire toujours accessible en lecture/écriture pour
 	// read_file/write_file (voir internal/tools.DirPermissions.AlwaysAllow),
 	// que ce soit en mode chat ou mail, sans passer par
@@ -342,6 +362,20 @@ func Load() Config {
 	if err != nil || agentMaxSteps <= 0 {
 		agentMaxSteps = 8
 	}
+	// Pas de repli sur une valeur par défaut si la variable est absente et
+	// que la conversion échoue pour une AUTRE raison qu'une valeur non
+	// numérique volontaire : contrairement à agentMaxSteps ci-dessus (dont 0
+	// n'a pas de sens et doit retomber sur le défaut), 0 est une valeur
+	// valide ici (désactive la fonctionnalité) — seule une valeur vraiment
+	// non numérique retombe sur le défaut.
+	agentMaxConsecutiveShellFailures, err := strconv.Atoi(getenv("AGENT_MAX_CONSECUTIVE_SHELL_FAILURES", "5"))
+	if err != nil {
+		agentMaxConsecutiveShellFailures = 5
+	}
+	agentRealUserWindow, err := time.ParseDuration(getenv("AGENT_REAL_USER_WINDOW", "5m"))
+	if err != nil || agentRealUserWindow <= 0 {
+		agentRealUserWindow = 5 * time.Minute
+	}
 
 	return Config{
 		LLMBaseURL:   getenv("LLM_BASE_URL", "http://localhost:8080/v1"),
@@ -379,12 +413,14 @@ func Load() Config {
 		SandboxUserEnabled: getenvBool("SANDBOX_USER_ENABLED", true),
 		SandboxSSHKey:      getenv("SANDBOX_SSH_KEY", defaultSandboxSSHKey()),
 
-		ToolsShellTimeout:         toolsShellTimeout,
-		ToolsShellMaxTimeout:      toolsShellMaxTimeout,
-		ToolsShellNotifyThreshold: toolsShellNotifyThreshold,
-		ToolsHTTPTimeout:          toolsHTTPTimeout,
-		ToolsBrowserFetchTimeout:  toolsBrowserFetchTimeout,
-		AgentMaxSteps:             agentMaxSteps,
+		ToolsShellTimeout:                toolsShellTimeout,
+		ToolsShellMaxTimeout:             toolsShellMaxTimeout,
+		ToolsShellNotifyThreshold:        toolsShellNotifyThreshold,
+		ToolsHTTPTimeout:                 toolsHTTPTimeout,
+		ToolsBrowserFetchTimeout:         toolsBrowserFetchTimeout,
+		AgentMaxSteps:                    agentMaxSteps,
+		AgentMaxConsecutiveShellFailures: agentMaxConsecutiveShellFailures,
+		AgentRealUserWindow:              agentRealUserWindow,
 
 		WorkspaceDir: getenv("WORKSPACE_DIR", defaultWorkspaceDir()),
 	}

@@ -321,6 +321,29 @@ func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) 
 		return false, nil
 	}
 
+	// Vérification post-octroi, en mode sandboxé uniquement : p.grant (via
+	// sandbox.GrantDirectory, dans l'implémentation du mode chat) peut
+	// annoncer un succès (err == nil) sans que l'accès réel du compte
+	// sandbox à abs en résulte effectivement — constaté en pratique : le
+	// répertoire restait inaccessible en écriture juste après un "accès
+	// accordé", pour une cause qui n'a pas pu être identifiée avec
+	// certitude (pas une erreur reproductible de GrantDirectory lui-même).
+	// Sans ce contrôle, l'incohérence n'apparaît qu'au prochain read_file/
+	// write_file/run_shell, avec un message qui ne permet pas de deviner
+	// que l'octroi qui semblait avoir réussi n'a en fait rien changé. Pas de
+	// vérification équivalente en mode non sandboxé : là, checkAccess ne
+	// teste rien d'autre que l'appartenance à p.allowed, qu'on est justement
+	// en train de construire — il n'y a rien d'indépendant à vérifier.
+	if sandboxReady() {
+		nearest := nearestExisting(abs)
+		if !sandboxCanAccess(nearest, false) || !sandboxCanAccess(nearest, true) {
+			return false, fmt.Errorf(
+				"octroi accepté mais l'accès réel (lecture/écriture) du compte sandbox à %q échoue toujours juste après — incohérence à diagnostiquer plutôt qu'un octroi silencieusement inefficace ; réessayer peut suffire si c'était transitoire",
+				abs,
+			)
+		}
+	}
+
 	p.mu.Lock()
 	p.allowed = append(p.allowed, abs)
 	dirsCopy := append([]string(nil), p.allowed...)

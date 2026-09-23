@@ -2,10 +2,13 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -56,6 +59,41 @@ func TestShellDefaultTimeout(t *testing.T) {
 	if !strings.Contains(out, want) {
 		t.Fatalf("sortie = %q, attendu contenant %q", out, want)
 	}
+}
+
+// Un timeout doit tuer TOUT l'arbre de processus, pas seulement le process
+// de tête (sh) — un job mis en arrière-plan par la commande elle-même
+// (`sleep 30 &`) ne doit pas survivre indéfiniment au timeout juste parce
+// que le process de tête, lui, a bien été tué (régression : cmd.Process.
+// Kill() par défaut n'atteint jamais un tel descendant détaché).
+func TestShellTimeoutKillsBackgroundedChild(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "pid")
+	tool := &ShellTool{Timeout: 300 * time.Millisecond}
+	command := fmt.Sprintf("sleep 30 & echo $! > %s; sleep 30", pidFile)
+	argsJSON, err := json.Marshal(map[string]string{"command": command})
+	if err != nil {
+		t.Fatalf("construction des arguments: %v", err)
+	}
+	if _, err := tool.Call(context.Background(), string(argsJSON)); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+
+	pidData := waitForFile(t, pidFile, 2*time.Second)
+	pid, err := strconv.Atoi(strings.TrimSpace(pidData))
+	if err != nil {
+		t.Fatalf("pid invalide dans %q: %q (%v)", pidFile, pidData, err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pid, 0) != nil {
+			return // process introuvable : bien tué
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	syscall.Kill(pid, syscall.SIGKILL) // nettoyage best-effort avant de faire échouer le test
+	t.Fatalf("job en arrière-plan (pid %d) toujours vivant après le timeout de run_shell", pid)
 }
 
 // "timeout_seconds" doit pouvoir raccourcir le timeout effectif en dessous
@@ -148,7 +186,7 @@ func TestShellAsRealUserNoOpWhenNotSandboxed(t *testing.T) {
 	called := false
 	tool := &ShellTool{
 		Timeout:         2 * time.Second,
-		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) { called = true; return true, nil },
+		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { called = true; return true, nil },
 	}
 	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
 	if err != nil {
@@ -172,8 +210,21 @@ func TestShellAsRealUserFailsWithoutConfirmCallback(t *testing.T) {
 	if err == nil {
 		t.Fatal("attendu une erreur (ConfirmRealUser non configuré)")
 	}
-	if !strings.Contains(err.Error(), "confirmation interactive") {
-		t.Fatalf("erreur = %q, attendu qu'elle mentionne l'absence de confirmation interactive possible", err.Error())
+	if !strings.Contains(err.Error(), "shell interactif") {
+		t.Fatalf("erreur = %q, attendu qu'elle mentionne l'absence de shell interactif accessible", err.Error())
+	}
+}
+
+// La description et le schéma doivent refléter que "as_real_user" est
+// indisponible quand ConfirmRealUser est nil (ex: mode mail) — pour que le
+// modèle le sache AVANT d'essayer, pas seulement après un échec.
+func TestShellDescriptionReflectsUnavailableRealUser(t *testing.T) {
+	tool := &ShellTool{Sandboxed: true} // ConfirmRealUser laissé nil
+	if !strings.Contains(tool.Description(), "shell interactif") {
+		t.Fatalf("Description() = %q, attendu qu'elle mentionne l'indisponibilité (shell interactif)", tool.Description())
+	}
+	if !strings.Contains(string(tool.ParametersSchema()), "INDISPONIBLE") {
+		t.Fatalf("ParametersSchema() = %s, attendu qu'il mentionne l'indisponibilité", tool.ParametersSchema())
 	}
 }
 
@@ -183,7 +234,7 @@ func TestShellAsRealUserFailsWhenConfirmationDenied(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:         2 * time.Second,
 		Sandboxed:       true,
-		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) { return false, nil },
+		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { return false, nil },
 	}
 	_, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
 	if err == nil {
@@ -200,7 +251,7 @@ func TestShellAsRealUserPassesExactCommandToConfirm(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:   2 * time.Second,
 		Sandboxed: true,
-		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) {
+		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) {
 			gotCommand = command
 			return true, nil
 		},
@@ -210,6 +261,50 @@ func TestShellAsRealUserPassesExactCommandToConfirm(t *testing.T) {
 	}
 	if gotCommand != "echo bonjour" {
 		t.Fatalf("commande reçue par ConfirmRealUser = %q, attendu %q", gotCommand, "echo bonjour")
+	}
+}
+
+// "as_real_user_window" sans "as_real_user" est une erreur de validation,
+// pas un no-op silencieux.
+func TestShellAsRealUserWindowRequiresAsRealUser(t *testing.T) {
+	tool := &ShellTool{
+		Timeout:         2 * time.Second,
+		Sandboxed:       true,
+		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { return true, nil },
+	}
+	_, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user_window":true}`)
+	if err == nil {
+		t.Fatal("attendu une erreur (as_real_user_window sans as_real_user)")
+	}
+	if !strings.Contains(err.Error(), "as_real_user_window") {
+		t.Fatalf("erreur = %q, attendu qu'elle mentionne as_real_user_window", err.Error())
+	}
+}
+
+// ConfirmRealUser doit recevoir exactement la valeur de "as_real_user_window"
+// demandée par le modèle : faux par défaut (mode oneshot), vrai seulement si
+// explicitement demandé.
+func TestShellAsRealUserPassesWindowFlagToConfirm(t *testing.T) {
+	var gotWindow bool
+	tool := &ShellTool{
+		Timeout:   2 * time.Second,
+		Sandboxed: true,
+		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) {
+			gotWindow = window
+			return true, nil
+		},
+	}
+	if _, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`); err != nil {
+		t.Fatalf("Call (oneshot): %v", err)
+	}
+	if gotWindow {
+		t.Fatal("window = true alors que as_real_user_window était omis (défaut attendu: oneshot)")
+	}
+	if _, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true,"as_real_user_window":true}`); err != nil {
+		t.Fatalf("Call (window): %v", err)
+	}
+	if !gotWindow {
+		t.Fatal("window = false alors que as_real_user_window:true était demandé")
 	}
 }
 
@@ -223,7 +318,7 @@ func TestShellAsRealUserRunsCommandDirectlyOnceConfirmed(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:         2 * time.Second,
 		Sandboxed:       true,
-		ConfirmRealUser: func(ctx context.Context, command string) (bool, error) { return true, nil },
+		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { return true, nil },
 	}
 	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
 	if err != nil {

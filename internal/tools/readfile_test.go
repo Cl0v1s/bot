@@ -203,3 +203,90 @@ func TestReadFileAcceptsTextFileWithAccents(t *testing.T) {
 		t.Fatalf("got %q, attendu le contenu texte inchangé", got)
 	}
 }
+
+func callReadFileSearch(t *testing.T, tool *ReadFileTool, path, search string, ctxLines int) (string, error) {
+	t.Helper()
+	args := fmt.Sprintf(`{"path":%q,"search":%q`, path, search)
+	if ctxLines > 0 {
+		args += fmt.Sprintf(`,"context":%d`, ctxLines)
+	}
+	args += "}"
+	return tool.Call(context.Background(), args)
+}
+
+// "search" ne doit renvoyer que les lignes correspondantes (avec le contexte
+// demandé autour), pas tout le fichier.
+func TestReadFileSearchReturnsOnlyMatchingLinesWithContext(t *testing.T) {
+	content := "a1\na2\nTARGET ici\na4\na5\na6\na7\nautre TARGET\na9\na10"
+	tool, path := newReadableFile(t, content)
+
+	got, err := callReadFileSearch(t, tool, path, "TARGET", 1)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if !strings.Contains(got, "2 correspondance(s)") {
+		t.Fatalf("got %q, attendu 2 correspondances", got)
+	}
+	if !strings.Contains(got, "3> TARGET ici") {
+		t.Fatalf("got %q, attendu la ligne 3 marquée comme correspondance", got)
+	}
+	if !strings.Contains(got, "2  a2") || !strings.Contains(got, "4  a4") {
+		t.Fatalf("got %q, attendu les lignes de contexte 2 et 4 (context=1)", got)
+	}
+	// a5/a6 ne sont dans le contexte d'aucune correspondance (trop loin des
+	// deux matches avec context=1) : ne doivent pas apparaître.
+	if strings.Contains(got, "a5") || strings.Contains(got, "a6") {
+		t.Fatalf("got %q, ne devrait pas contenir a5/a6 (hors contexte)", got)
+	}
+}
+
+// Deux correspondances proches doivent être fusionnées en un seul passage
+// contigu plutôt que de répéter les lignes partagées deux fois.
+func TestReadFileSearchMergesOverlappingContext(t *testing.T) {
+	content := "a1\nMATCH\na3\nMATCH\na5"
+	tool, path := newReadableFile(t, content)
+
+	got, err := callReadFileSearch(t, tool, path, "MATCH", 1)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	// Un seul bloc "--- lignes 1-5 ---" attendu (les deux fenêtres de
+	// contexte [1-3] et [3-5] se chevauchent sur la ligne 3).
+	if strings.Count(got, "--- lignes") != 1 {
+		t.Fatalf("got %q, attendu un seul passage fusionné, pas deux", got)
+	}
+}
+
+// Aucune correspondance doit être un résultat normal, pas une erreur.
+func TestReadFileSearchNoMatchIsNotAnError(t *testing.T) {
+	tool, path := newReadableFile(t, "rien d'intéressant ici\n")
+	got, err := callReadFileSearch(t, tool, path, "INTROUVABLE", 0)
+	if err != nil {
+		t.Fatalf("Call: %v (une absence de résultat ne doit pas être une erreur)", err)
+	}
+	if !strings.Contains(got, "0 correspondance") {
+		t.Fatalf("got %q, attendu une mention explicite de 0 correspondance", got)
+	}
+}
+
+// Un motif regex invalide doit échouer clairement.
+func TestReadFileSearchRejectsInvalidRegex(t *testing.T) {
+	tool, path := newReadableFile(t, "contenu\n")
+	_, err := callReadFileSearch(t, tool, path, "(", 0)
+	if err == nil {
+		t.Fatal("attendu une erreur pour un motif regex invalide")
+	}
+}
+
+// "search" et "offset"/"length" ne doivent jamais être combinés
+// silencieusement (lequel gagnerait ne serait pas évident) : erreur claire.
+func TestReadFileSearchRejectsCombinationWithOffset(t *testing.T) {
+	tool, path := newReadableFile(t, "a\nb\nc\n")
+	_, err := tool.Call(context.Background(), fmt.Sprintf(`{"path":%q,"search":"a","offset":2}`, path))
+	if err == nil {
+		t.Fatal("attendu une erreur pour la combinaison search+offset")
+	}
+	if !strings.Contains(err.Error(), "mutuellement exclusifs") {
+		t.Fatalf("erreur = %q, attendu qu'elle mentionne l'incompatibilité", err.Error())
+	}
+}

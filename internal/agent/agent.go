@@ -160,11 +160,42 @@ func truncateForDisplay(s string, max int) string {
 	return s[:max] + "\n[... tronqué pour l'affichage ...]"
 }
 
+// shellFailureNudge est injecté dans la conversation (voir Run,
+// maxConsecutiveShellFailures) quand run_shell a échoué N fois de suite :
+// pousse le modèle à changer d'approche plutôt qu'à retenter indéfiniment
+// une commande qui échoue de la même façon. Rôle "user" plutôt que "system"
+// (déjà utilisé une fois en tête de conversation, réinjecter ce rôle en
+// cours de route n'est pas uniformément bien supporté par tous les
+// gabarits de chat) — universellement traité comme une entrée à laquelle
+// répondre, quel que soit le serveur/modèle.
+const shellFailureNudgeTemplate = "[harnais] %d appels run_shell d'affilée ont échoué pour cette tâche. N'insiste pas avec la même commande ou la même approche : arrête-toi, explique brièvement ce qui a échoué, et choisis une méthode différente pour atteindre l'objectif — un autre outil, une autre stratégie, ou explique clairement à l'utilisateur ce qui bloque si tu ne vois pas d'autre option."
+
+// shellCallFailed indique si le résultat d'un appel à "run_shell" doit
+// compter comme un échec, pour maxConsecutiveShellFailures (voir Run).
+// callErr non nil couvre les échecs "durs" du tool lui-même (permission
+// refusée, commande bloquée, confirmation as_real_user refusée...) ; sinon,
+// la commande a pu s'exécuter mais échouer (code de sortie non nul,
+// timeout) — détecté via les marqueurs que tools.ShellTool.Call ajoute
+// lui-même en fin de sortie plutôt que de les faire remonter comme une
+// erreur Go (un run_shell qui s'exécute mais dont la commande échoue N'EST
+// PAS une erreur du point de vue du tool : le modèle doit pouvoir lire
+// cette sortie comme un résultat normal, pas un échec d'appel).
+func shellCallFailed(result string, callErr error) bool {
+	if callErr != nil {
+		return true
+	}
+	return strings.Contains(result, "[commande terminée avec erreur:") ||
+		strings.Contains(result, "[commande interrompue après")
+}
+
 // Run exécute la boucle agentique sur la conversation conv, jusqu'à une
 // réponse finale sans tool_calls. onEvent (optionnel) est appelé pour
 // chaque appel/résultat d'outil, afin d'en permettre un affichage séparé du
 // texte de réponse au fur et à mesure.
-func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, registry *tools.Registry, maxSteps int, onEvent func(Event)) (string, llm.Usage, error) {
+//
+// maxConsecutiveShellFailures : voir shellFailureNudge et
+// config.Config.AgentMaxConsecutiveShellFailures. <= 0 = désactivé.
+func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, registry *tools.Registry, maxSteps int, maxConsecutiveShellFailures int, onEvent func(Event)) (string, llm.Usage, error) {
 	if maxSteps <= 0 {
 		maxSteps = defaultMaxSteps
 	}
@@ -176,6 +207,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 	// même échec probable — pas la peine de payer un appel LLM par étape
 	// pour ça) ; sert aussi à ne montrer l'avertissement qu'une seule fois.
 	compactionFailed := false
+	// consecutiveShellFailures : remis à zéro dès qu'un run_shell réussit,
+	// ou dès que shellFailureNudgeTemplate est injecté (voir plus bas) — pas
+	// un compteur cumulatif sur toute la durée de Run, seulement "combien
+	// d'affilée en ce moment".
+	consecutiveShellFailures := 0
 	for step := 0; step < maxSteps; step++ {
 		// Un échec de compaction ne doit JAMAIS faire échouer le tour : la
 		// compaction est une optimisation de contexte, pas un prérequis pour
@@ -245,6 +281,22 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 			}
 
 			result, callErr := registry.Call(ctx, tc.Function.Name, tc.Function.Arguments)
+
+			// Évalué sur le résultat/l'erreur d'ORIGINE, avant la réécriture
+			// de result juste en dessous : shellCallFailed regarde callErr
+			// indépendamment, et les marqueurs qu'elle cherche dans result
+			// ne peuvent de toute façon apparaître QUE dans une sortie de
+			// ShellTool (jamais dans "erreur: ..."), donc l'ordre n'affecte
+			// pas le résultat ici — gardé simplement dans l'ordre le plus
+			// naturel à lire.
+			if tc.Function.Name == "run_shell" {
+				if shellCallFailed(result, callErr) {
+					consecutiveShellFailures++
+				} else {
+					consecutiveShellFailures = 0
+				}
+			}
+
 			if callErr != nil {
 				result = "erreur: " + callErr.Error()
 			}
@@ -258,6 +310,20 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 				ToolCallID: tc.ID,
 				Content:    result,
 			})
+		}
+
+		// Vérifié une fois le lot de tool_calls de cette étape entièrement
+		// traité, jamais au milieu (voir la boucle ci-dessus) : l'API exige
+		// une réponse "tool" pour CHAQUE tool_call demandé par le même
+		// message assistant avant d'accepter le tour suivant — s'arrêter en
+		// cours de lot casserait ce contrat, même pour injecter ce message.
+		if maxConsecutiveShellFailures > 0 && consecutiveShellFailures >= maxConsecutiveShellFailures {
+			consecutiveShellFailures = 0
+			nudge := fmt.Sprintf(shellFailureNudgeTemplate, maxConsecutiveShellFailures)
+			conv.AddUser(nudge)
+			if onEvent != nil {
+				onEvent(Event{Kind: EventWarning, Result: nudge})
+			}
 		}
 	}
 

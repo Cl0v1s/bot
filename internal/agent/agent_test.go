@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"bot/internal/convo"
 	"bot/internal/llm"
@@ -44,7 +45,7 @@ func TestRunSurvivesCompactionFailure(t *testing.T) {
 	conv.AddUser("bonjour")
 
 	var warnings []string
-	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, func(e Event) {
+	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, func(e Event) {
 		if e.Kind == EventWarning {
 			warnings = append(warnings, e.Result)
 		}
@@ -99,7 +100,7 @@ func TestRunTruncatesOversizedHistoryAfterCompactionFailure(t *testing.T) {
 	}
 
 	var warnings []string
-	_, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, func(e Event) {
+	_, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, func(e Event) {
 		if e.Kind == EventWarning {
 			warnings = append(warnings, e.Result)
 		}
@@ -122,5 +123,173 @@ func TestRunTruncatesOversizedHistoryAfterCompactionFailure(t *testing.T) {
 	}
 	if !foundTruncationWarning {
 		t.Fatalf("attendu un avertissement mentionnant la troncature, got %v", warnings)
+	}
+}
+
+// La fonctionnalité demandée : après N échecs run_shell d'affilée (ici
+// N=2), Run doit injecter un message poussant le modèle à changer
+// d'approche — avant que le modèle ne produise sa réponse finale, pas
+// après. Utilise le vrai ShellTool (non sandboxé, "exit 1" échoue
+// réellement) plutôt qu'un faux tool : le point exact vérifié est la
+// détection par agent.shellCallFailed d'un vrai résultat de ShellTool.Call.
+func TestRunInjectsNudgeAfterConsecutiveShellFailures(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		var msg map[string]any
+		if n <= 2 {
+			msg = map[string]any{
+				"role": "assistant",
+				"tool_calls": []map[string]any{{
+					"id":   "call" + string(rune('0'+n)),
+					"type": "function",
+					"function": map[string]any{
+						"name":      "run_shell",
+						"arguments": `{"command":"exit 1"}`,
+					},
+				}},
+			}
+		} else {
+			msg = map[string]any{"role": "assistant", "content": "fini"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": msg}},
+		})
+	}))
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	conv := convo.New("sys", 100000, 0.9, 10)
+	conv.AddUser("fais un truc qui échoue")
+
+	registry := tools.NewRegistry(&tools.ShellTool{Timeout: 2 * time.Second})
+
+	var warnings []string
+	reply, _, err := Run(context.Background(), client, conv, registry, 5, 2, func(e Event) {
+		if e.Kind == EventWarning {
+			warnings = append(warnings, e.Result)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if reply != "fini" {
+		t.Fatalf("reply = %q, want %q", reply, "fini")
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("appels API = %d, attendu exactement 3 (2 échecs run_shell + 1 réponse finale, le nudge ne doit pas déclencher d'étape en plus)", got)
+	}
+
+	foundNudge := false
+	for _, m := range conv.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "2 appels run_shell") {
+			foundNudge = true
+		}
+	}
+	if !foundNudge {
+		t.Fatalf("aucun message \"user\" de nudge trouvé dans conv.Messages: %+v", conv.Messages)
+	}
+
+	foundWarning := false
+	for _, w := range warnings {
+		if strings.Contains(w, "run_shell") {
+			foundWarning = true
+		}
+	}
+	if !foundWarning {
+		t.Fatalf("attendu un EventWarning mentionnant run_shell, got %v", warnings)
+	}
+}
+
+// maxConsecutiveShellFailures <= 0 doit désactiver la fonctionnalité :
+// aucun message injecté, quel que soit le nombre d'échecs.
+func TestRunDoesNotInjectNudgeWhenDisabled(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		var msg map[string]any
+		if n <= 5 {
+			msg = map[string]any{
+				"role": "assistant",
+				"tool_calls": []map[string]any{{
+					"id":       "call" + string(rune('0'+n)),
+					"type":     "function",
+					"function": map[string]any{"name": "run_shell", "arguments": `{"command":"exit 1"}`},
+				}},
+			}
+		} else {
+			msg = map[string]any{"role": "assistant", "content": "fini"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": msg}},
+		})
+	}))
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	conv := convo.New("sys", 100000, 0.9, 10)
+	conv.AddUser("fais un truc qui échoue")
+	registry := tools.NewRegistry(&tools.ShellTool{Timeout: 2 * time.Second})
+
+	_, _, err := Run(context.Background(), client, conv, registry, 8, 0, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, m := range conv.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "run_shell") && strings.Contains(m.Content, "harnais") {
+			t.Fatalf("nudge injecté malgré maxConsecutiveShellFailures=0 (désactivé): %+v", conv.Messages)
+		}
+	}
+}
+
+// Un run_shell RÉUSSI entre deux échecs doit remettre le compteur à zéro :
+// pas de nudge si les échecs ne sont pas consécutifs.
+func TestRunResetsCounterOnShellSuccess(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		var msg map[string]any
+		switch {
+		case n == 1, n == 3:
+			msg = map[string]any{
+				"role": "assistant",
+				"tool_calls": []map[string]any{{
+					"id":       "callf" + string(rune('0'+n)),
+					"type":     "function",
+					"function": map[string]any{"name": "run_shell", "arguments": `{"command":"exit 1"}`},
+				}},
+			}
+		case n == 2:
+			msg = map[string]any{
+				"role": "assistant",
+				"tool_calls": []map[string]any{{
+					"id":       "calls2",
+					"type":     "function",
+					"function": map[string]any{"name": "run_shell", "arguments": `{"command":"true"}`},
+				}},
+			}
+		default:
+			msg = map[string]any{"role": "assistant", "content": "fini"}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": msg}},
+		})
+	}))
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	conv := convo.New("sys", 100000, 0.9, 10)
+	conv.AddUser("fais un truc")
+	registry := tools.NewRegistry(&tools.ShellTool{Timeout: 2 * time.Second})
+
+	// Seuil 2 : échec, succès, échec -> jamais 2 échecs D'AFFILÉE.
+	_, _, err := Run(context.Background(), client, conv, registry, 8, 2, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, m := range conv.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "harnais") {
+			t.Fatalf("nudge injecté alors que les échecs n'étaient pas consécutifs (succès entre les deux): %+v", conv.Messages)
+		}
 	}
 }

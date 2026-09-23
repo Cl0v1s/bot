@@ -97,6 +97,8 @@ func main() {
 
 	client := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
 	client.HTTPClient.Timeout = cfg.LLMTimeout
+	client.ContextTokens = cfg.ContextMaxTokens
+
 
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
 	// lancé : sinon, lancer le programme depuis un dossier différent d'une
@@ -110,17 +112,19 @@ func main() {
 		conv.MemoryFile = cfg.MemoryFile()
 
 		toolsCfg := chat.ToolsConfig{
-			Enabled:              cfg.ChatToolsEnabled,
-			AllowedDirsFile:      allowedDirsFile,
-			SandboxUserEnabled:   cfg.SandboxUserEnabled,
-			ShellTimeout:         cfg.ToolsShellTimeout,
-			ShellMaxTimeout:      cfg.ToolsShellMaxTimeout,
-			ShellNotifyThreshold: cfg.ToolsShellNotifyThreshold,
-			HTTPTimeout:          cfg.ToolsHTTPTimeout,
-			BrowserFetchTimeout:  cfg.ToolsBrowserFetchTimeout,
-			MaxSteps:             cfg.AgentMaxSteps,
-			WorkspaceDir:         cfg.WorkspaceDir,
-			SandboxSSHKey:        cfg.SandboxSSHKey,
+			Enabled:                     cfg.ChatToolsEnabled,
+			AllowedDirsFile:             allowedDirsFile,
+			SandboxUserEnabled:          cfg.SandboxUserEnabled,
+			ShellTimeout:                cfg.ToolsShellTimeout,
+			ShellMaxTimeout:             cfg.ToolsShellMaxTimeout,
+			ShellNotifyThreshold:        cfg.ToolsShellNotifyThreshold,
+			HTTPTimeout:                 cfg.ToolsHTTPTimeout,
+			BrowserFetchTimeout:         cfg.ToolsBrowserFetchTimeout,
+			MaxSteps:                    cfg.AgentMaxSteps,
+			MaxConsecutiveShellFailures: cfg.AgentMaxConsecutiveShellFailures,
+			RealUserWindow:              cfg.AgentRealUserWindow,
+			WorkspaceDir:                cfg.WorkspaceDir,
+			SandboxSSHKey:               cfg.SandboxSSHKey,
 		}
 		// Pas de contexte dérivé d'un signal ici : chat.Run gère lui-même
 		// Ctrl+C/SIGTERM (annulation de la requête en cours si une requête
@@ -165,7 +169,8 @@ func main() {
 			AllowFrom:    cfg.MailAllowFrom,
 			MaxBodyChars: cfg.MailMaxBodyChars,
 
-			AgentMaxSteps: cfg.AgentMaxSteps,
+			AgentMaxSteps:                    cfg.AgentMaxSteps,
+			AgentMaxConsecutiveShellFailures: cfg.AgentMaxConsecutiveShellFailures,
 		}
 		if cfg.MailToolsEnabled {
 			// Mode mail : pas d'humain pour approuver une demande d'accès en

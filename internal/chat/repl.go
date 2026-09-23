@@ -43,6 +43,12 @@ type ToolsConfig struct {
 	// BrowserFetchTimeout : voir tools.BrowserFetchTool.Timeout.
 	BrowserFetchTimeout time.Duration
 	MaxSteps            int
+	// MaxConsecutiveShellFailures : voir agent.Run — <= 0 désactive.
+	MaxConsecutiveShellFailures int
+	// RealUserWindow : durée de la fenêtre ouverte par "as_real_user_window"
+	// (voir tools.ShellTool.ConfirmRealUser) une fois confirmée — <= 0 =
+	// valeur par défaut (5 min).
+	RealUserWindow time.Duration
 	// WorkspaceDir : répertoire toujours accessible en lecture/écriture pour
 	// read_file/write_file (voir tools.DirPermissions.AlwaysAllow), sans
 	// passer par request_directory_access.
@@ -90,6 +96,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// color est calculé sur la sortie d'origine : colorsEnabled fait un
 	// type-assert vers *os.File, qui échouerait sur le syncWriter ci-dessous.
 	color := colorizer(out)
+	// liveCursor : même calcul, pour savoir si des séquences ANSI de
+	// repositionnement de curseur (indicateur "réflexion", voir
+	// dispatchTurn) peuvent être utilisées sans polluer une sortie non
+	// terminale (fichier, pipe, tests).
+	liveCursor := colorsEnabled(out)
 	// À partir d'ici, plusieurs goroutines (streaming en tâche de fond, écho
 	// clavier, boucle principale) écrivent potentiellement en parallèle vers
 	// out : on le sérialise pour éviter des écritures entrelacées/coupées.
@@ -164,29 +175,42 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}
 
-	// realUserGrantWindow : une fois confirmée, la fenêtre pendant laquelle les
-	// commandes "as_real_user" suivantes sont autorisées sans redemander (voir
-	// confirmRealUser) — une tâche qui enchaîne plusieurs commandes sous
-	// l'identité réelle (ex: `glab auth login` puis une vérification juste
-	// après) ne redemande pas à chaque appel. Volontairement court plutôt
-	// qu'une mémorisation permanente comme DirPermissions : l'accès accordé
-	// ici est bien plus large (n'importe quelle commande, pas un répertoire
-	// précis).
-	const realUserGrantWindow = 5 * time.Minute
+	// realUserGrantWindow : durée de la fenêtre ouverte quand le modèle
+	// demande explicitement "as_real_user_window" et que l'utilisateur
+	// confirme (voir confirmRealUser) — une tâche qui enchaîne plusieurs
+	// commandes sous l'identité réelle (ex: `glab auth login` puis une
+	// vérification juste après) ne redemande pas à chaque appel tant que la
+	// fenêtre est ouverte. Configurable (ToolsConfig.RealUserWindow) ;
+	// volontairement court par défaut plutôt qu'une mémorisation permanente
+	// comme DirPermissions : l'accès accordé ici est bien plus large
+	// (n'importe quelle commande, pas un répertoire précis).
+	realUserGrantWindow := toolsCfg.RealUserWindow
+	if realUserGrantWindow <= 0 {
+		realUserGrantWindow = 5 * time.Minute
+	}
 	var realUserGrantedUntil time.Time
 
-	// confirmRealUser : voir tools.ShellTool.ConfirmRealUser.
-	confirmRealUser := func(ctx context.Context, command string) (bool, error) {
+	// confirmRealUser : voir tools.ShellTool.ConfirmRealUser. window indique
+	// si le modèle demande l'ouverture d'une fenêtre de réutilisation
+	// (as_real_user_window) ou une autorisation ponctuelle valable pour
+	// cette seule commande.
+	confirmRealUser := func(ctx context.Context, command string, window bool) (bool, error) {
 		if time.Now().Before(realUserGrantedUntil) {
 			return true, nil
 		}
 		fmt.Fprintln(out, color(ansiMagenta, "\n[run_shell] le modèle demande à exécuter cette commande sous l'identité réelle (hors sandbox, accès complet) :"))
 		fmt.Fprintln(out, color(ansiMagenta, "  "+command))
-		fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  (une fois autorisé, valable %s pour les commandes suivantes sous l'identité réelle, sans redemander)", realUserGrantWindow)))
+		if window {
+			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  (fenêtre demandée : une fois autorisé, valable %s pour les commandes suivantes sous l'identité réelle, sans redemander)", realUserGrantWindow)))
+		} else {
+			fmt.Fprintln(out, color(ansiMagenta, "  (autorisation ponctuelle : uniquement pour cette commande)"))
+		}
 		if !askYesNo(ctx, "  autoriser ? [o/N] ") {
 			return false, nil
 		}
-		realUserGrantedUntil = time.Now().Add(realUserGrantWindow)
+		if window {
+			realUserGrantedUntil = time.Now().Add(realUserGrantWindow)
+		}
 		return true, nil
 	}
 
@@ -270,7 +294,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.ListDirTool{},
 		}
 		if shellAvailable {
-			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, ConfirmRealUser: confirmRealUser})
+			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, RealUserWindow: realUserGrantWindow, ConfirmRealUser: confirmRealUser})
 		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
@@ -351,8 +375,29 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			reqCtx, endReq := interrupt.begin(ctx)
 			defer endReq()
 
+			// thinking : indicateur affiché dès l'envoi de la requête au
+			// modèle, effacé dès la toute première sortie produite (premier
+			// événement d'outil/réflexion, premier fragment de réponse en
+			// streaming, ou message d'erreur) — comble le silence entre
+			// l'envoi de la requête et sa première sortie visible, pendant
+			// lequel rien n'indiquait avant que le modèle travaillait
+			// effectivement. Seulement sur un vrai terminal (liveCursor) :
+			// les séquences de repositionnement de curseur polluent une
+			// sortie non terminale (fichier, pipe, tests).
+			thinkingShown := liveCursor
+			if thinkingShown {
+				fmt.Fprint(out, color(ansiGray, "…réflexion"))
+			}
+			clearThinking := func() {
+				if thinkingShown {
+					fmt.Fprint(out, "\r\x1b[K")
+					thinkingShown = false
+				}
+			}
+
 			if !registry.Empty() {
-				reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, func(e agent.Event) {
+				reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, toolsCfg.MaxConsecutiveShellFailures, func(e agent.Event) {
+					clearThinking()
 					code := ansiYellow // appel d'outil
 					switch {
 					case e.Kind == agent.EventReasoning:
@@ -365,6 +410,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 					}
 					fmt.Fprint(out, color(code, e.Format()))
 				})
+				clearThinking()
 				if err != nil {
 					cancelled = errors.Is(err, context.Canceled)
 					reqErrorLine(err)
@@ -375,19 +421,24 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 
 			if compacted, err := conv.CompactIfNeeded(reqCtx, client); err != nil {
+				clearThinking()
 				errorLine("[avertissement: échec de la compaction du contexte: %v]", err)
 			} else if compacted {
+				clearThinking()
 				fmt.Fprintln(out, "[contexte compacté automatiquement]")
 			}
 			// Filet de sécurité de dernier recours : voir le commentaire de
 			// convo.Conversation.EnsureFitsContext.
 			if dropped := conv.EnsureFitsContext(); dropped > 0 {
+				clearThinking()
 				errorLine("[avertissement: contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé]", dropped)
 			}
 
 			reply, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), func(delta string) {
+				clearThinking()
 				fmt.Fprint(out, delta)
 			})
+			clearThinking()
 			if err != nil {
 				cancelled = errors.Is(err, context.Canceled)
 				reqErrorLine(err)

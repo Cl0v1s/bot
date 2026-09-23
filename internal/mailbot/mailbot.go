@@ -70,6 +70,8 @@ type Options struct {
 	Tools         *tools.Registry
 	ToolsPerms    *tools.DirPermissions // rafraîchi depuis le fichier partagé à chaque cycle de poll
 	AgentMaxSteps int
+	// AgentMaxConsecutiveShellFailures : voir agent.Run — <= 0 désactive.
+	AgentMaxConsecutiveShellFailures int
 }
 
 // logBlock journalise body sous forme de bloc encadré, nettement délimité
@@ -266,7 +268,7 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	if !opts.Tools.Empty() {
 		// Les appels d'outils et leurs résultats sont journalisés à part,
 		// nettement séparés du texte de la réponse envoyée par mail.
-		reply, _, err = agent.Run(ctx, client, conv, opts.Tools, opts.AgentMaxSteps, func(e agent.Event) {
+		reply, _, err = agent.Run(ctx, client, conv, opts.Tools, opts.AgentMaxSteps, opts.AgentMaxConsecutiveShellFailures, func(e agent.Event) {
 			log.Print(strings.TrimRight(e.Format(), "\n"))
 		})
 		if err != nil {

@@ -132,6 +132,64 @@ func TestCheckFileUsesRealSandboxAccessWhenReady(t *testing.T) {
 	}
 }
 
+// RequestAccess ne doit jamais annoncer un octroi réussi si l'accès réel du
+// compte sandbox échoue toujours juste après (voir le commentaire de
+// RequestAccess sur la vérification post-octroi) — cas observé en pratique :
+// le callback de grant (sandbox.GrantDirectory dans le mode chat réel)
+// retourne nil sans que ça se traduise par un accès effectif, laissant
+// passer un "accès accordé" trompeur suivi d'un échec confus au premier
+// read_file/write_file/run_shell.
+func TestRequestAccessFailsWhenPostGrantVerificationFails(t *testing.T) {
+	withSandboxReady(t, true)
+	dir := t.TempDir()
+
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	sandboxCanAccess = func(path string, write bool) bool { return false } // l'octroi n'a rien changé en réalité
+
+	perms := NewDirPermissions(func(ctx context.Context, abs, reason string) (bool, error) {
+		return true, nil // le callback de grant affirme réussir...
+	})
+	ok, err := perms.RequestAccess(context.Background(), dir, "test")
+	if ok {
+		t.Fatal("attendu ok=false : la vérification post-octroi doit détecter l'incohérence")
+	}
+	if err == nil {
+		t.Fatal("attendu une erreur (pas un simple refus) : l'octroi a réussi mais l'accès réel ne suit pas, ça mérite d'être signalé distinctement")
+	}
+	if _, err := perms.CheckFileRead(filepath.Join(dir, "x")); err == nil {
+		t.Fatal("le répertoire ne doit pas avoir été ajouté à la liste autorisée malgré l'échec de la vérification")
+	}
+}
+
+// Symétrique du test précédent : quand la vérification post-octroi réussit
+// bien, RequestAccess doit continuer à fonctionner normalement (pas de faux
+// positif introduit par le nouveau contrôle).
+func TestRequestAccessSucceedsWhenPostGrantVerificationPasses(t *testing.T) {
+	withSandboxReady(t, true)
+	dir := t.TempDir()
+
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	// granted ne devient vrai qu'après l'appel du callback de grant (comme
+	// le ferait sandbox.GrantDirectory en pratique) : sans cet état, le test
+	// ne distinguerait pas "la vérification post-octroi a réussi" de "elle
+	// n'a jamais été exercée" (le contrôle initial de RequestAccess, au tout
+	// début, aurait déjà court-circuité tout le reste si sandboxCanAccess
+	// avait renvoyé true dès le départ).
+	granted := false
+	sandboxCanAccess = func(path string, write bool) bool { return granted && path == dir }
+
+	perms := NewDirPermissions(func(ctx context.Context, abs, reason string) (bool, error) {
+		granted = true // simule l'effet réel de sandbox.GrantDirectory
+		return true, nil
+	})
+	ok, err := perms.RequestAccess(context.Background(), dir, "test")
+	if err != nil || !ok {
+		t.Fatalf("RequestAccess: ok=%v err=%v", ok, err)
+	}
+}
+
 // CheckFileWrite cible un fichier qui n'existe pas encore (cas normal :
 // write_file le crée) : la vérification doit alors porter sur le plus proche
 // ancêtre existant (voir nearestExisting), jamais échouer simplement parce
