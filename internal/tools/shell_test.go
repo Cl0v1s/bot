@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // withFakeNotifySend place, en tête du PATH pour la durée du test, un faux
@@ -326,5 +327,64 @@ func TestShellAsRealUserRunsCommandDirectlyOnceConfirmed(t *testing.T) {
 	}
 	if !strings.Contains(out, "bonjour") {
 		t.Fatalf("sortie = %q, attendu qu'elle contienne bonjour (commande exécutée directement)", out)
+	}
+}
+
+// La commande ne voit jamais de terminal : stdin n'en est pas un, et les
+// variables de noTTYEnv sont bien exportées.
+func TestShellNoTTYEnvironment(t *testing.T) {
+	tool := &ShellTool{Timeout: 5 * time.Second}
+	out, err := tool.Call(context.Background(), `{"command":"tty; echo \"GTP=$GIT_TERMINAL_PROMPT\""}`)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if !strings.Contains(out, "not a tty") && !strings.Contains(out, "pas un tty") {
+		t.Fatalf("stdin semble être un tty : %q", out)
+	}
+	if !strings.Contains(out, "GTP=0") {
+		t.Fatalf("GIT_TERMINAL_PROMPT non exporté : %q", out)
+	}
+}
+
+// L'enveloppe noTTYScript ne masque pas le code de sortie de la commande.
+func TestShellNoTTYPreservesExitStatus(t *testing.T) {
+	tool := &ShellTool{Timeout: 5 * time.Second}
+	out, err := tool.Call(context.Background(), `{"command":"echo 'a b'; exit 3"}`)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if !strings.Contains(out, "a b") || !strings.Contains(out, "exit status 3") {
+		t.Fatalf("sortie = %q, attendu \"a b\" et \"exit status 3\"", out)
+	}
+}
+
+// Ouvrir un tty (sans O_NOCTTY, comme le fait une redirection sh) ne doit
+// jamais en faire le terminal de contrôle de la commande : celle-ci n'est
+// pas chef de session (voir noTTYScript).
+func TestShellCannotAcquireControllingTTY(t *testing.T) {
+	ptmx, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Skipf("pas de /dev/ptmx : %v", err)
+	}
+	defer ptmx.Close()
+	var unlock int32
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCSPTLCK, uintptr(unsafe.Pointer(&unlock))); e != 0 {
+		t.Skipf("unlockpt: %v", e)
+	}
+	var n uint32
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, ptmx.Fd(), syscall.TIOCGPTN, uintptr(unsafe.Pointer(&n))); e != 0 {
+		t.Skipf("ptsname: %v", e)
+	}
+	pts := fmt.Sprintf("/dev/pts/%d", n)
+
+	tool := &ShellTool{Timeout: 5 * time.Second}
+	cmd := fmt.Sprintf(`: <>%s; cut -d' ' -f7 /proc/$$/stat`, pts)
+	argsJSON, _ := json.Marshal(map[string]string{"command": cmd})
+	out, err := tool.Call(context.Background(), string(argsJSON))
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if strings.TrimSpace(out) != "0" {
+		t.Fatalf("tty_nr = %q après ouverture de %s, attendu 0 (aucun terminal de contrôle)", out, pts)
 	}
 }

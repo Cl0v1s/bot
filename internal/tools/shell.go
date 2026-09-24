@@ -257,13 +257,17 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	script := noTTYScript(args.Command)
 	var cmd *exec.Cmd
 	if t.Sandboxed && !runAsRealUser {
-		cmd = sandbox.WrapCommand(cctx, args.Command, t.GitConfigPath, t.HomeDir)
+		cmd = sandbox.WrapCommand(cctx, script, t.GitConfigPath, t.HomeDir)
 	} else {
-		cmd = exec.CommandContext(cctx, "sh", "-c", args.Command)
+		cmd = exec.CommandContext(cctx, "sh", "-c", script)
 	}
 	cmd.Dir = workDir
+	// Stdin laissé à nil = /dev/null (voir exec.Cmd) : jamais le terminal
+	// du harnais, même en mode chat. Voir aussi noTTYScript.
+	cmd.Stdin = nil
 	// Détache la commande du terminal de contrôle (nouvelle session) : sans
 	// ça, une commande qui ouvre /dev/tty directement (un outil interactif
 	// ignorant sciemment que son entrée standard est /dev/null — vim, less,
@@ -348,6 +352,40 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 		b.WriteString(fmt.Sprintf("\n[commande terminée avec erreur: %v]", runErr))
 	}
 	return b.String(), nil
+}
+
+// noTTYEnv : variables posées avant chaque commande pour que les outils
+// usuels renoncent d'eux-mêmes à toute interaction terminal (demande
+// d'identifiants git, pager, questions debconf...) au lieu d'échouer — ou
+// d'attendre jusqu'au timeout — en cherchant un tty qu'ils n'auront pas.
+var noTTYEnv = []string{
+	"GIT_TERMINAL_PROMPT=0",
+	"GCM_INTERACTIVE=never",
+	"DEBIAN_FRONTEND=noninteractive",
+	"TERM=dumb",
+	"PAGER=cat",
+	"GIT_PAGER=cat",
+}
+
+// noTTYScript enveloppe command pour qu'elle ne puisse jamais obtenir de
+// terminal, en complément de Setsid (voir Call) :
+//
+//   - Setsid seul laisse une faille : le process lancé (sh) est chef de
+//     session sans terminal de contrôle, et sous Linux un chef de session
+//     qui ouvre un tty sans O_NOCTTY (ex: `echo x > /dev/pts/0`) en fait
+//     son terminal de contrôle. Le sh externe ne fait donc QUE lancer la
+//     commande dans un sh enfant (en arrière-plan puis wait, ce qui
+//     empêche sh de remplacer le chef de session par la commande via
+//     exec) : un process qui n'est pas chef de session ne peut jamais
+//     acquérir de terminal de contrôle, quoi qu'il ouvre. Même groupe de
+//     processus, donc toujours atteint par le SIGKILL de cmd.Cancel ; le
+//     code de sortie est celui de la commande (wait).
+//   - noTTYEnv est exporté (via le script plutôt que cmd.Env pour
+//     traverser aussi le sudo du mode sandboxé, qui réinitialise
+//     l'environnement), GPG_TTY retiré.
+func noTTYScript(command string) string {
+	return "export " + strings.Join(noTTYEnv, " ") + "; unset GPG_TTY; " +
+		"sh -c " + sandbox.ShellQuote(command) + " </dev/null & wait $!"
 }
 
 // truncateForNotify raccourcit s à max caractères, pour le corps d'une

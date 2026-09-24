@@ -52,15 +52,15 @@ func WrapCommand(ctx context.Context, shellCmd string, gitConfigPath string, hom
 	// pose les mêmes bits rétroactivement sur un répertoire accordé.
 	script := "umask 002; " + shellCmd
 	if homeDir != "" {
-		script = "export HOME=" + shellQuote(homeDir) + "; " + script
+		script = "export HOME=" + ShellQuote(homeDir) + "; " + script
 	}
 	args = append(args, "--", "sh", "-c", script)
 	return exec.CommandContext(ctx, "sudo", args...)
 }
 
-// shellQuote entoure s de guillemets simples pour un usage sûr dans un
+// ShellQuote entoure s de guillemets simples pour un usage sûr dans un
 // script sh -c, en échappant les guillemets simples déjà présents (forme
 // standard 'x'\''y' pour un s contenant x'y).
-func shellQuote(s string) string {
+func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
