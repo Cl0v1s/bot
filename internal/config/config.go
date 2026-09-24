@@ -87,9 +87,18 @@ type Config struct {
 	// ToolsShellNotifyThreshold : durée d'exécution réelle au-delà de
 	// laquelle une commande run_shell déclenche une notification de bureau à
 	// la fin (voir internal/tools.ShellTool.NotifyThreshold, notify.go). <=
-	// 0 = désactivé.
+	// 0 = désactivé. Mode chat uniquement : ignoré en mode mail.
 	ToolsShellNotifyThreshold time.Duration
 	ToolsHTTPTimeout          time.Duration
+
+	// ToolsClaude* : voir internal/tools.ClaudeTool (run_claude). Le tool
+	// n'est proposé que si ToolsClaudeEnabled et que ToolsClaudeBin est
+	// trouvé dans le PATH.
+	ToolsClaudeEnabled        bool
+	ToolsClaudeBin            string
+	ToolsClaudePermissionMode string
+	ToolsClaudeTimeout        time.Duration
+	ToolsClaudeMaxTimeout     time.Duration
 	// ToolsBrowserFetchTimeout : voir internal/tools.BrowserFetchTool.Timeout
 	// — plus long que ToolsHTTPTimeout par défaut, le démarrage d'un
 	// navigateur (et de geckodriver pour Firefox) prenant plus de temps
@@ -358,6 +367,14 @@ func Load() Config {
 	if err != nil || toolsBrowserFetchTimeout <= 0 {
 		toolsBrowserFetchTimeout = 45 * time.Second
 	}
+	toolsClaudeTimeout, err := time.ParseDuration(getenv("TOOLS_CLAUDE_TIMEOUT", "10m"))
+	if err != nil || toolsClaudeTimeout <= 0 {
+		toolsClaudeTimeout = 10 * time.Minute
+	}
+	toolsClaudeMaxTimeout, err := time.ParseDuration(getenv("TOOLS_CLAUDE_MAX_TIMEOUT", "30m"))
+	if err != nil || toolsClaudeMaxTimeout <= 0 {
+		toolsClaudeMaxTimeout = 30 * time.Minute
+	}
 	agentMaxSteps, err := strconv.Atoi(getenv("AGENT_MAX_STEPS", "8"))
 	if err != nil || agentMaxSteps <= 0 {
 		agentMaxSteps = 8
@@ -418,6 +435,11 @@ func Load() Config {
 		ToolsShellNotifyThreshold:        toolsShellNotifyThreshold,
 		ToolsHTTPTimeout:                 toolsHTTPTimeout,
 		ToolsBrowserFetchTimeout:         toolsBrowserFetchTimeout,
+		ToolsClaudeEnabled:               getenvBool("TOOLS_CLAUDE_ENABLED", true),
+		ToolsClaudeBin:                   getenv("TOOLS_CLAUDE_BIN", "claude"),
+		ToolsClaudePermissionMode:        getenv("TOOLS_CLAUDE_PERMISSION_MODE", "auto"),
+		ToolsClaudeTimeout:               toolsClaudeTimeout,
+		ToolsClaudeMaxTimeout:            toolsClaudeMaxTimeout,
 		AgentMaxSteps:                    agentMaxSteps,
 		AgentMaxConsecutiveShellFailures: agentMaxConsecutiveShellFailures,
 		AgentRealUserWindow:              agentRealUserWindow,

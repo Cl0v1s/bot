@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -118,6 +119,11 @@ func main() {
 			ShellTimeout:                cfg.ToolsShellTimeout,
 			ShellMaxTimeout:             cfg.ToolsShellMaxTimeout,
 			ShellNotifyThreshold:        cfg.ToolsShellNotifyThreshold,
+			ClaudeEnabled:               cfg.ToolsClaudeEnabled,
+			ClaudeBin:                   cfg.ToolsClaudeBin,
+			ClaudePermissionMode:        cfg.ToolsClaudePermissionMode,
+			ClaudeTimeout:               cfg.ToolsClaudeTimeout,
+			ClaudeMaxTimeout:            cfg.ToolsClaudeMaxTimeout,
 			HTTPTimeout:                 cfg.ToolsHTTPTimeout,
 			BrowserFetchTimeout:         cfg.ToolsBrowserFetchTimeout,
 			MaxSteps:                    cfg.AgentMaxSteps,
@@ -251,7 +257,21 @@ func main() {
 				}
 			}
 			if shellAvailable {
-				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, NotifyThreshold: cfg.ToolsShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir})
+				// Pas de NotifyThreshold en mode mail : le bot tourne sans
+				// utilisateur devant l'écran, une notification de bureau n'a
+				// pas de sens (0 = notifications désactivées).
+				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir})
+			}
+			// run_claude tourne toujours sous l'identité réelle (voir
+			// tools.ClaudeTool) : jamais proposé si le sandbox est requis,
+			// pour la même raison que run_shell ci-dessus — et pas de
+			// confirmation possible, personne n'étant là pour répondre.
+			if cfg.ToolsClaudeEnabled && !cfg.SandboxUserEnabled {
+				if _, err := exec.LookPath(cfg.ToolsClaudeBin); err != nil {
+					log.Printf("mode mail: %q introuvable, run_claude non proposé", cfg.ToolsClaudeBin)
+				} else {
+					toolList = append(toolList, &tools.ClaudeTool{Bin: cfg.ToolsClaudeBin, PermissionMode: cfg.ToolsClaudePermissionMode, Timeout: cfg.ToolsClaudeTimeout, MaxTimeout: cfg.ToolsClaudeMaxTimeout, Perms: perms})
+				}
 			}
 
 			opts.Tools = tools.NewRegistry(toolList...)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -39,6 +40,12 @@ type ToolsConfig struct {
 	ShellMaxTimeout time.Duration
 	// ShellNotifyThreshold : voir tools.ShellTool.NotifyThreshold.
 	ShellNotifyThreshold time.Duration
+	// Claude* : voir tools.ClaudeTool (run_claude).
+	ClaudeEnabled        bool
+	ClaudeBin            string
+	ClaudePermissionMode string
+	ClaudeTimeout        time.Duration
+	ClaudeMaxTimeout     time.Duration
 	HTTPTimeout          time.Duration
 	// BrowserFetchTimeout : voir tools.BrowserFetchTool.Timeout.
 	BrowserFetchTimeout time.Duration
@@ -214,6 +221,16 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		return true, nil
 	}
 
+	// confirmClaude : voir tools.ClaudeTool.Confirm — demandé à chaque
+	// appel, Claude Code tournant hors sandbox sous l'identité réelle.
+	confirmClaude := func(ctx context.Context, prompt, workDir string) (bool, error) {
+		fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("\n[run_claude] le modèle demande à lancer Claude Code (hors sandbox, identité réelle) dans %s avec la tâche :", workDir)))
+		for _, line := range strings.Split(prompt, "\n") {
+			fmt.Fprintln(out, color(ansiMagenta, "  "+line))
+		}
+		return askYesNo(ctx, "  autoriser ? [o/N] "), nil
+	}
+
 	var registry *tools.Registry
 	if toolsCfg.Enabled {
 		// shellAvailable : run_shell n'est proposé que si le sandbox n'est pas
@@ -295,6 +312,13 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 		if shellAvailable {
 			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, RealUserWindow: realUserGrantWindow, ConfirmRealUser: confirmRealUser})
+		}
+		if toolsCfg.ClaudeEnabled {
+			if _, err := exec.LookPath(toolsCfg.ClaudeBin); err != nil {
+				fmt.Fprintln(out, color(ansiYellow, fmt.Sprintf("[run_claude] %q introuvable dans le PATH, run_claude ne sera pas proposé cette session", toolsCfg.ClaudeBin)))
+			} else {
+				toolList = append(toolList, &tools.ClaudeTool{Bin: toolsCfg.ClaudeBin, PermissionMode: toolsCfg.ClaudePermissionMode, Timeout: toolsCfg.ClaudeTimeout, MaxTimeout: toolsCfg.ClaudeMaxTimeout, Perms: perms, Confirm: confirmClaude})
+			}
 		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
