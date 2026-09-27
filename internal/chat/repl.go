@@ -627,22 +627,46 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				fmt.Fprintln(out, color(ansiYellow, "[file d'attente vidée après annulation]"))
 			}
 			for len(queue) > 0 {
-				next := queue[0]
-				queue = queue[1:]
-				// Le message tapé peut être loin en arrière dans le
+				// Une commande en file (/new, /compact, /exit...) est traitée
+				// seule, à sa place : fusionner des messages de part et
+				// d'autre d'un /new, par exemple, changerait le sens.
+				if isQueueCommand(queue[0]) {
+					next := queue[0]
+					queue = queue[1:]
+					fmt.Fprintln(out, color(ansiInput, "> "+next))
+					dispatched, exit := dispatchOrHandle(next)
+					if exit {
+						return nil
+					}
+					if dispatched {
+						busy = true
+						break
+					}
+					continue
+				}
+				// Messages de chat consécutifs en file : fusionnés en un seul
+				// envoi, plutôt qu'un tour complet par message — typiquement
+				// des précisions ajoutées au fil de l'eau pendant la réponse
+				// précédente, que le modèle doit lire ensemble.
+				n := 1
+				for n < len(queue) && !isQueueCommand(queue[n]) {
+					n++
+				}
+				batch := queue[:n]
+				queue = queue[n:]
+				// Les messages tapés peuvent être loin en arrière dans le
 				// défilement du terminal (le tour précédent a pu produire
-				// beaucoup de sortie) : on le rappelle en gris au moment où
-				// son traitement démarre, pour qu'il soit clair lequel des
-				// messages en file est en cours (même couleur que la saisie).
-				fmt.Fprintln(out, color(ansiInput, "> "+next))
-				dispatched, exit := dispatchOrHandle(next)
-				if exit {
-					return nil
+				// beaucoup de sortie) : on les rappelle au moment où leur
+				// traitement démarre (même couleur que la saisie).
+				for _, l := range batch {
+					fmt.Fprintln(out, color(ansiInput, "> "+l))
 				}
-				if dispatched {
-					busy = true
-					break
+				if n > 1 {
+					fmt.Fprintln(out, color(ansiCyan, fmt.Sprintf("  [%d messages en attente fusionnés en un seul envoi]", n)))
 				}
+				dispatchTurn(strings.Join(batch, "\n\n"))
+				busy = true
+				break
 			}
 			if !busy {
 				if eofPending {
@@ -655,4 +679,16 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 		}
 	}
+}
+
+// isQueueCommand indique si line (déjà nettoyée des espaces) est une
+// commande spéciale du mode chat (voir runCommand/dispatchOrHandle) plutôt
+// qu'un message pour le modèle — utilisé pour ne jamais la fusionner avec
+// des messages en file d'attente. À tenir à jour avec runCommand.
+func isQueueCommand(line string) bool {
+	switch line {
+	case "/exit", "/quit", "/new", "/reset", "/stats", "/compact":
+		return true
+	}
+	return false
 }

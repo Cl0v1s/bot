@@ -217,3 +217,58 @@ func TestRun_CompactCommandOnEmptyHistory(t *testing.T) {
 		t.Errorf("attendu un message \"rien à compacter\", got: %q", out.String())
 	}
 }
+
+// runQueued exécute Run sur input (lignes arrivant toutes pendant le premier
+// tour, donc mises en file) et retourne la conversation finale.
+func runQueued(t *testing.T, input string) (*convo.Conversation, string) {
+	t.Helper()
+	srv := fakeStreamingServer(t)
+	defer srv.Close()
+	client := llm.New(srv.URL, "", "test-model")
+	conv := convo.New("", 100000, 0.9, 10)
+	var out bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- Run(context.Background(), client, conv, ToolsConfig{}, strings.NewReader(input), &out)
+	}()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run n'a pas terminé à temps (deadlock ?)")
+	}
+	return conv, out.String()
+}
+
+func userContents(conv *convo.Conversation) []string {
+	var got []string
+	for _, m := range conv.Messages {
+		if m.Role == "user" {
+			got = append(got, m.Content)
+		}
+	}
+	return got
+}
+
+// Plusieurs messages en file d'attente sont envoyés en un seul tour.
+func TestRun_MergesQueuedMessages(t *testing.T) {
+	conv, out := runQueued(t, "premier\nsecond\ntroisième\n/exit\n")
+	want := []string{"premier", "second\n\ntroisième"}
+	if got := userContents(conv); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("messages envoyés = %q, attendu %q", got, want)
+	}
+	if !strings.Contains(out, "2 messages en attente fusionnés") {
+		t.Errorf("attendu l'annonce de la fusion dans la sortie, got: %q", out)
+	}
+}
+
+// Une commande en file sépare les messages : jamais de fusion par-dessus.
+func TestRun_QueuedCommandSplitsMerge(t *testing.T) {
+	conv, _ := runQueued(t, "premier\nA\nB\n/stats\nC\n/exit\n")
+	want := []string{"premier", "A\n\nB", "C"}
+	if got := userContents(conv); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("messages envoyés = %q, attendu %q", got, want)
+	}
+}
