@@ -4,12 +4,15 @@ package config
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"bot/internal/sandbox"
 )
 
 type Config struct {
@@ -183,7 +186,7 @@ func defaultWorkspaceDir() string {
 // nulle part, le fichier de config attendu et le workspace effectif sont le
 // même répertoire.
 func ConfigFilePath() string {
-	return filepath.Join(getenv("WORKSPACE_DIR", defaultWorkspaceDir()), ".env")
+	return filepath.Join(getenv("WORKSPACE_DIR", defaultWorkspaceDir()), sandbox.ConfigFileName)
 }
 
 // EnsureConfigFile crée path avec defaultContent s'il est absent — jamais
@@ -229,17 +232,21 @@ func defaultSandboxSSHKey() string {
 // LoadDotEnv lit un fichier .env (KEY=VALUE par ligne) s'il existe et
 // définit les variables d'environnement correspondantes, sans écraser
 // celles déjà présentes dans l'environnement.
+//
+// Lu via sandbox.ReadTrustedFile : le .env vit dans le workspace, accordé
+// au compte sandbox — un .env recréé par lui (ex: SANDBOX_USER_ENABLED=false
+// pour le lancement suivant) est refusé, et un .env resté accessible au
+// groupe est remis en 0600.
 func LoadDotEnv(path string) error {
-	f, err := os.Open(path)
+	data, err := sandbox.ReadTrustedFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
-	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {

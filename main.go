@@ -100,12 +100,12 @@ func main() {
 	client.HTTPClient.Timeout = cfg.LLMTimeout
 	client.ContextTokens = cfg.ContextMaxTokens
 
-
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
 	// lancé : sinon, lancer le programme depuis un dossier différent d'une
 	// fois sur l'autre fait "oublier" les répertoires déjà accordés (rien à
 	// voir avec le workspace lui-même, qui a un chemin absolu stable).
 	allowedDirsFile := filepath.Join(cfg.WorkspaceDir, tools.DefaultAllowedDirsFile)
+	whitelistFile := filepath.Join(cfg.WorkspaceDir, tools.DefaultWhitelistedCommandsFile)
 
 	switch os.Args[1] {
 	case "chat":
@@ -115,6 +115,7 @@ func main() {
 		toolsCfg := chat.ToolsConfig{
 			Enabled:                     cfg.ChatToolsEnabled,
 			AllowedDirsFile:             allowedDirsFile,
+			WhitelistedCommandsFile:     whitelistFile,
 			SandboxUserEnabled:          cfg.SandboxUserEnabled,
 			ShellTimeout:                cfg.ToolsShellTimeout,
 			ShellMaxTimeout:             cfg.ToolsShellMaxTimeout,
@@ -187,10 +188,11 @@ func main() {
 			// cycle de poll (voir pollOnce) : le mode mail ne peut jamais lui
 			// -même en ajouter. ATTENTION : le corps du mail est un contenu
 			// non fiable (voir MAIL_ALLOW_FROM, lui-même vulnérable au
-			// spoofing de l'en-tête From) — exposer run_shell/write_file ici
-			// est un vecteur d'exécution de code par injection de prompt,
-			// accepté en connaissance de cause à la demande explicite de
-			// l'opérateur de ce bot.
+			// spoofing de l'en-tête From) — exposer run_shell (et run_claude
+			// hors sandbox) ici est un vecteur d'exécution de code par
+			// injection de prompt, accepté en connaissance de cause à la
+			// demande explicite de l'opérateur de ce bot. write_file n'est
+			// jamais proposé en mode mail.
 			perms := tools.NewDirPermissions(nil)
 			if err := perms.WithPersistence(allowedDirsFile); err != nil {
 				log.Printf("mode mail: lecture des répertoires autorisés: %v", err)
@@ -257,10 +259,18 @@ func main() {
 				}
 			}
 			if shellAvailable {
+				// Liste blanche en lecture seule (rafraîchie à chaque cycle,
+				// voir mailbot.pollOnce) : pas de ConfirmRealUser, donc aucun
+				// ajout possible depuis le mode mail.
+				whitelist, err := tools.NewCommandWhitelist(whitelistFile)
+				if err != nil {
+					log.Printf("mode mail: %v", err)
+				}
+				opts.ToolsWhitelist = whitelist
 				// Pas de NotifyThreshold en mode mail : le bot tourne sans
 				// utilisateur devant l'écran, une notification de bureau n'a
 				// pas de sens (0 = notifications désactivées).
-				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir})
+				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, Whitelist: whitelist})
 			}
 			// run_claude tourne toujours sous l'identité réelle (voir
 			// tools.ClaudeTool) : jamais proposé si le sandbox est requis,

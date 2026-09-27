@@ -21,6 +21,13 @@ import (
 type HTTPGetTool struct {
 	Timeout      time.Duration
 	MaxBodyBytes int
+
+	// Perms : si non nil, active le paramètre "save_to" (voir
+	// saveFetchedContent), soumis aux mêmes permissions que write_file. nil
+	// = paramètre absent du schéma (ex: mode mail).
+	Perms *DirPermissions
+	// Sandboxed : voir WriteFileTool.Sandboxed, pour "save_to".
+	Sandboxed bool
 }
 
 func (t *HTTPGetTool) Name() string { return "http_get" }
@@ -31,18 +38,18 @@ func (t *HTTPGetTool) Description() string {
 }
 
 func (t *HTTPGetTool) ParametersSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"url": {"type": "string", "description": "URL http(s) à récupérer."}
-		},
-		"required": ["url"],
-		"additionalProperties": false
-	}`)
+	props := map[string]any{
+		"url": map[string]any{"type": "string", "description": "URL http(s) à récupérer."},
+	}
+	if t.Perms != nil {
+		props["save_to"] = map[string]any{"type": "string", "description": saveToDescription + " Une page HTML est enregistrée convertie en texte, tout autre contenu (JSON, CSV, fichier...) tel quel."}
+	}
+	return mustSchema("http_get", props, []string{"url"})
 }
 
 type httpGetArgs struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	SaveTo string `json:"save_to"`
 }
 
 func (t *HTTPGetTool) Call(ctx context.Context, argsJSON string) (string, error) {
@@ -108,8 +115,24 @@ func (t *HTTPGetTool) Call(ctx context.Context, argsJSON string) (string, error)
 		body = body[:rawCap]
 	}
 
+	isHTML := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
+	if args.SaveTo != "" {
+		content := body
+		if isHTML {
+			content = []byte(htmlToText(string(body)))
+		}
+		summary, err := saveFetchedContent(t.Perms, t.Sandboxed, args.SaveTo, content)
+		if err != nil {
+			return "", err
+		}
+		if len(body) >= rawCap {
+			summary += fmt.Sprintf("\n[réponse limitée aux %d premiers octets]", rawCap)
+		}
+		return fmt.Sprintf("HTTP %s\n\n%s", resp.Status, summary), nil
+	}
+
 	text := string(body)
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+	if isHTML {
 		// Le HTML brut (balises, scripts, styles, menus de navigation...) est
 		// à la fois inutile et une source de confusion : un modèle plus
 		// faible peut mal attribuer un fragment de texte noyé dans le

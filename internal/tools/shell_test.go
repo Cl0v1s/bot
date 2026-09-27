@@ -186,8 +186,11 @@ func TestShellNotifyDisabledByDefault(t *testing.T) {
 func TestShellAsRealUserNoOpWhenNotSandboxed(t *testing.T) {
 	called := false
 	tool := &ShellTool{
-		Timeout:         2 * time.Second,
-		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { called = true; return true, nil },
+		Timeout: 2 * time.Second,
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
+			called = true
+			return true, nil
+		},
 	}
 	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
 	if err != nil {
@@ -235,7 +238,7 @@ func TestShellAsRealUserFailsWhenConfirmationDenied(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:         2 * time.Second,
 		Sandboxed:       true,
-		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { return false, nil },
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) { return false, nil },
 	}
 	_, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
 	if err == nil {
@@ -252,7 +255,7 @@ func TestShellAsRealUserPassesExactCommandToConfirm(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:   2 * time.Second,
 		Sandboxed: true,
-		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) {
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
 			gotCommand = command
 			return true, nil
 		},
@@ -271,7 +274,7 @@ func TestShellAsRealUserWindowRequiresAsRealUser(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:         2 * time.Second,
 		Sandboxed:       true,
-		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { return true, nil },
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) { return true, nil },
 	}
 	_, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user_window":true}`)
 	if err == nil {
@@ -290,7 +293,7 @@ func TestShellAsRealUserPassesWindowFlagToConfirm(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:   2 * time.Second,
 		Sandboxed: true,
-		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) {
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
 			gotWindow = window
 			return true, nil
 		},
@@ -319,7 +322,7 @@ func TestShellAsRealUserRunsCommandDirectlyOnceConfirmed(t *testing.T) {
 	tool := &ShellTool{
 		Timeout:         2 * time.Second,
 		Sandboxed:       true,
-		ConfirmRealUser: func(ctx context.Context, command string, window bool) (bool, error) { return true, nil },
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) { return true, nil },
 	}
 	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
 	if err != nil {
@@ -386,5 +389,154 @@ func TestShellCannotAcquireControllingTTY(t *testing.T) {
 	}
 	if strings.TrimSpace(out) != "0" {
 		t.Fatalf("tty_nr = %q après ouverture de %s, attendu 0 (aucun terminal de contrôle)", out, pts)
+	}
+}
+
+// "white_list" : une fois la commande confirmée, un second appel avec la
+// MÊME commande exacte ne redemande plus (même dans une nouvelle session,
+// liste rechargée depuis le fichier), alors qu'une variante d'argument
+// redemande.
+func TestShellWhiteListConfirmsOnlyOncePerExactCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), DefaultWhitelistedCommandsFile)
+	wl, err := NewCommandWhitelist(path)
+	if err != nil {
+		t.Fatalf("NewCommandWhitelist: %v", err)
+	}
+	var asked []string
+	var gotWhiteList bool
+	confirm := func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
+		asked = append(asked, command)
+		gotWhiteList = whiteList
+		return true, nil
+	}
+	tool := &ShellTool{Timeout: 2 * time.Second, Sandboxed: true, ConfirmRealUser: confirm, Whitelist: wl}
+
+	if _, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true,"white_list":true}`); err != nil {
+		t.Fatalf("Call 1: %v", err)
+	}
+	if len(asked) != 1 || !gotWhiteList {
+		t.Fatalf("premier appel : confirmations = %v, whiteList = %v ; attendu 1 confirmation avec whiteList", asked, gotWhiteList)
+	}
+
+	// Nouvelle "session" : liste rechargée depuis le fichier.
+	wl2, err := NewCommandWhitelist(path)
+	if err != nil {
+		t.Fatalf("NewCommandWhitelist (rechargement): %v", err)
+	}
+	tool.Whitelist = wl2
+	out, err := tool.Call(context.Background(), `{"command":"echo bonjour","as_real_user":true}`)
+	if err != nil {
+		t.Fatalf("Call 2: %v", err)
+	}
+	if len(asked) != 1 {
+		t.Fatalf("commande en liste blanche reconfirmée : %v", asked)
+	}
+	if !strings.Contains(out, "bonjour") {
+		t.Fatalf("sortie = %q, attendu bonjour", out)
+	}
+
+	if _, err := tool.Call(context.Background(), `{"command":"echo bonjour2","as_real_user":true}`); err != nil {
+		t.Fatalf("Call 3: %v", err)
+	}
+	if len(asked) != 2 || asked[1] != "echo bonjour2" {
+		t.Fatalf("variante non reconfirmée : %v", asked)
+	}
+}
+
+// Un refus ne met rien en liste blanche.
+func TestShellWhiteListNotAddedWhenDenied(t *testing.T) {
+	wl, _ := NewCommandWhitelist("")
+	tool := &ShellTool{
+		Sandboxed: true,
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
+			return false, nil
+		},
+		Whitelist: wl,
+	}
+	if _, err := tool.Call(context.Background(), `{"command":"echo x","as_real_user":true,"white_list":true}`); err == nil {
+		t.Fatal("attendu une erreur (refus)")
+	}
+	if wl.Contains("echo x") {
+		t.Fatal("commande refusée ajoutée à la liste blanche")
+	}
+}
+
+func TestShellWhiteListRequiresAsRealUser(t *testing.T) {
+	wl, _ := NewCommandWhitelist("")
+	tool := &ShellTool{Sandboxed: true, Whitelist: wl,
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) { return true, nil }}
+	if _, err := tool.Call(context.Background(), `{"command":"echo x","white_list":true}`); err == nil {
+		t.Fatal("attendu une erreur (white_list sans as_real_user)")
+	}
+}
+
+func TestShellWhiteListUnavailableWithoutWhitelist(t *testing.T) {
+	called := false
+	tool := &ShellTool{Sandboxed: true,
+		ConfirmRealUser: func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
+			called = true
+			return true, nil
+		}}
+	if _, err := tool.Call(context.Background(), `{"command":"echo x","as_real_user":true,"white_list":true}`); err == nil {
+		t.Fatal("attendu une erreur (Whitelist nil)")
+	}
+	if called {
+		t.Fatal("confirmation demandée alors que white_list est indisponible")
+	}
+}
+
+// Sans ConfirmRealUser (mode mail), une commande en liste blanche s'exécute
+// sous l'identité réelle sans confirmation, mais toute autre commande
+// "as_real_user" est refusée, et "white_list" reste indisponible.
+func TestShellWhiteListHonoredWithoutConfirm(t *testing.T) {
+	wl, _ := NewCommandWhitelist("")
+	_ = wl.Add("echo x")
+	tool := &ShellTool{Timeout: 2 * time.Second, Sandboxed: true, Whitelist: wl}
+
+	out, err := tool.Call(context.Background(), `{"command":"echo x","as_real_user":true}`)
+	if err != nil {
+		t.Fatalf("Call (en liste blanche): %v", err)
+	}
+	if !strings.Contains(out, "x") {
+		t.Fatalf("sortie = %q, attendu x", out)
+	}
+	if _, err := tool.Call(context.Background(), `{"command":"echo y","as_real_user":true}`); err == nil {
+		t.Fatal("attendu une erreur (commande hors liste blanche, sans confirmation possible)")
+	}
+	if _, err := tool.Call(context.Background(), `{"command":"echo y","as_real_user":true,"white_list":true}`); err == nil {
+		t.Fatal("attendu une erreur (white_list sans confirmation possible)")
+	}
+	if wl.Contains("echo y") {
+		t.Fatal("commande ajoutée à la liste blanche sans confirmation")
+	}
+	if d := tool.Description(); !strings.Contains(d, `"echo x"`) {
+		t.Fatalf("description sans la commande en liste blanche : %q", d)
+	}
+}
+
+// Refresh reflète les ajouts faits par une autre instance (mode chat) et les
+// retraits manuels dans le fichier.
+func TestCommandWhitelistRefresh(t *testing.T) {
+	path := filepath.Join(t.TempDir(), DefaultWhitelistedCommandsFile)
+	reader, _ := NewCommandWhitelist(path)
+	writer, _ := NewCommandWhitelist(path)
+	if err := writer.Add("echo x"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if reader.Contains("echo x") {
+		t.Fatal("visible avant Refresh")
+	}
+	if err := reader.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if !reader.Contains("echo x") {
+		t.Fatal("ajout non visible après Refresh")
+	}
+	if err := os.WriteFile(path, []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = reader.Refresh()
+	if reader.Contains("echo x") {
+		t.Fatal("retrait manuel non pris en compte après Refresh")
 	}
 }

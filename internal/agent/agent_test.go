@@ -293,3 +293,54 @@ func TestRunResetsCounterOnShellSuccess(t *testing.T) {
 		}
 	}
 }
+
+// Quand le serveur refuse la requête principale pour dépassement de contexte
+// malgré les estimations (cas réel : "Message too long: 65230 tokens exceeds
+// the 65024-token context window"), Run supprime les plus vieux messages et
+// retente au lieu de faire échouer tout le tour.
+func TestRunRetriesAfterContextOverflowByDroppingOldest(t *testing.T) {
+	var calls int32
+	var lastCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []llm.Message `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		lastCount = len(req.Messages)
+		if atomic.AddInt32(&calls, 1) <= 2 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "Message too long: 65230 tokens exceeds the 65024-token context window."},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "réponse finale"}}},
+		})
+	}))
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+
+	conv := convo.New("sys", 0, 0.9, 0) // pas de compaction : seul le réessai joue
+	for i := 0; i < 10; i++ {
+		conv.AddUser("question")
+		conv.AddAssistant("réponse")
+	}
+	conv.AddUser("dernière question")
+	before := len(conv.Messages)
+
+	var warnings []string
+	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, func(e Event) {
+		if e.Kind == EventWarning {
+			warnings = append(warnings, e.Result)
+		}
+	})
+	if err != nil || reply != "réponse finale" {
+		t.Fatalf("Run = %q, %v ; attendu une réponse après réessais", reply, err)
+	}
+	if len(warnings) != 2 {
+		t.Fatalf("attendu 2 avertissements (un par réessai), got %v", warnings)
+	}
+	if lastCount-1 >= before { // -1 : system prompt
+		t.Fatalf("historique non réduit avant le dernier essai (%d messages envoyés, %d au départ)", lastCount-1, before)
+	}
+}

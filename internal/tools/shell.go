@@ -85,7 +85,22 @@ type ShellTool struct {
 	// window est faux, la confirmation ne vaut que pour cette commande
 	// précise). nil (ex: mode mail, aucun humain disponible pour confirmer)
 	// désactive purement et simplement ce mode.
-	ConfirmRealUser func(ctx context.Context, command string, window bool) (granted bool, err error)
+	//
+	// whiteList indique que le modèle demande (paramètre "white_list") à ce
+	// que cette commande exacte, une fois confirmée, soit ajoutée à
+	// Whitelist : purement informatif pour l'affichage de la question, c'est
+	// ShellTool qui fait l'ajout.
+	ConfirmRealUser func(ctx context.Context, command string, window, whiteList bool) (granted bool, err error)
+
+	// Whitelist : commandes exactes autorisées une fois pour toutes sous
+	// l'identité réelle (voir CommandWhitelist et le paramètre
+	// "white_list") — une commande "as_real_user" qui y figure s'exécute
+	// sans appeler ConfirmRealUser. nil = "white_list" indisponible.
+	// Aussi honorée quand ConfirmRealUser est nil (ex: mode mail, qui relit
+	// le fichier alimenté en mode chat) : "as_real_user" y est alors limité
+	// aux seules commandes de la liste, et "white_list" (qui exige une
+	// confirmation pour ajouter) reste indisponible.
+	Whitelist *CommandWhitelist
 }
 
 func (t *ShellTool) Name() string { return "run_shell" }
@@ -106,6 +121,15 @@ func (t *ShellTool) Description() string {
 		base += fmt.Sprintf(" Exécutée sous le compte système restreint %q, pas sous celui de l'utilisateur.", sandbox.User)
 		if t.ConfirmRealUser != nil {
 			base += fmt.Sprintf(" Le paramètre \"as_real_user\" existe pour un cas précis (identité réelle plutôt que le compte sandbox, ex: un outil qui exige des permissions de fichier strictes incompatibles avec un accès partagé, comme `glab auth login`) — mais NE L'UTILISE QUE si l'utilisateur te le demande explicitement, ou si les instructions d'une skill (SKILL.md) le demandent explicitement pour cet outil précis. Ne l'utilise JAMAIS de ta propre initiative simplement parce qu'une commande sandboxée échoue ou que ça semble plus simple : une commande sandboxée qui échoue a presque toujours une autre cause (répertoire non accordé, syntaxe, outil manquant...) à diagnostiquer normalement d'abord. Par défaut (\"as_real_user_window\" omis ou faux), la confirmation ne vaut que pour CETTE commande précise (mode \"oneshot\") : le prochain appel \"as_real_user\", même juste après, redemande. Si une skill (ou l'utilisateur) prévoit PLUSIEURS commandes sous l'identité réelle à la suite, passe \"as_real_user_window\": true sur le PREMIER appel pour ouvrir une fenêtre de %s pendant laquelle les appels \"as_real_user\" suivants (oneshot ou window) ne redemandent pas — n'active ce mode que si tu sais déjà que tu en auras besoin plusieurs fois, pas par précaution.", t.effectiveRealUserWindow())
+			if t.Whitelist != nil {
+				base += " Le paramètre \"white_list\" (avec \"as_real_user\") demande à l'utilisateur d'autoriser CETTE commande exacte (arguments compris) une fois pour toutes : si c'est accepté, les appels suivants avec exactement la même commande ne redemandent plus, même dans une session ultérieure. Réserve-le à une commande précise et récurrente, jamais par précaution."
+			}
+		} else if cmds := t.Whitelist.List(); len(cmds) > 0 {
+			quoted := make([]string, len(cmds))
+			for i, c := range cmds {
+				quoted[i] = fmt.Sprintf("%q", c)
+			}
+			base += " Le paramètre \"as_real_user\" (identité réelle plutôt que le compte sandbox) est LIMITÉ dans cette session, faute d'humain pour confirmer (ex: mode mail) : il n'est accepté QUE pour les commandes suivantes, préalablement autorisées par l'utilisateur, à reproduire EXACTEMENT (même chaîne, mêmes arguments) — toute autre commande avec \"as_real_user\" échouera : " + strings.Join(quoted, ", ") + ". N'utilise \"as_real_user\" que si l'une d'elles correspond exactement à ce qu'il faut faire, et jamais \"white_list\" (indisponible ici)."
 		} else {
 			base += " Le paramètre \"as_real_user\" (identité réelle plutôt que le compte sandbox) existe mais est INDISPONIBLE dans cette session : il exige qu'un shell interactif soit accessible pour qu'un humain confirme, ce qui n'est pas le cas ici (ex: mode mail, sans personne pour répondre) — toute tentative échouera explicitement avec une erreur claire. N'essaie pas de contourner ça autrement."
 		}
@@ -122,9 +146,16 @@ func (t *ShellTool) Description() string {
 func (t *ShellTool) ParametersSchema() json.RawMessage {
 	asRealUserDesc := "Si vrai, exécute cette commande précise sous l'identité réelle plutôt que sous le compte sandbox (aucun effet si le tool n'est pas sandboxé) — ne change AUCUN droit de fichier/répertoire, juste l'identité de ce seul appel. Demande une confirmation interactive à l'utilisateur. N'UTILISE CE PARAMÈTRE QUE si l'utilisateur te le demande explicitement, ou si les instructions d'une skill l'exigent explicitement pour cet outil précis (ex: un outil dont l'authentification/les identifiants sont liés à l'identité réelle, comme glab). Ne l'active JAMAIS simplement parce qu'une commande sandboxée a échoué ou par réflexe — diagnostique d'abord la vraie cause de l'échec. Voir \"as_real_user_window\" pour plusieurs commandes à la suite."
 	asRealUserWindowDesc := fmt.Sprintf("Sans effet si \"as_real_user\" n'est pas vrai. Par défaut (faux) : confirmation \"oneshot\", valable seulement pour cette commande précise, le prochain appel \"as_real_user\" redemande. Si vrai : ouvre, une fois confirmé, une fenêtre de %s pendant laquelle les appels \"as_real_user\" suivants ne redemandent pas — à réserver au cas où TU SAIS déjà que plusieurs commandes sous l'identité réelle vont suivre (typiquement précisé par une skill), jamais par défaut/précaution.", t.effectiveRealUserWindow())
-	if t.Sandboxed && t.ConfirmRealUser == nil {
+	if t.Sandboxed && t.ConfirmRealUser == nil && len(t.Whitelist.List()) > 0 {
+		asRealUserDesc = "LIMITÉ dans cette session (aucun humain pour confirmer) : accepté uniquement pour une commande de la liste blanche donnée dans la description du tool, reproduite exactement. Toute autre commande échouera."
+		asRealUserWindowDesc = "INDISPONIBLE dans cette session, voir \"as_real_user\"."
+	} else if t.Sandboxed && t.ConfirmRealUser == nil {
 		asRealUserDesc = "INDISPONIBLE dans cette session : exige qu'un shell interactif soit accessible pour qu'un humain confirme (ex: mode mail, personne pour répondre) — ce n'est pas le cas ici. Toute valeur true échouera explicitement, ne l'utilise pas."
 		asRealUserWindowDesc = "INDISPONIBLE dans cette session, voir \"as_real_user\"."
+	}
+	whiteListDesc := "Sans effet si \"as_real_user\" n'est pas vrai. Si vrai : demande à l'utilisateur d'autoriser définitivement cette commande EXACTE (même chaîne, mêmes arguments) sous l'identité réelle — une fois acceptée, elle ne redemande plus jamais de confirmation, même dans une session ultérieure ; toute variation (argument, espace...) redemande. À réserver à une commande précise et récurrente, jamais par défaut/précaution."
+	if !t.Sandboxed || t.ConfirmRealUser == nil || t.Whitelist == nil {
+		whiteListDesc = "INDISPONIBLE dans cette session. Toute valeur true échouera explicitement, ne l'utilise pas."
 	}
 	schema, err := json.Marshal(map[string]any{
 		"type": "object",
@@ -133,6 +164,7 @@ func (t *ShellTool) ParametersSchema() json.RawMessage {
 			"timeout_seconds":     map[string]any{"type": "integer", "description": "Timeout pour cette commande, en secondes. Optionnel : par défaut, timeout standard du tool. Plafonné à une valeur maximale fixée par la configuration.", "minimum": 1},
 			"as_real_user":        map[string]any{"type": "boolean", "description": asRealUserDesc},
 			"as_real_user_window": map[string]any{"type": "boolean", "description": asRealUserWindowDesc},
+			"white_list":          map[string]any{"type": "boolean", "description": whiteListDesc},
 		},
 		"required":             []string{"command"},
 		"additionalProperties": false,
@@ -151,6 +183,7 @@ type shellArgs struct {
 	TimeoutSeconds   int    `json:"timeout_seconds"`
 	AsRealUser       bool   `json:"as_real_user"`
 	AsRealUserWindow bool   `json:"as_real_user_window"`
+	WhiteList        bool   `json:"white_list"`
 }
 
 // effectiveTimeout retourne t.Timeout, ou 30s par défaut si non configuré.
@@ -180,6 +213,9 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 	}
 	if args.AsRealUserWindow && !args.AsRealUser {
 		return "", fmt.Errorf(`"as_real_user_window" n'a de sens qu'avec "as_real_user": true`)
+	}
+	if args.WhiteList && !args.AsRealUser {
+		return "", fmt.Errorf(`"white_list" n'a de sens qu'avec "as_real_user": true`)
 	}
 
 	// Verrou appliqué dans le code, pas seulement suggéré dans le prompt :
@@ -211,19 +247,32 @@ func (t *ShellTool) Call(ctx context.Context, argsJSON string) (string, error) {
 	// runAsRealUser : cette commande précise s'exécute sous l'identité réelle
 	// plutôt que sous le compte sandbox (voir ConfirmRealUser) — jamais vrai
 	// si le tool n'est pas sandboxé (rien à contourner, déjà l'identité
-	// réelle par défaut). Toujours reconfirmé ici, jamais mémorisé d'un appel
-	// à l'autre : voir le commentaire de ConfirmRealUser.
+	// réelle par défaut). Toujours reconfirmé ici (sauf commande en liste
+	// blanche), jamais mémorisé d'un appel à l'autre : voir le commentaire
+	// de ConfirmRealUser.
 	runAsRealUser := false
 	if args.AsRealUser && t.Sandboxed {
-		if t.ConfirmRealUser == nil {
-			return "", fmt.Errorf(`"as_real_user" demandé mais indisponible : ça nécessite qu'un shell interactif soit accessible pour qu'un humain confirme, ce qui n'est pas le cas dans cette session (ex: mode mail) — commande non exécutée`)
+		if args.WhiteList && (t.Whitelist == nil || t.ConfirmRealUser == nil) {
+			return "", fmt.Errorf(`"white_list" demandé mais indisponible dans cette session (aucun humain pour confirmer l'ajout, ou liste blanche non configurée) — commande non exécutée`)
 		}
-		granted, err := t.ConfirmRealUser(ctx, args.Command, args.AsRealUserWindow)
-		if err != nil {
-			return "", fmt.Errorf("confirmation pour l'exécution sous l'identité réelle: %w", err)
-		}
-		if !granted {
-			return "", fmt.Errorf("exécution sous l'identité réelle refusée par l'utilisateur — commande non exécutée")
+		// Liste blanche : comparaison exacte de la chaîne complète, voir
+		// CommandWhitelist. Suffit à elle seule, même sans ConfirmRealUser.
+		if !t.Whitelist.Contains(args.Command) {
+			if t.ConfirmRealUser == nil {
+				return "", fmt.Errorf(`"as_real_user" demandé mais indisponible pour cette commande : elle n'est pas en liste blanche, et sa confirmation nécessite qu'un shell interactif soit accessible pour qu'un humain confirme, ce qui n'est pas le cas dans cette session (ex: mode mail) — commande non exécutée`)
+			}
+			granted, err := t.ConfirmRealUser(ctx, args.Command, args.AsRealUserWindow, args.WhiteList)
+			if err != nil {
+				return "", fmt.Errorf("confirmation pour l'exécution sous l'identité réelle: %w", err)
+			}
+			if !granted {
+				return "", fmt.Errorf("exécution sous l'identité réelle refusée par l'utilisateur — commande non exécutée")
+			}
+			if args.WhiteList {
+				if err := t.Whitelist.Add(args.Command); err != nil {
+					log.Printf("run_shell: échec de l'enregistrement de la liste blanche: %v", err)
+				}
+			}
 		}
 		runAsRealUser = true
 	}

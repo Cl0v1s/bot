@@ -177,3 +177,115 @@ func TestWriteFileRejectsNegativeOffsetOrLength(t *testing.T) {
 		t.Fatal("attendu une erreur pour length négatif")
 	}
 }
+
+func TestTopmostMissing(t *testing.T) {
+	dir := t.TempDir()
+	if got := topmostMissing(dir); got != dir {
+		t.Errorf("topmostMissing(existant) = %q, attendu %q", got, dir)
+	}
+	want := filepath.Join(dir, "a")
+	if got := topmostMissing(filepath.Join(dir, "a", "b", "c")); got != want {
+		t.Errorf("topmostMissing = %q, attendu %q (jamais l'ancêtre existant lui-même)", got, want)
+	}
+}
+
+// write_file ne doit pas réécrire un fichier existant que le compte sandbox
+// ne peut pas écrire lui-même (voir checkExistingFile).
+func TestWriteFileRefusesFileNotWritableBySandbox(t *testing.T) {
+	withSandboxReady(t, true)
+	dir := canonicalTempDir(t)
+	path := filepath.Join(dir, "f.txt")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	sandboxCanAccess = func(p string, write bool) bool { return p == dir }
+
+	tool := &WriteFileTool{Perms: NewDirPermissions(nil)}
+	if _, err := callWriteFile(t, tool, path, "nouveau", 0, 0); err == nil {
+		t.Fatal("attendu un refus")
+	}
+	if data, _ := os.ReadFile(path); string(data) != "original" {
+		t.Fatalf("fichier modifié malgré le refus : %q", data)
+	}
+}
+
+// Un "content" terminé par "\n" (cas habituel d'un modèle) ne doit pas
+// ajouter de ligne vide parasite.
+func TestWriteFileOffsetIgnoresTrailingNewlineOfContent(t *testing.T) {
+	tool, path := newWritableFile(t, "l1\nl2\n")
+	if _, err := callWriteFile(t, tool, path, "NOUVELLE\n", 2, 0); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "l1\nNOUVELLE\nl2\n" {
+		t.Fatalf("contenu = %q", got)
+	}
+}
+
+// Relancer une insertion déjà faite ne doit pas dupliquer le bloc.
+func TestWriteFileOffsetRefusesRepeatedInsertion(t *testing.T) {
+	tool, path := newWritableFile(t, "# Titre\nfin\n")
+	if _, err := callWriteFile(t, tool, path, "- point important\n- autre point", 2, 0); err != nil {
+		t.Fatalf("premier appel: %v", err)
+	}
+	if _, err := callWriteFile(t, tool, path, "- point important\n- autre point", 2, 0); err == nil {
+		t.Fatal("attendu un refus : même bloc déjà présent à cet endroit")
+	}
+	if got, _ := os.ReadFile(path); string(got) != "# Titre\n- point important\n- autre point\nfin\n" {
+		t.Fatalf("contenu = %q", got)
+	}
+}
+
+// Inclure la ligne d'ancrage (titre sous lequel on insère) dans "content"
+// la dupliquerait.
+func TestWriteFileOffsetRefusesAnchorLineRepeated(t *testing.T) {
+	tool, path := newWritableFile(t, "# Titre\nfin\n")
+	if _, err := callWriteFile(t, tool, path, "# Titre\nnouveau", 2, 0); err == nil {
+		t.Fatal("attendu un refus : la ligne \"# Titre\" serait en double")
+	}
+	// Remplacement dont le contenu reprend la ligne suivante, restée en place.
+	if _, err := callWriteFile(t, tool, path, "Titre modifié\nfin", 1, 1); err == nil {
+		t.Fatal("attendu un refus : la ligne \"fin\" serait en double")
+	}
+	if got, _ := os.ReadFile(path); string(got) != "# Titre\nfin\n" {
+		t.Fatalf("fichier modifié malgré les refus : %q", got)
+	}
+}
+
+// Une ligne banale identique de part et d'autre (accolade, ligne vide) ne
+// doit pas bloquer l'édition.
+func TestWriteFileOffsetAllowsTrivialBoundaryRepeat(t *testing.T) {
+	tool, path := newWritableFile(t, "func a() {\n}\n")
+	if _, err := callWriteFile(t, tool, path, "}\n\nfunc b() {", 2, 0); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "func a() {\n}\n\nfunc b() {\n}\n" {
+		t.Fatalf("contenu = %q", got)
+	}
+}
+
+// Le résultat doit montrer la zone modifiée, numérotée.
+func TestWriteFileOffsetReportsEditedZone(t *testing.T) {
+	tool, path := newWritableFile(t, "l1\nl2\nl3\n")
+	out, err := callWriteFile(t, tool, path, "X", 2, 1)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	for _, want := range []string{"lignes 2-2 (1) remplacées par 1 ligne(s)", "1  l1", "2> X", "3  l3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("résultat sans %q :\n%s", want, out)
+		}
+	}
+}
+
+// "content" vide avec "length" = suppression de lignes.
+func TestWriteFileOffsetEmptyContentDeletesLines(t *testing.T) {
+	tool, path := newWritableFile(t, "l1\nl2\nl3\n")
+	if _, err := callWriteFile(t, tool, path, "", 2, 1); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if got, _ := os.ReadFile(path); string(got) != "l1\nl3\n" {
+		t.Fatalf("contenu = %q", got)
+	}
+}

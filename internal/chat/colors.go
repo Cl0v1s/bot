@@ -16,7 +16,11 @@ const (
 	ansiYellow  = "\x1b[33m"
 	ansiCyan    = "\x1b[36m"
 	ansiMagenta = "\x1b[35m" // demandes d'interaction utilisateur (permission, confirmation)
-	ansiGray    = "\x1b[90m" // rappel du message tapé, au moment où son traitement démarre (voir dispatchTurn/file d'attente)
+	ansiGray    = "\x1b[90m" // indicateur "réflexion" et commentaires du modèle avant ses appels d'outils
+	// ansiInput : prompt et texte tapé par l'utilisateur (écho de l'éditeur
+	// de ligne, rappel des messages en file), pour les distinguer des
+	// réponses du modèle, affichées dans la couleur par défaut du terminal.
+	ansiInput = ansiBold + ansiCyan
 )
 
 // colorsEnabled désactive la couleur si NO_COLOR est défini (convention

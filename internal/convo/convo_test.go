@@ -329,33 +329,202 @@ func TestCompactFailsOnEmptySummaryInsteadOfCorruptingHistory(t *testing.T) {
 	}
 }
 
-// Depuis que persistMemory est lancée en parallèle du résumé (pas après),
-// l'extraction mémoire doit quand même aboutir même si le résumé échoue
-// ensuite — contrepartie assumée de la parallélisation (voir le commentaire
-// de Compact). Vérifie aussi que Compact attend bien la fin de
-// l'extraction (wg.Wait()) avant de retourner, sans quoi ce test serait
-// intrinsèquement flaky (lecture du fichier avant qu'il soit écrit).
-func TestCompactPersistsMemoryEvenWhenSummaryFails(t *testing.T) {
-	server := fakeCompactionServer(t, "", "- préfère les réponses en français")
-	defer server.Close()
-	client := llm.New(server.URL, "", "test-model")
-
+// La maintenance mémoire a lieu APRÈS le résumé, jamais en parallèle (les
+// serveurs locaux partagent une même réserve de contexte entre générations
+// simultanées, voir Compact), et seulement si le résumé a réussi.
+func TestCompactPersistsMemoryOnlyAfterSuccessfulSummary(t *testing.T) {
 	memoryFile := filepath.Join(t.TempDir(), "MEMORY.md")
+
+	failing := fakeCompactionServer(t, "", "- préfère les réponses en français")
+	defer failing.Close()
 	c := New("", 8192, 0.9, 0)
 	c.MemoryFile = memoryFile
 	c.AddUser("bonjour")
 	c.AddAssistant("salut")
-
-	if _, err := c.Compact(context.Background(), client); err == nil {
+	if _, err := c.Compact(context.Background(), llm.New(failing.URL, "", "test-model")); err == nil {
 		t.Fatal("attendu une erreur (résumé vide dans ce test)")
 	}
-
-	data, err := os.ReadFile(memoryFile)
-	if err != nil {
-		t.Fatalf("lecture de %q: %v (l'extraction mémoire aurait dû aboutir malgré l'échec du résumé)", memoryFile, err)
+	if _, err := os.Stat(memoryFile); !os.IsNotExist(err) {
+		t.Fatalf("MEMORY.md ne devrait pas être écrit quand le résumé échoue (err=%v)", err)
 	}
-	if !strings.Contains(string(data), "préfère les réponses en français") {
-		t.Fatalf("MEMORY.md = %q, attendu qu'il contienne l'extraction", data)
+
+	ok := fakeCompactionServer(t, "résumé", "- préfère les réponses en français")
+	defer ok.Close()
+	if _, err := c.Compact(context.Background(), llm.New(ok.URL, "", "test-model")); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	data, err := os.ReadFile(memoryFile)
+	if err != nil || !strings.Contains(string(data), "préfère les réponses en français") {
+		t.Fatalf("MEMORY.md = %q (err=%v), attendu l'extraction après un résumé réussi", data, err)
+	}
+}
+
+// overflowServer refuse (erreur de dépassement de contexte) toute requête de
+// résumé dont le journal dépasse maxChars caractères, et répond "résumé"
+// sinon. Compte les requêtes reçues.
+func overflowServer(t *testing.T, maxChars int, calls *int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []llm.Message `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("décodage de la requête: %v", err)
+		}
+		*calls++
+		size := 0
+		for _, m := range req.Messages {
+			size += len(m.Content)
+		}
+		if size > maxChars {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "The model ran out of context space while generating."},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "résumé"}}},
+		})
+	}))
+}
+
+// Un échec de compaction pour dépassement de contexte n'est pas définitif :
+// Compact supprime les plus vieux messages et retente, jusqu'à réussir.
+func TestCompactRetriesDroppingOldestOnContextOverflow(t *testing.T) {
+	calls := 0
+	server := overflowServer(t, 6000, &calls)
+	defer server.Close()
+
+	c := New("", 0, 0.9, 2) // MaxContextTokens=0 : pas de pré-découpe, seule la boucle de réessai joue
+	for i := 0; i < 20; i++ {
+		c.AddUser(strings.Repeat("u", 400))
+		c.AddAssistant(strings.Repeat("a", 400))
+	}
+	last := c.Messages[len(c.Messages)-1]
+
+	compacted, err := c.Compact(context.Background(), llm.New(server.URL, "", "test-model"))
+	if err != nil || !compacted {
+		t.Fatalf("Compact = %v, %v ; attendu un succès après réessais", compacted, err)
+	}
+	if calls < 2 {
+		t.Fatalf("%d requête(s) : attendu au moins un réessai", calls)
+	}
+	if c.LastCompactionDropped == 0 {
+		t.Fatal("LastCompactionDropped = 0, attendu des messages supprimés sans résumé")
+	}
+	if len(c.Messages) != 3 || c.Messages[0].Role != "system" || c.Messages[2].Content != last.Content {
+		t.Fatalf("historique inattendu après compaction : %d messages", len(c.Messages))
+	}
+}
+
+// Même si toutes les tentatives échouent, les messages supprimés le restent :
+// la conversation rétrécit au lieu de rester bloquée.
+func TestCompactShrinksConversationEvenWhenAllAttemptsFail(t *testing.T) {
+	calls := 0
+	server := overflowServer(t, 0, &calls) // refuse tout
+	defer server.Close()
+
+	c := New("", 0, 0.9, 2)
+	for i := 0; i < 20; i++ {
+		c.AddUser("question")
+		c.AddAssistant("réponse")
+	}
+	before := len(c.Messages)
+
+	_, err := c.Compact(context.Background(), llm.New(server.URL, "", "test-model"))
+	if err == nil && len(c.Messages) != 2 {
+		t.Fatalf("sans erreur, attendu que tout l'ancien historique ait été supprimé (reste %d)", len(c.Messages))
+	}
+	if len(c.Messages) >= before {
+		t.Fatalf("historique non réduit (%d -> %d)", before, len(c.Messages))
+	}
+	if calls > maxCompactionAttempts {
+		t.Fatalf("%d requêtes, attendu au plus %d", calls, maxCompactionAttempts)
+	}
+}
+
+// La requête de résumé est bornée d'emblée (summaryInputShare) : elle ne doit
+// pas contenir tout le contexte.
+func TestCompactBoundsSummaryRequestUpFront(t *testing.T) {
+	calls := 0
+	// 1000 tokens de contexte => budget ~600 tokens ~ 2400 caractères.
+	server := overflowServer(t, 3200, &calls)
+	defer server.Close()
+
+	c := New("", 1000, 0.9, 1)
+	for i := 0; i < 20; i++ {
+		c.AddUser(strings.Repeat("u", 200))
+		c.AddAssistant(strings.Repeat("a", 200))
+	}
+	if _, err := c.Compact(context.Background(), llm.New(server.URL, "", "test-model")); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("%d requêtes, attendu une seule (requête déjà bornée avant envoi)", calls)
+	}
+}
+
+// Une erreur qui n'est PAS un dépassement de contexte ne déclenche aucune
+// suppression.
+func TestCompactDoesNotDropOnOtherErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "model not loaded"}})
+	}))
+	defer server.Close()
+
+	c := New("", 0, 0.9, 2)
+	for i := 0; i < 5; i++ {
+		c.AddUser("q")
+		c.AddAssistant("r")
+	}
+	before := len(c.Messages)
+	if _, err := c.Compact(context.Background(), llm.New(server.URL, "", "test-model")); err == nil {
+		t.Fatal("attendu une erreur")
+	}
+	if len(c.Messages) != before || c.LastCompactionDropped != 0 {
+		t.Fatalf("historique modifié (%d -> %d) sur une erreur sans rapport avec le contexte", before, len(c.Messages))
+	}
+}
+
+func TestIsContextOverflow(t *testing.T) {
+	for _, msg := range []string{
+		"erreur LLM: Message too long: 65230 tokens exceeds the 65024-token context window.",
+		"erreur LLM: The model ran out of context space while generating.",
+		"This model's maximum context length is 8192 tokens",
+	} {
+		if !IsContextOverflow(errString(msg)) {
+			t.Errorf("IsContextOverflow(%q) = false", msg)
+		}
+	}
+	for _, msg := range []string{"model not loaded", "connection refused"} {
+		if IsContextOverflow(errString(msg)) {
+			t.Errorf("IsContextOverflow(%q) = true", msg)
+		}
+	}
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+// DropOldest ne coupe jamais un groupe tool_calls et garde le dernier message.
+func TestDropOldestKeepsToolGroupsAndLastMessage(t *testing.T) {
+	c := New("", 0, 0.9, 0)
+	c.AddUser("q1")
+	c.AppendRaw(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "1", Function: llm.ToolCallFunction{Name: "run_shell"}}}})
+	c.AppendRaw(llm.Message{Role: "tool", Content: "out", ToolCallID: "1"})
+	c.AddAssistant("r1")
+	c.AddUser("q2")
+
+	if n := c.DropOldest(0.4); n != 3 { // 0.4*5=2 -> étendu au-delà du "tool"
+		t.Fatalf("DropOldest = %d, attendu 3", n)
+	}
+	if c.Messages[0].Role == "tool" {
+		t.Fatal("un message tool se retrouve en tête")
+	}
+	c.DropOldest(1)
+	if len(c.Messages) != 1 || c.Messages[0].Content != "q2" {
+		t.Fatalf("attendu de garder le dernier message, reste %+v", c.Messages)
 	}
 }
 

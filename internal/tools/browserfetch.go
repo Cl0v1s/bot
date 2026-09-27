@@ -61,6 +61,10 @@ type BrowserFetchTool struct {
 	// MaxMediaBytes : taille max acceptée pour un média téléchargé (voir
 	// probeAndSaveMedia). <= 0 = valeur par défaut (25 Mio).
 	MaxMediaBytes int
+
+	// Perms, Sandboxed : voir HTTPGetTool (paramètre "save_to").
+	Perms     *DirPermissions
+	Sandboxed bool
 }
 
 func (t *BrowserFetchTool) Name() string { return "browser_fetch" }
@@ -75,20 +79,20 @@ func (t *BrowserFetchTool) Description() string {
 }
 
 func (t *BrowserFetchTool) ParametersSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"url": {"type": "string", "description": "URL http(s) complète de la page à charger."},
-			"format": {"type": "string", "enum": ["text", "html"], "description": "\"text\" (défaut) : contenu converti en texte lisible. \"html\" : DOM brut (balises et attributs compris) — à utiliser pour extraire une information logée dans un attribut, comme l'URL d'une image dans <img src=\"...\">, perdue par la conversion en texte."}
-		},
-		"required": ["url"],
-		"additionalProperties": false
-	}`)
+	props := map[string]any{
+		"url":    map[string]any{"type": "string", "description": "URL http(s) complète de la page à charger."},
+		"format": map[string]any{"type": "string", "enum": []string{"text", "html"}, "description": "\"text\" (défaut) : contenu converti en texte lisible. \"html\" : DOM brut (balises et attributs compris) — à utiliser pour extraire une information logée dans un attribut, comme l'URL d'une image dans <img src=\"...\">, perdue par la conversion en texte."},
+	}
+	if t.Perms != nil {
+		props["save_to"] = map[string]any{"type": "string", "description": saveToDescription + " Enregistre le contenu au format demandé par \"format\" — typiquement \"html\" pour ensuite chercher des balises (ex: grep '<img' sur le fichier)."}
+	}
+	return mustSchema("browser_fetch", props, []string{"url"})
 }
 
 type browserFetchArgs struct {
 	URL    string `json:"url"`
 	Format string `json:"format"`
+	SaveTo string `json:"save_to"`
 }
 
 // browserRenderBudget : temps laissé à la page pour finir de se construire
@@ -192,6 +196,10 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 	if args.Format == "html" {
 		content = html
 		label = "DOM brut de la page rendue (HTML, balises et attributs compris)"
+	}
+
+	if args.SaveTo != "" {
+		return saveFetchedContent(t.Perms, t.Sandboxed, args.SaveTo, []byte(content))
 	}
 
 	maxBytes := t.MaxBodyBytes

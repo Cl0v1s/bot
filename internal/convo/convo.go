@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"strings"
-	"sync"
 
 	"bot/internal/llm"
 )
@@ -35,6 +34,11 @@ type Conversation struct {
 	// survivre à cette conversation (voir persistMemory). "" = désactivé
 	// (aucune tentative d'extraction).
 	MemoryFile string
+
+	// LastCompactionDropped : nombre de messages supprimés SANS résumé lors
+	// de la dernière compaction (voir Compact), pour que l'appelant puisse
+	// le signaler. 0 = aucun.
+	LastCompactionDropped int
 }
 
 func New(systemPrompt string, maxContextTokens int, compactAt float64, keepLast int) *Conversation {
@@ -374,36 +378,62 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 	toSummarize := c.Messages[:cut]
 	kept := append([]llm.Message(nil), c.Messages[cut:]...)
 
-	// persistMemory lancée en parallèle du résumé (pas après) : deux appels
-	// LLM indépendants sur les mêmes messages, autant ne pas payer leur
-	// latence en série. Contrepartie assumée : contrairement à avant,
-	// l'appel mémoire a maintenant lieu même si le résumé échoue ensuite
-	// (retenté au prochain tour) — un aller-retour LLM de plus dans ce cas
-	// précis, en échange d'une compaction deux fois plus rapide dans le cas
-	// normal (succès). wg.Wait() avant de retourner : que Compact réussisse
-	// ou échoue, on ne rend la main qu'une fois persistMemory terminée
-	// (déterministe pour les appelants/tests, qui peuvent alors vérifier
-	// MEMORY.md immédiatement après).
-	var wg sync.WaitGroup
-	if c.MemoryFile != "" {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			c.persistMemory(ctx, client, toSummarize)
-		}()
+	// Le résumé est demandé en une seule requête contenant tout ce qu'il y a
+	// à résumer : c'est-à-dire, au moment où la compaction se déclenche,
+	// presque tout le contexte — plus la place de générer le résumé. Sans
+	// borne, cette requête déborde précisément quand la compaction est le
+	// plus nécessaire. On retire donc d'emblée les plus vieux messages tant
+	// que la requête dépasse summaryInputBudget, puis, à chaque échec pour
+	// dépassement de contexte, on en retire encore une part et on retente.
+	// Les messages ainsi retirés sont définitivement supprimés de la
+	// conversation (sans résumé), même si toutes les tentatives échouent :
+	// la conversation rétrécit à chaque échec au lieu de rester bloquée à
+	// une taille qui ne passe plus.
+	budget := c.summaryInputBudget()
+	dropped := 0
+	for len(toSummarize) > 0 && budget > 0 && summarizeRequestTokens(toSummarize) > budget {
+		n := dropOldestGroupSafe(toSummarize, 1)
+		toSummarize = toSummarize[n:]
+		dropped += n
 	}
 
-	summarizeReq := []llm.Message{
-		{Role: "system", Content: summarizeSystemPrompt},
-		{Role: "user", Content: serializeForSummary(toSummarize) + "\n\n--- fin du journal à résumer ---\n\nRésume ce journal, selon les instructions données."},
+	var summaryMsg llm.Message
+	var err error
+	for attempt := 1; ; attempt++ {
+		if len(toSummarize) == 0 {
+			break
+		}
+		summarizeReq := []llm.Message{
+			{Role: "system", Content: summarizeSystemPrompt},
+			{Role: "user", Content: serializeForSummary(toSummarize) + "\n\n--- fin du journal à résumer ---\n\nRésume ce journal, selon les instructions données."},
+		}
+		// L'usage renvoyé ici correspond au prompt de résumé, pas à la
+		// conversation réelle : on ne l'enregistre pas via RecordUsage.
+		summaryMsg, _, err = client.ChatCompletion(ctx, summarizeReq, nil)
+		if err == nil || !IsContextOverflow(err) || attempt >= maxCompactionAttempts || ctx.Err() != nil {
+			break
+		}
+		n := dropOldestGroupSafe(toSummarize, (len(toSummarize)+compactionDropDivisor-1)/compactionDropDivisor)
+		log.Printf("convo: compaction (tentative %d) : contexte dépassé, %d message(s) le(s) plus ancien(s) supprimé(s) avant nouvel essai : %v", attempt, n, err)
+		toSummarize = toSummarize[n:]
+		dropped += n
 	}
 
-	// L'usage renvoyé ici correspond au prompt de résumé, pas à la
-	// conversation réelle : on ne l'enregistre pas via RecordUsage.
-	summaryMsg, _, err := client.ChatCompletion(ctx, summarizeReq, nil)
-	wg.Wait()
+	if dropped > 0 {
+		// Suppression définitive, que le résumé ait finalement réussi ou non.
+		c.Messages = append(append([]llm.Message(nil), toSummarize...), kept...)
+		c.LastKnownTokens = 0
+		c.LastKnownMessageCount = 0
+		c.LastCompactionDropped = dropped
+		log.Printf("convo: compaction : %d message(s) le(s) plus ancien(s) supprimé(s) sans résumé pour tenir dans le contexte", dropped)
+	}
+	if len(toSummarize) == 0 {
+		// Plus rien à résumer : tout l'ancien historique a dû être supprimé.
+		// La conversation a quand même été ramenée à kept.
+		return dropped > 0, nil
+	}
 	if err != nil {
-		return false, fmt.Errorf("compaction du contexte: %w", err)
+		return dropped > 0, fmt.Errorf("compaction du contexte: %w", err)
 	}
 	summary := strings.TrimSpace(summaryMsg.Content)
 	if summary == "" || looksLikeToolCallArtifact(summary) {
@@ -416,7 +446,18 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 		// mais n'est pas un résumé. Mieux vaut échouer clairement ici
 		// (compaction retentée au prochain tour) que remplacer l'historique
 		// par un résumé vide ou par un appel d'outil recopié tel quel.
-		return false, fmt.Errorf("compaction du contexte: résumé invalide renvoyé par le modèle (vide, ou appel d'outil échappé en texte au lieu d'un résumé)")
+		return dropped > 0, fmt.Errorf("compaction du contexte: résumé invalide renvoyé par le modèle (vide, ou appel d'outil échappé en texte au lieu d'un résumé)")
+	}
+
+	// Maintenance mémoire APRÈS le résumé, pas en parallèle : les serveurs
+	// locaux (LM Studio...) partagent une même réserve de contexte entre
+	// les générations simultanées — deux gros appels en même temps font
+	// déborder les deux ("The model ran out of context space while
+	// generating. This happens when several chats [...] generate at the
+	// same time"). Seulement en cas de succès du résumé, et sur les seuls
+	// messages effectivement résumés (déjà bornés par budget).
+	if c.MemoryFile != "" {
+		c.persistMemory(ctx, client, toSummarize)
 	}
 
 	compacted := make([]llm.Message, 0, len(kept)+1)
@@ -441,10 +482,101 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 	c.LastKnownTokens = 0
 	c.LastKnownMessageCount = 0
 
-	// persistMemory déjà lancée en parallèle plus haut, et déjà terminée
-	// (wg.Wait() ci-dessus) : rien à refaire ici.
-
 	return true, nil
+}
+
+const (
+	// maxCompactionAttempts : nombre max de tentatives de résumé dans un
+	// même appel à Compact (voir la boucle de réessai).
+	maxCompactionAttempts = 6
+	// compactionDropDivisor : à chaque échec pour dépassement de contexte,
+	// 1/compactionDropDivisor des messages restant à résumer (les plus
+	// anciens) est supprimé avant de retenter.
+	compactionDropDivisor = 4
+	// summaryInputShare : part de MaxContextTokens que la requête de résumé
+	// peut occuper au maximum, le reste étant laissé à la génération du
+	// résumé lui-même (et à la marge d'erreur de l'estimation).
+	summaryInputShare = 0.6
+)
+
+// summaryInputBudget : taille max (tokens estimés) de la requête de résumé ;
+// 0 = pas de borne (MaxContextTokens inconnu).
+func (c *Conversation) summaryInputBudget() int {
+	if c.MaxContextTokens <= 0 {
+		return 0
+	}
+	return int(float64(c.MaxContextTokens) * summaryInputShare)
+}
+
+// summarizeRequestTokens estime la taille de la requête de résumé pour
+// messages.
+func summarizeRequestTokens(messages []llm.Message) int {
+	return estimateTokens(summarizeSystemPrompt) + estimateTokens(serializeForSummary(messages)) + 50
+}
+
+// IsContextOverflow indique si err est un refus du serveur LLM pour
+// dépassement de la fenêtre de contexte (requête trop longue, ou plus de
+// place pour générer). Heuristique sur le message d'erreur : les serveurs
+// compatibles OpenAI (LM Studio, llama.cpp, vLLM...) n'ont pas de code
+// d'erreur commun pour ce cas.
+func IsContextOverflow(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"context window", "context length", "context space", "context size",
+		"maximum context", "context_length_exceeded", "too long", "exceeds the",
+		"ran out of context",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropOldestGroupSafe retourne le nombre de messages à retirer en tête de
+// messages pour en supprimer au moins n, sans jamais couper au milieu d'un
+// groupe [assistant à tool_calls + ses résultats] (voir Compact) : un
+// message "tool" ne peut pas se retrouver en tête. Peut retourner
+// len(messages).
+func dropOldestGroupSafe(messages []llm.Message, n int) int {
+	if n < 1 {
+		n = 1
+	}
+	if n >= len(messages) {
+		return len(messages)
+	}
+	for n < len(messages) && messages[n].Role == "tool" {
+		n++
+	}
+	return n
+}
+
+// DropOldest supprime au moins une fraction (0-1) des messages les plus
+// anciens de la conversation, sans casser de groupe tool_calls et en gardant
+// toujours au moins le dernier message. Filet de sécurité quand le serveur
+// refuse une requête pour dépassement de contexte malgré les estimations
+// (voir agent.Run). Retourne le nombre de messages supprimés.
+func (c *Conversation) DropOldest(fraction float64) int {
+	if len(c.Messages) <= 1 {
+		return 0
+	}
+	n := dropOldestGroupSafe(c.Messages, int(float64(len(c.Messages))*fraction+0.5))
+	if n >= len(c.Messages) {
+		n = len(c.Messages) - 1
+		for n > 0 && c.Messages[n].Role == "tool" {
+			n--
+		}
+	}
+	if n <= 0 {
+		return 0
+	}
+	c.Messages = append([]llm.Message(nil), c.Messages[n:]...)
+	c.LastKnownTokens = 0
+	c.LastKnownMessageCount = 0
+	return n
 }
 
 // CompactIfNeeded compacte le contexte si le seuil est atteint. Retourne true

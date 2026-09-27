@@ -18,6 +18,15 @@ import (
 
 const defaultMaxSteps = 8
 
+// maxOverflowRetries / overflowDropFraction : quand le serveur refuse une
+// requête pour dépassement de contexte, nombre max de nouvelles tentatives
+// dans une même étape, et part des plus vieux messages supprimée avant
+// chacune (voir Run).
+const (
+	maxOverflowRetries   = 4
+	overflowDropFraction = 0.25
+)
+
 // ToolUsagePrompt rappelle au modèle d'essayer un outil plutôt que de
 // deviner s'il y a accès ou de demander la permission lui-même en langage
 // naturel : sans ce rappel, un modèle prudent tend à répondre "je n'ai pas
@@ -223,7 +232,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// qu'aucun message ne puisse plus jamais aboutir. On continue donc
 		// simplement sans compacter, avec l'historique complet tel quel.
 		if !compactionFailed {
-			if _, err := conv.CompactIfNeeded(ctx, client); err != nil {
+			conv.LastCompactionDropped = 0
+			_, err := conv.CompactIfNeeded(ctx, client)
+			if dropped := conv.LastCompactionDropped; dropped > 0 && onEvent != nil {
+				onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("compaction : %d message(s) le(s) plus ancien(s) supprimé(s) sans résumé pour tenir dans le contexte", dropped)})
+			}
+			if err != nil {
 				compactionFailed = true
 				if onEvent != nil {
 					onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("échec de la compaction du contexte, poursuite sans compacter : %v", err)})
@@ -239,7 +253,22 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 			onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé", dropped)})
 		}
 
+		// Si le serveur refuse quand même la requête pour dépassement de
+		// contexte (l'estimation de EnsureFitsContext reste une heuristique,
+		// qui ne compte notamment pas la définition des outils), on supprime
+		// une part des plus vieux messages et on retente, plutôt que de
+		// faire échouer tout le tour.
 		msg, usage, err := client.ChatCompletion(ctx, conv.Full(), specs)
+		for attempt := 1; err != nil && convo.IsContextOverflow(err) && attempt <= maxOverflowRetries && ctx.Err() == nil; attempt++ {
+			dropped := conv.DropOldest(overflowDropFraction)
+			if dropped == 0 {
+				break
+			}
+			if onEvent != nil {
+				onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("requête refusée pour dépassement de contexte : %d message(s) le(s) plus ancien(s) supprimé(s), nouvel essai (%d/%d)", dropped, attempt, maxOverflowRetries)})
+			}
+			msg, usage, err = client.ChatCompletion(ctx, conv.Full(), specs)
+		}
 		if err != nil {
 			return "", lastUsage, err
 		}

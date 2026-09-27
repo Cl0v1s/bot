@@ -1,6 +1,8 @@
 package mailbot
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"bot/internal/convo"
@@ -79,5 +81,32 @@ func TestGetOrCreateConversationSeparatePerSubject(t *testing.T) {
 	b := opts.getOrCreateConversation("alice@example.com", "Question B")
 	if a == b {
 		t.Fatalf("deux sujets différents ne devraient pas partager la même conversation")
+	}
+}
+
+// Premier échec de génération : le mail doit rester non lu pour être
+// retenté (erreur retournée, aucun envoi ni accès IMAP), et une annulation
+// (arrêt du programme) ne doit jamais compter comme un échec.
+func TestHandleLLMFailureRetriesBeforeGivingUp(t *testing.T) {
+	opts := Options{
+		Conversations: make(map[string]*convo.Conversation),
+		Failures:      make(map[string]int),
+	}
+	parsed := &parsedMail{MessageID: "<abc@example.com>", Subject: "Re: Question"}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := opts.handleLLMFailure(cancelled, nil, 1, parsed, "alice@example.com", errors.New("boom")); err == nil {
+		t.Fatalf("une annulation devrait retourner l'erreur")
+	}
+	if n := opts.Failures["<abc@example.com>"]; n != 0 {
+		t.Fatalf("une annulation ne devrait pas être comptée, compteur = %d", n)
+	}
+
+	if err := opts.handleLLMFailure(context.Background(), nil, 1, parsed, "alice@example.com", errors.New("boom")); err == nil {
+		t.Fatalf("le premier échec devrait retourner une erreur (mail laissé non lu)")
+	}
+	if n := opts.Failures["<abc@example.com>"]; n != 1 {
+		t.Fatalf("compteur d'échecs = %d, attendu 1", n)
 	}
 }

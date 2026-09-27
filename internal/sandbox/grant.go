@@ -105,6 +105,9 @@ func GrantDirectory(dir string) error {
 		}
 
 		if isProtectedFromGrant(d.Name()) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 
@@ -284,16 +287,14 @@ func ensureGroupWritableAsUser(paths []string) error {
 }
 
 // isProtectedFromGrant indique si name (nom de base, pas chemin complet) ne
-// doit JAMAIS être touché par GrantDirectory, quel que soit le dossier
-// accordé — y compris le workspace lui-même, dont ConfigFilePath place le
-// sien à sa racine. ".env" porte les vrais identifiants du bot (clé API
-// LLM, identifiants mail...) : le compte sandbox est justement là pour
-// isoler ce qu'une commande shell pilotée par le modèle peut atteindre, lui
-// accorder l'accès à ce fichier en effet de bord d'une synchronisation de
-// dossier annulerait cette isolation, sans aucune raison fonctionnelle
-// (aucun outil n'a besoin d'y toucher).
+// doit JAMAIS être touché par GrantDirectory (ni, pour un répertoire, son
+// contenu), quel que soit le dossier accordé — y compris le workspace
+// lui-même, qui contient .env (vrais identifiants du bot) et les fichiers
+// d'état du harnais : les accorder au compte sandbox, en effet de bord d'une
+// synchronisation de dossier, annulerait l'isolation qu'il est censé
+// apporter. Voir IsProtectedName (trusted.go) pour la liste.
 func isProtectedFromGrant(name string) bool {
-	return name == ".env"
+	return IsProtectedName(name)
 }
 
 // ancestors retourne les répertoires parents de dir, du plus proche (parent

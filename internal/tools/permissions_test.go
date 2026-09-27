@@ -123,7 +123,7 @@ func TestCheckFileUsesRealSandboxAccessWhenReady(t *testing.T) {
 		t.Fatal("attendu un refus : sandbox prêt mais sandboxCanAccess refuse, la liste JSON ne doit pas suffire")
 	}
 
-	sandboxCanAccess = func(path string, write bool) bool { return path == dir && !write }
+	sandboxCanAccess = func(path string, write bool) bool { return (path == dir || path == file) && !write }
 	if _, err := perms.CheckFileRead(file); err != nil {
 		t.Fatalf("CheckFileRead: %v", err)
 	}
@@ -218,4 +218,102 @@ func canonicalTempDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
+}
+
+// En mode sandbox, le répertoire accessible ne suffit pas : read_file
+// s'exécute sous l'identité réelle, il ne doit pas lire un fichier que le
+// compte sandbox lui-même ne peut pas lire (ex: fichier 600 de
+// l'utilisateur dans /tmp).
+func TestCheckFileReadChecksFileItselfWhenSandboxed(t *testing.T) {
+	withSandboxReady(t, true)
+	dir := canonicalTempDir(t)
+	file := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	sandboxCanAccess = func(path string, write bool) bool { return path == dir }
+
+	if _, err := (&DirPermissions{}).CheckFileRead(file); err == nil {
+		t.Fatal("attendu un refus : fichier inaccessible au compte sandbox malgré un répertoire accessible")
+	}
+	// Fichier à créer : seul le répertoire compte.
+	if _, err := (&DirPermissions{}).CheckFileRead(filepath.Join(dir, "absent.txt")); err != nil {
+		t.Fatalf("CheckFileRead (fichier absent): %v", err)
+	}
+}
+
+// .env et les fichiers d'état du harnais vivent dans le workspace, toujours
+// accessible : ils doivent quand même rester hors de portée de read_file/
+// write_file, avec ou sans sandbox.
+func TestCheckFileRefusesProtectedFiles(t *testing.T) {
+	for _, ready := range []bool{false, true} {
+		withSandboxReady(t, ready)
+		prevCanAccess := sandboxCanAccess
+		sandboxCanAccess = func(string, bool) bool { return true }
+
+		dir := canonicalTempDir(t)
+		perms := NewDirPermissions(nil)
+		perms.AlwaysAllow(dir)
+		for _, name := range []string{".env", DefaultAllowedDirsFile, DefaultWhitelistedCommandsFile, ".ssh/id_ed25519", ".git-credentials"} {
+			path := filepath.Join(dir, name)
+			if _, err := perms.CheckFileRead(path); err == nil {
+				t.Errorf("sandbox=%v: lecture de %q acceptée, attendu un refus", ready, name)
+			}
+			if _, err := perms.CheckFileWrite(path); err == nil {
+				t.Errorf("sandbox=%v: écriture de %q acceptée, attendu un refus", ready, name)
+			}
+		}
+		if _, err := perms.CheckFileRead(filepath.Join(dir, "MEMORY.md")); err != nil {
+			t.Errorf("sandbox=%v: MEMORY.md refusé: %v", ready, err)
+		}
+		sandboxCanAccess = prevCanAccess
+	}
+}
+
+// Un octroi trop large (racine, répertoire personnel ou l'un de ses
+// parents) est refusé sans même solliciter l'humain.
+func TestRequestAccessRefusesTooBroadDirectories(t *testing.T) {
+	withSandboxReady(t, false)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	asked := false
+	perms := NewDirPermissions(func(ctx context.Context, abs, reason string) (bool, error) {
+		asked = true
+		return true, nil
+	})
+	for _, dir := range []string{"/", "/etc", home, filepath.Dir(home)} {
+		ok, err := perms.RequestAccess(context.Background(), dir, "test")
+		if ok || err == nil {
+			t.Errorf("RequestAccess(%q): ok=%v err=%v, attendu un refus explicite", dir, ok, err)
+		}
+	}
+	if asked {
+		t.Fatal("l'humain ne doit pas être sollicité pour un répertoire trop large")
+	}
+	sub := filepath.Join(home, "projet")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := perms.RequestAccess(context.Background(), sub, "test"); !ok || err != nil {
+		t.Fatalf("RequestAccess(sous-répertoire): ok=%v err=%v", ok, err)
+	}
+}
+
+// Un fichier de persistance qui n'est plus un fichier de confiance (ici un
+// lien symbolique, comme pourrait en poser le compte sandbox) est refusé.
+func TestWithPersistenceRefusesSymlinkedFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "cible.json")
+	if err := os.WriteFile(target, []byte(`["/"]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, DefaultAllowedDirsFile)
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewDirPermissions(nil).WithPersistence(path); err == nil {
+		t.Fatal("attendu une erreur pour un fichier de persistance en lien symbolique")
+	}
 }

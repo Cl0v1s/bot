@@ -28,6 +28,11 @@ type ToolsConfig struct {
 	// aussi disponible pour le mode mail (qui relit ce même fichier, en
 	// lecture seule).
 	AllowedDirsFile string
+	// WhitelistedCommandsFile : fichier de persistance des commandes
+	// "as_real_user" autorisées une fois pour toutes (voir
+	// tools.CommandWhitelist, paramètre "white_list" de run_shell). "" =
+	// liste en mémoire seulement, pour la session.
+	WhitelistedCommandsFile string
 	// SandboxUserEnabled : exécute run_shell sous le compte système
 	// restreint "llm" (internal/sandbox) plutôt que sous l'utilisateur
 	// courant. La configuration est vérifiée (et effectuée si besoin, avec
@@ -108,38 +113,49 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// dispatchTurn) peuvent être utilisées sans polluer une sortie non
 	// terminale (fichier, pipe, tests).
 	liveCursor := colorsEnabled(out)
-	// À partir d'ici, plusieurs goroutines (streaming en tâche de fond, écho
-	// clavier, boucle principale) écrivent potentiellement en parallèle vers
-	// out : on le sérialise pour éviter des écritures entrelacées/coupées.
-	out = &syncWriter{out: out}
-
 	// L'éditeur de ligne (édition + historique haut/bas) n'est activé que
 	// si in est un vrai terminal interactif : sur une entrée redirigée
 	// (pipe, fichier, tests), on garde bufio.Scanner tel quel. readLine()
 	// unifie les deux : c'est la seule façon de lire une ligne dans tout le
 	// reste de la fonction.
+	//
+	// À partir d'ici, plusieurs goroutines (streaming en tâche de fond, écho
+	// clavier, boucle principale) écrivent potentiellement en parallèle vers
+	// out : on le sérialise pour éviter des écritures entrelacées/coupées —
+	// via console avec l'éditeur de ligne (qui garde en plus la saisie en
+	// cours affichée en bas, sous la sortie, voir console.go), syncWriter
+	// sinon.
 	var editor *lineEditor
 	if f, ok := in.(*os.File); ok && isTerminalFile(f) {
-		if ed, err := newLineEditor(f, out); err == nil {
+		con := newConsole(out, terminalWidth(f))
+		if liveCursor {
+			con.promptColor, con.inputColor = ansiInput, ansiInput
+		}
+		if ed, err := newLineEditor(f, con); err == nil {
 			editor = ed
+			out = con
 		}
 		// Si stty échoue (terminal exotique), on retombe silencieusement
 		// sur bufio.Scanner ci-dessous : pas d'historique/édition avancée,
 		// mais le chat reste utilisable.
+	}
+	if editor == nil {
+		out = &syncWriter{out: out}
 	}
 
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var scanErr error
 
-	// readLine ne reçoit jamais de texte de prompt à afficher : l'affichage
-	// du prompt est découplé de la lecture (voir plus bas, terminalInput) car
-	// une même ligne tapée peut aussi bien répondre à une confirmation
-	// qu'alimenter le prochain message de chat, selon ce qui l'attend au
-	// moment où elle arrive.
+	// Avec l'éditeur de ligne, la zone de saisie (prompt "> " compris) est
+	// affichée en permanence en bas de l'écran par console, que le modèle
+	// soit en train de répondre ou non : une même ligne tapée peut aussi bien
+	// répondre à une confirmation qu'alimenter le prochain message de chat
+	// ou la file d'attente (voir plus bas, terminalInput). Sans éditeur, le
+	// prompt est affiché par la boucle principale (showPrompt).
 	readLine := func() (string, bool) {
 		if editor != nil {
-			return editor.ReadLine("")
+			return editor.ReadLine("> ")
 		}
 		if !scanner.Scan() {
 			scanErr = scanner.Err()
@@ -201,12 +217,15 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// si le modèle demande l'ouverture d'une fenêtre de réutilisation
 	// (as_real_user_window) ou une autorisation ponctuelle valable pour
 	// cette seule commande.
-	confirmRealUser := func(ctx context.Context, command string, window bool) (bool, error) {
+	confirmRealUser := func(ctx context.Context, command string, window, whiteList bool) (bool, error) {
 		if time.Now().Before(realUserGrantedUntil) {
 			return true, nil
 		}
 		fmt.Fprintln(out, color(ansiMagenta, "\n[run_shell] le modèle demande à exécuter cette commande sous l'identité réelle (hors sandbox, accès complet) :"))
 		fmt.Fprintln(out, color(ansiMagenta, "  "+command))
+		if whiteList {
+			fmt.Fprintln(out, color(ansiMagenta, "  (liste blanche demandée : une fois autorisée, CETTE commande exacte ne redemandera plus jamais, y compris aux prochains lancements)"))
+		}
 		if window {
 			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  (fenêtre demandée : une fois autorisé, valable %s pour les commandes suivantes sous l'identité réelle, sans redemander)", realUserGrantWindow)))
 		} else {
@@ -305,13 +324,17 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		toolList := []tools.Tool{
 			&tools.ReadFileTool{Perms: perms},
 			&tools.WriteFileTool{Perms: perms, Sandboxed: sandboxReady},
-			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout},
-			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout},
+			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout, Perms: perms, Sandboxed: sandboxReady},
+			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady},
 			&tools.RequestDirectoryAccessTool{Perms: perms},
 			&tools.ListDirTool{},
 		}
 		if shellAvailable {
-			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, RealUserWindow: realUserGrantWindow, ConfirmRealUser: confirmRealUser})
+			whitelist, err := tools.NewCommandWhitelist(toolsCfg.WhitelistedCommandsFile)
+			if err != nil {
+				fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[avertissement: %v]", err)))
+			}
+			toolList = append(toolList, &tools.ShellTool{Timeout: toolsCfg.ShellTimeout, MaxTimeout: toolsCfg.ShellMaxTimeout, NotifyThreshold: toolsCfg.ShellNotifyThreshold, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, RealUserWindow: realUserGrantWindow, ConfirmRealUser: confirmRealUser, Whitelist: whitelist})
 		}
 		if toolsCfg.ClaudeEnabled {
 			if _, err := exec.LookPath(toolsCfg.ClaudeBin); err != nil {
@@ -326,7 +349,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}
 
-	promptIdle := color(ansiBold+ansiCyan, "> ")
+	promptIdle := color(ansiInput, "> ")
+	// showPrompt : sans éditeur de ligne uniquement — avec, console affiche
+	// déjà le prompt en permanence (voir readLine).
+	showPrompt := func() {
+		if editor == nil {
+			fmt.Fprint(out, promptIdle)
+		}
+	}
 	errorLine := func(format string, a ...any) {
 		fmt.Fprintln(out, color(ansiRed, fmt.Sprintf(format, a...)))
 	}
@@ -550,7 +580,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	}()
 
 	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique, /compact pour compacter maintenant.")
-	fmt.Fprint(out, promptIdle)
+	showPrompt()
 
 	var queue []string
 	busy := false
@@ -572,7 +602,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			line := strings.TrimSpace(cl.text)
 			if line == "" {
 				if !busy {
-					fmt.Fprint(out, promptIdle)
+					showPrompt()
 				}
 				continue
 			}
@@ -587,7 +617,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 			busy = dispatched
 			if !dispatched {
-				fmt.Fprint(out, promptIdle)
+				showPrompt()
 			}
 
 		case cancelled := <-doneCh:
@@ -603,8 +633,8 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				// défilement du terminal (le tour précédent a pu produire
 				// beaucoup de sortie) : on le rappelle en gris au moment où
 				// son traitement démarre, pour qu'il soit clair lequel des
-				// messages en file est en cours.
-				fmt.Fprintln(out, color(ansiGray, "> "+next))
+				// messages en file est en cours (même couleur que la saisie).
+				fmt.Fprintln(out, color(ansiInput, "> "+next))
 				dispatched, exit := dispatchOrHandle(next)
 				if exit {
 					return nil
@@ -621,7 +651,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 					}
 					return nil
 				}
-				fmt.Fprint(out, promptIdle)
+				showPrompt()
 			}
 		}
 	}

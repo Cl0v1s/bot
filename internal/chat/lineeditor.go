@@ -3,7 +3,6 @@ package chat
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -23,9 +22,14 @@ import (
 // local — c'est nous qui réaffichons) mais on laisse ISIG actif, donc le
 // pilote du terminal continue de générer SIGINT lui-même sur Ctrl+C, sans
 // rien changer à ce mécanisme existant.
+//
+// L'affichage de la saisie est entièrement délégué à console (voir
+// console.go) : c'est elle qui la garde en bas de l'écran, sous la sortie
+// du modèle qui peut s'afficher en parallèle de la frappe, et qui gère une
+// saisie plus longue qu'une ligne d'écran.
 type lineEditor struct {
 	f       *os.File
-	out     io.Writer
+	con     *console
 	saved   string // état stty d'origine (sortie de `stty -g`), pour restauration
 	history []string
 }
@@ -34,7 +38,7 @@ type lineEditor struct {
 // approche que le reste du projet pour internal/sandbox — aucune
 // dépendance ajoutée). Si stty échoue (terminal exotique, sandboxé...),
 // retourne une erreur : l'appelant doit alors retomber sur bufio.Scanner.
-func newLineEditor(f *os.File, out io.Writer) (*lineEditor, error) {
+func newLineEditor(f *os.File, con *console) (*lineEditor, error) {
 	saved, err := runStty(f, "-g")
 	if err != nil {
 		return nil, err
@@ -42,7 +46,7 @@ func newLineEditor(f *os.File, out io.Writer) (*lineEditor, error) {
 	if _, err := runStty(f, "-icanon", "-echo"); err != nil {
 		return nil, err
 	}
-	return &lineEditor{f: f, out: out, saved: strings.TrimSpace(saved)}, nil
+	return &lineEditor{f: f, con: con, saved: strings.TrimSpace(saved)}, nil
 }
 
 // restore rétablit l'état stty d'origine. Sûr à appeler plusieurs fois ou
@@ -142,24 +146,20 @@ func (e *lineEditor) ReadLine(prompt string) (line string, ok bool) {
 	histIdx := len(e.history)
 	pending := "" // ligne en cours de frappe, sauvegardée en remontant l'historique
 
-	redraw := func() {
-		fmt.Fprint(e.out, "\r", prompt, string(buf), "\x1b[K")
-		if back := len(buf) - pos; back > 0 {
-			fmt.Fprintf(e.out, "\x1b[%dD", back)
-		}
-	}
+	redraw := func() { e.con.setInput(buf, pos) }
 
-	fmt.Fprint(e.out, prompt)
+	e.con.beginInput(prompt)
 
 	for {
 		b, err := e.readByteRaw()
 		if err != nil {
+			e.con.endInput()
 			return "", false
 		}
 
 		switch {
 		case b == '\r' || b == '\n':
-			fmt.Fprint(e.out, "\r\n")
+			e.con.commitInput()
 			s := string(buf)
 			if s != "" && (len(e.history) == 0 || e.history[len(e.history)-1] != s) {
 				e.history = append(e.history, s)
@@ -175,6 +175,7 @@ func (e *lineEditor) ReadLine(prompt string) (line string, ok bool) {
 
 		case b == 0x04: // Ctrl+D
 			if len(buf) == 0 {
+				e.con.endInput()
 				return "", false
 			}
 
@@ -216,12 +217,12 @@ func (e *lineEditor) ReadLine(prompt string) (line string, ok bool) {
 			case "[C": // droite
 				if pos < len(buf) {
 					pos++
-					fmt.Fprint(e.out, "\x1b[C")
+					redraw()
 				}
 			case "[D": // gauche
 				if pos > 0 {
 					pos--
-					fmt.Fprint(e.out, "\x1b[D")
+					redraw()
 				}
 			case "[H", "OH", "[1~": // début
 				pos = 0
@@ -242,17 +243,14 @@ func (e *lineEditor) ReadLine(prompt string) (line string, ok bool) {
 		default:
 			r, err := e.readRune(b)
 			if err != nil {
+				e.con.endInput()
 				return "", false
 			}
 			buf = append(buf, 0)
 			copy(buf[pos+1:], buf[pos:])
 			buf[pos] = r
 			pos++
-			if pos == len(buf) {
-				fmt.Fprint(e.out, string(r))
-			} else {
-				redraw()
-			}
+			redraw()
 		}
 	}
 }

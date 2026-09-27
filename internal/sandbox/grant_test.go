@@ -41,7 +41,7 @@ func TestNeedsGroupWriteAsUser(t *testing.T) {
 }
 
 // GrantDirectory ne doit jamais accorder au compte sandbox l'accès à un
-// ".env" — voir le commentaire d'isProtectedFromGrant. Testé isolément
+// ".env", aux fichiers d'état du harnais ni aux secrets usuels — voir le commentaire d'isProtectedFromGrant. Testé isolément
 // (plutôt que via GrantDirectory + un vrai chown) : celui-ci dépend de
 // privilèges/appartenance de groupe réels, non portables en test.
 func TestIsProtectedFromGrant(t *testing.T) {
@@ -54,6 +54,15 @@ func TestIsProtectedFromGrant(t *testing.T) {
 		{".env.example", false},
 		{"env", false},
 		{".sandbox-gitconfig", false},
+		{".bot_allowed_dirs.json", true},
+		{".bot_allowed_dirs.json.tmp", true},
+		{".bot_whitelisted_commands.json", true},
+		{".bot_whitelisted_commands.json.123.tmp", true},
+		{".ssh", true},
+		{".gnupg", true},
+		{".netrc", true},
+		{".git-credentials", true},
+		{"MEMORY.md", false},
 	}
 	for _, c := range cases {
 		if got := isProtectedFromGrant(c.name); got != c.want {

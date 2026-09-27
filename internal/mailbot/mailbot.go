@@ -57,6 +57,14 @@ type Options struct {
 	// disque, comme le reste de l'état du mode mail (et du mode chat).
 	Conversations map[string]*convo.Conversation
 
+	// Failures : nombre d'échecs de génération de réponse (erreur LLM/agent)
+	// par mail, indexé par mailKey. Un mail en échec reste non lu et est
+	// retenté au poll suivant ; au bout de maxLLMFailures échecs, on répond
+	// à l'expéditeur que la demande n'a pas pu être traitée (voir
+	// handleLLMFailure) au lieu de boucler indéfiniment sur la même erreur.
+	// Initialisé automatiquement si nil par Run ; en mémoire du process.
+	Failures map[string]int
+
 	// AllowFrom : liste blanche d'adresses (en minuscules) autorisées à
 	// déclencher une réponse automatique. Vide = pas de filtre.
 	AllowFrom    []string
@@ -67,9 +75,12 @@ type Options struct {
 	// run_shell/write_file ici est un vecteur d'exécution de code arbitraire
 	// par injection de prompt, à n'accepter qu'en connaissance de cause (voir
 	// la mise en garde dans main.go et MAIL_ALLOW_FROM/le sandbox système).
-	Tools         *tools.Registry
-	ToolsPerms    *tools.DirPermissions // rafraîchi depuis le fichier partagé à chaque cycle de poll
-	AgentMaxSteps int
+	Tools      *tools.Registry
+	ToolsPerms *tools.DirPermissions // rafraîchi depuis le fichier partagé à chaque cycle de poll
+	// ToolsWhitelist : commandes "as_real_user" autorisées en mode chat (voir
+	// tools.CommandWhitelist), rafraîchi à chaque cycle comme ToolsPerms.
+	ToolsWhitelist *tools.CommandWhitelist
+	AgentMaxSteps  int
 	// AgentMaxConsecutiveShellFailures : voir agent.Run — <= 0 désactive.
 	AgentMaxConsecutiveShellFailures int
 }
@@ -136,6 +147,27 @@ func threadKey(senderAddr, subject string) string {
 	return strings.ToLower(senderAddr) + "\x00" + normalizeSubject(subject)
 }
 
+// maxLLMFailures : nombre d'échecs de génération tolérés pour un même mail
+// avant d'abandonner et de répondre un message d'échec (voir Failures). 2 =
+// une seule nouvelle tentative, pour absorber une erreur ponctuelle du
+// serveur LLM sans répéter indéfiniment une erreur déterministe (ex: appel
+// d'outil au JSON invalide, qui se reproduit à l'identique à chaque essai).
+const maxLLMFailures = 2
+
+// failureReply : corps du mail envoyé quand une demande n'a pas pu être
+// traitée après maxLLMFailures tentatives.
+const failureReply = "Désolé, je n'ai pas pu traiter cette demande : une erreur s'est produite à plusieurs reprises pendant la génération de la réponse.\n\nLe plus simple est de démarrer un nouveau sujet (nouveau mail, avec un autre objet), en reformulant ou en découpant la demande si elle est volumineuse."
+
+// mailKey identifie un mail pour le suivi des échecs (Options.Failures) :
+// son Message-ID, stable d'un poll à l'autre contrairement au numéro de
+// séquence IMAP ; à défaut (mail sans Message-ID), le numéro de séquence.
+func mailKey(messageID string, seq int) string {
+	if messageID != "" {
+		return messageID
+	}
+	return fmt.Sprintf("seq:%d", seq)
+}
+
 // getOrCreateConversation retourne la conversation existante pour le fil
 // (senderAddr, subject) si ce fil est déjà en cours, ou en crée une
 // nouvelle sinon (et l'enregistre pour les mails suivants du même fil). Le
@@ -165,6 +197,9 @@ func Run(ctx context.Context, client *llm.Client, opts Options) error {
 	if opts.Conversations == nil {
 		opts.Conversations = make(map[string]*convo.Conversation)
 	}
+	if opts.Failures == nil {
+		opts.Failures = make(map[string]int)
+	}
 
 	ticker := time.NewTicker(opts.PollInterval)
 	defer ticker.Stop()
@@ -191,6 +226,9 @@ func pollOnce(ctx context.Context, client *llm.Client, opts Options) error {
 		if err := opts.ToolsPerms.Refresh(); err != nil {
 			log.Printf("mailbot: échec du rafraîchissement des répertoires autorisés: %v", err)
 		}
+	}
+	if err := opts.ToolsWhitelist.Refresh(); err != nil {
+		log.Printf("mailbot: échec du rafraîchissement de la liste blanche run_shell: %v", err)
 	}
 
 	ic, err := imapclient.Dial(opts.imapAddr(), opts.IMAPTLS)
@@ -262,6 +300,12 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	logBlock(fmt.Sprintf("requête mail › de %s", senderAddr), userMessage)
 
 	conv := opts.getOrCreateConversation(senderAddr, parsed.Subject)
+	// Instantané de l'historique avant ce mail, restauré en cas d'échec de
+	// génération : sinon chaque nouvelle tentative réempilerait le même
+	// message utilisateur (et les éventuels appels d'outils à moitié faits).
+	// Copie complète plutôt qu'une simple longueur, car une compaction
+	// pendant le tour peut réécrire conv.Messages.
+	saved := append([]llm.Message(nil), conv.Messages...)
 	conv.AddUser(userMessage)
 
 	var reply string
@@ -272,7 +316,8 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 			log.Print(strings.TrimRight(e.Format(), "\n"))
 		})
 		if err != nil {
-			return fmt.Errorf("agent LLM: %w", err)
+			conv.Messages = saved
+			return opts.handleLLMFailure(ctx, ic, seq, parsed, senderAddr, fmt.Errorf("agent LLM: %w", err))
 		}
 	} else {
 		if _, err := conv.CompactIfNeeded(ctx, client); err != nil {
@@ -287,15 +332,45 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 		var msg llm.Message
 		msg, usage, err = client.ChatCompletion(ctx, conv.Full(), nil)
 		if err != nil {
-			return fmt.Errorf("appel LLM: %w", err)
+			conv.Messages = saved
+			return opts.handleLLMFailure(ctx, ic, seq, parsed, senderAddr, fmt.Errorf("appel LLM: %w", err))
 		}
 		reply = msg.Content
 		conv.AddAssistant(reply)
 		conv.RecordUsage(usage)
 	}
 
+	delete(opts.Failures, mailKey(parsed.MessageID, seq))
 	logBlock(fmt.Sprintf("réponse mail › à %s", senderAddr), reply)
+	return opts.sendReply(ic, seq, parsed, senderAddr, reply)
+}
 
+// handleLLMFailure comptabilise un échec de génération pour ce mail. Tant
+// que maxLLMFailures n'est pas atteint, retourne l'erreur en laissant le
+// mail non lu (retenté au prochain poll). Ensuite, répond à l'expéditeur
+// qu'il vaut mieux démarrer un nouveau sujet, marque le mail lu et oublie la
+// conversation du fil : un historique qui fait échouer le modèle à chaque
+// fois (typiquement un contexte trop lourd) bloquerait aussi les mails
+// suivants du même fil. Une annulation (arrêt du programme) n'est jamais
+// comptée comme un échec.
+func (o Options) handleLLMFailure(ctx context.Context, ic *imapclient.Client, seq int, parsed *parsedMail, senderAddr string, cause error) error {
+	if ctx.Err() != nil {
+		return cause
+	}
+	key := mailKey(parsed.MessageID, seq)
+	o.Failures[key]++
+	if o.Failures[key] < maxLLMFailures {
+		return fmt.Errorf("%w (tentative %d/%d, nouvel essai au prochain poll)", cause, o.Failures[key], maxLLMFailures)
+	}
+	delete(o.Failures, key)
+	delete(o.Conversations, threadKey(senderAddr, parsed.Subject))
+	log.Printf("mailbot: abandon du message #%d après %d échecs (%v) — réponse d'échec envoyée, conversation du fil réinitialisée", seq, maxLLMFailures, cause)
+	logBlock(fmt.Sprintf("réponse mail (échec) › à %s", senderAddr), failureReply)
+	return o.sendReply(ic, seq, parsed, senderAddr, failureReply)
+}
+
+// sendReply envoie body en réponse au mail parsed, puis marque ce dernier lu.
+func (o Options) sendReply(ic *imapclient.Client, seq int, parsed *parsedMail, senderAddr, body string) error {
 	// Même sujet que le mail original, sans préfixe "Re:". Le threading
 	// (affichage "conversation" côté client, ex. Thunderbird) repose sur les
 	// en-têtes In-Reply-To/References, pas sur le préfixe du sujet.
@@ -304,10 +379,10 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 		references = parsed.References + " " + parsed.MessageID
 	}
 
-	err = opts.SMTP.Send(smtpclient.Mail{
+	err := o.SMTP.Send(smtpclient.Mail{
 		To:         senderAddr,
 		Subject:    parsed.Subject,
-		Body:       reply,
+		Body:       body,
 		InReplyTo:  parsed.MessageID,
 		References: references,
 	})

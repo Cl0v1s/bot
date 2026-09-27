@@ -43,11 +43,12 @@ var (
 // refusé", qui est une tout autre situation.
 type DirGrantFunc func(ctx context.Context, abs, reason string) (granted bool, err error)
 
-// DefaultAllowedDirsFile est le chemin (relatif au répertoire de travail du
-// programme) du fichier de persistance partagé entre le mode chat et le
-// mode mail. Non configurable : ce n'est pas un réglage utilisateur, juste
-// l'emplacement fixe de cet état partagé entre les deux invocations.
-const DefaultAllowedDirsFile = ".bot_allowed_dirs.json"
+// DefaultAllowedDirsFile est le nom (relatif au workspace, voir main.go) du
+// fichier de persistance partagé entre le mode chat et le mode mail. Non
+// configurable : ce n'est pas un réglage utilisateur, juste l'emplacement
+// fixe de cet état partagé entre les deux invocations. Protégé contre toute
+// modification par le compte sandbox, voir sandbox.ReadTrustedFile.
+const DefaultAllowedDirsFile = sandbox.AllowedDirsFileName
 
 // DirPermissions est le point d'application réel (dans le code, pas dans le
 // prompt) du contrôle d'accès aux répertoires pour les tools fichiers. Par
@@ -282,13 +283,68 @@ func (p *DirPermissions) checkFile(path string, write bool) (string, error) {
 		return "", fmt.Errorf("chemin invalide %q: %w", path, err)
 	}
 
+	if err := checkNotProtected(abs); err != nil {
+		return "", err
+	}
+
 	if !p.checkAccess(filepath.Dir(abs), write) {
 		return "", fmt.Errorf(
 			`accès refusé : le répertoire %q n'est pas autorisé. Utilise l'outil "request_directory_access" pour demander l'accès à l'utilisateur avant de réessayer.`,
 			filepath.Dir(abs),
 		)
 	}
+
+	// En écriture, le contrôle au niveau du fichier est fait par l'appelant
+	// APRÈS resynchronisation (voir writeFileSynced) : un fichier de
+	// l'utilisateur fraîchement créé hors du harnais n'est accessible au
+	// compte sandbox qu'une fois son répertoire resynchronisé.
+	if !write {
+		if err := checkExistingFile(abs, false); err != nil {
+			return "", err
+		}
+	}
 	return abs, nil
+}
+
+// checkNotProtected refuse tout chemin dont un composant est protégé (voir
+// sandbox.IsProtectedName : .env, fichiers d'état du harnais, ~/.ssh...),
+// quel que soit le mode (sandbox ou non) et même dans un répertoire
+// autorisé — y compris le workspace, qui les contient. Sans ça, read_file
+// (qui s'exécute sous l'identité réelle) lirait .env alors que
+// GrantDirectory le refuse justement au compte sandbox, et write_file
+// pourrait modifier la liste blanche "as_real_user" ou les répertoires
+// autorisés sans aucune confirmation humaine.
+func checkNotProtected(abs string) error {
+	for _, part := range strings.Split(abs, string(filepath.Separator)) {
+		if sandbox.IsProtectedName(part) {
+			return fmt.Errorf("accès refusé : %q est un fichier protégé (configuration, état du harnais ou secret de l'utilisateur), jamais accessible aux outils du modèle — ne réessaie pas", abs)
+		}
+	}
+	return nil
+}
+
+// checkExistingFile vérifie, en mode sandbox uniquement, que le fichier abs
+// lui-même (s'il existe) est accessible au compte sandbox, pas seulement son
+// répertoire : read_file/write_file s'exécutent sous l'identité réelle, et
+// sans ce contrôle un fichier de l'utilisateur en 0600 situé dans un
+// répertoire lisible par le compte sandbox (/tmp, /etc, un dossier 755...)
+// serait lu ou réécrit alors que le compte sandbox lui-même n'y a pas accès.
+// Sans sandbox, pas d'identité séparée à interroger : no-op.
+func checkExistingFile(abs string, write bool) error {
+	if !sandboxReady() {
+		return nil
+	}
+	if _, err := os.Lstat(abs); err != nil {
+		return nil // fichier à créer : seul le répertoire compte
+	}
+	if !sandboxCanAccess(abs, write) {
+		mode := "lecture"
+		if write {
+			mode = "écriture"
+		}
+		return fmt.Errorf("accès refusé : le fichier %q n'est pas accessible en %s au compte sandbox %q (droits du fichier lui-même, ex: 600), même si son répertoire l'est", abs, mode, sandbox.User)
+	}
+	return nil
 }
 
 // RequestAccess est le seul moyen d'ajouter un répertoire à la liste
@@ -305,6 +361,13 @@ func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) 
 
 	if p.checkAccess(abs, false) {
 		return true, nil
+	}
+
+	if err := checkNotProtected(abs); err != nil {
+		return false, err
+	}
+	if err := checkNotTooBroad(abs); err != nil {
+		return false, err
 	}
 
 	if p.grant == nil {
@@ -362,8 +425,42 @@ func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) 
 	return true, nil
 }
 
+// tooBroadDirs : répertoires système jamais accordables tels quels (voir
+// checkNotTooBroad) — leurs sous-répertoires restent accordables.
+var tooBroadDirs = []string{
+	"/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib64", "/opt",
+	"/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr", "/var",
+	"/var/home", "/Users", "/Applications", "/Library", "/System", "/private",
+}
+
+// checkNotTooBroad refuse d'accorder la racine, un répertoire système, le
+// répertoire personnel de l'utilisateur ou l'un de ses ancêtres : en mode
+// sandbox, un octroi rend TOUT le contenu accessible au compte sandbox
+// (chgrp + g+rw récursif, voir sandbox.GrantDirectory) — ~/.ssh, ~/.config,
+// ~/.gnupg... Cas typique : run_shell demande l'accès au répertoire de
+// travail du bot, lancé depuis $HOME. Une seule réponse "o" ne doit jamais
+// pouvoir avoir cette portée ; le modèle doit demander un sous-répertoire
+// précis.
+func checkNotTooBroad(abs string) error {
+	broad := false
+	for _, d := range tooBroadDirs {
+		if c, err := canonicalPath(d); err == nil && c == abs {
+			broad = true
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if h, err := canonicalPath(home); err == nil && (h == abs || strings.HasPrefix(h, abs+string(filepath.Separator))) {
+			broad = true
+		}
+	}
+	if !broad {
+		return nil
+	}
+	return fmt.Errorf("accès refusé sans demander : %q est trop large (racine, répertoire système, répertoire personnel ou l'un de ses parents) — demande l'accès à un sous-répertoire précis (ex: le dossier du projet concerné). Pour run_shell, le bot doit être lancé depuis ce sous-répertoire", abs)
+}
+
 func loadAllowedDirsFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := sandbox.ReadTrustedFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -380,9 +477,10 @@ func loadAllowedDirsFile(path string) ([]string, error) {
 	return dirs, nil
 }
 
-// saveAllowedDirsFile écrit atomiquement (fichier temporaire + rename) pour
+// saveAllowedDirsFile écrit atomiquement (voir sandbox.WriteTrustedFile) pour
 // limiter le risque de lecture partielle par une autre invocation en cours
-// (ex: le mode mail qui relit périodiquement ce même fichier).
+// (ex: le mode mail qui relit périodiquement ce même fichier), et sans
+// jamais suivre un fichier/lien préparé par le compte sandbox.
 func saveAllowedDirsFile(path string, dirs []string) error {
 	if dirs == nil {
 		dirs = []string{}
@@ -391,9 +489,5 @@ func saveAllowedDirsFile(path string, dirs []string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return sandbox.WriteTrustedFile(path, data)
 }

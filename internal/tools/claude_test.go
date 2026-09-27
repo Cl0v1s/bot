@@ -41,6 +41,36 @@ func TestClaudeToolPassesNonInteractiveFlagsAndPrompt(t *testing.T) {
 	}
 }
 
+func TestClaudeToolReturnsStdoutOnlyOnSuccess(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "claude")
+	script := "#!/bin/sh\ncat >/dev/null\necho 'J ai fait X.'\necho 'bruit' >&2\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (&ClaudeTool{Bin: bin}).Call(context.Background(), `{"prompt":"x","working_dir":"`+t.TempDir()+`"}`)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if !strings.Contains(out, "J ai fait X.") || strings.Contains(out, "bruit") {
+		t.Errorf("sortie inattendue:\n%s", out)
+	}
+}
+
+func TestClaudeToolIncludesStderrOnFailure(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "claude")
+	script := "#!/bin/sh\ncat >/dev/null\necho 'non authentifié' >&2\nexit 1\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := (&ClaudeTool{Bin: bin}).Call(context.Background(), `{"prompt":"x","working_dir":"`+t.TempDir()+`"}`)
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if !strings.Contains(out, "non authentifié") || !strings.Contains(out, "terminé avec erreur") {
+		t.Errorf("sortie inattendue:\n%s", out)
+	}
+}
+
 func TestClaudeToolConfirmRefused(t *testing.T) {
 	tool := &ClaudeTool{
 		Bin:     fakeClaude(t),
@@ -55,5 +85,17 @@ func TestClaudeToolRejectsRelativeDir(t *testing.T) {
 	tool := &ClaudeTool{Bin: fakeClaude(t)}
 	if _, err := tool.Call(context.Background(), `{"prompt":"x","working_dir":"relatif"}`); err == nil {
 		t.Fatal("attendu une erreur pour un chemin relatif")
+	}
+}
+
+// Le modèle ne doit lancer Claude Code que sur demande explicite de
+// l'utilisateur : la consigne doit figurer en tête de la description.
+func TestClaudeDescriptionRequiresExplicitUserRequest(t *testing.T) {
+	desc := (&ClaudeTool{}).Description()
+	if !strings.HasPrefix(desc, "N'UTILISE CET OUTIL QUE si l'utilisateur te demande EXPLICITEMENT") {
+		t.Fatalf("description sans la restriction en tête : %q", desc)
+	}
+	if !strings.Contains(desc, "JAMAIS de ta propre initiative") {
+		t.Fatalf("description sans l'interdiction d'initiative : %q", desc)
 	}
 }

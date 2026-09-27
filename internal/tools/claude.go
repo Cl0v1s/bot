@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -82,14 +83,14 @@ func (t *ClaudeTool) effectiveMaxTimeout() time.Duration {
 }
 
 func (t *ClaudeTool) Description() string {
-	return fmt.Sprintf("Délègue une tâche de développement complète (modifier du code, corriger un bug, lancer des tests, explorer un dépôt...) à Claude Code, un agent de code autonome, en mode non interactif dans un répertoire donné. Claude Code ne peut PAS te poser de question : il fait la tâche directement et retourne un résumé de ce qu'il a fait. Donne-lui donc dans \"prompt\" tout le contexte nécessaire (objectif, contraintes, fichiers concernés, critère de réussite) — il ne voit rien de ta conversation. Exécuté sous l'identité réelle de l'utilisateur, hors sandbox (mode de permissions %q). Timeout par défaut %s, ajustable via \"timeout_seconds\" jusqu'à %s. Chaque appel repart de zéro, sans mémoire des appels précédents.", t.permissionMode(), t.effectiveTimeout(), t.effectiveMaxTimeout())
+	return fmt.Sprintf("N'UTILISE CET OUTIL QUE si l'utilisateur te demande EXPLICITEMENT, dans son message, de faire appel à Claude Code (ex: \"demande à Claude\", \"lance Claude Code\", \"utilise run_claude\") — JAMAIS de ta propre initiative, même pour une tâche de code qui semble s'y prêter, même si tes autres outils échouent : dans ce cas, fais la tâche toi-même avec tes autres outils, ou explique le problème à l'utilisateur. Une demande de code ordinaire n'est PAS une demande d'utiliser Claude Code. Transmet la demande de l'utilisateur à Claude Code, un agent de code autonome, en mode non interactif dans un répertoire donné : il fait la tâche directement, sans poser de question, et retourne sa réponse (ce qu'il a fait). \"prompt\" doit être la demande EXACTE de l'utilisateur, recopiée mot pour mot : ne la reformule pas, ne la résume pas, n'y ajoute ni contexte, ni instructions, ni précisions de ton cru. Une fois le résultat reçu, affiche à l'utilisateur la réponse de Claude Code telle quelle, en entier, sans la reformuler ni la résumer. Exécuté sous l'identité réelle de l'utilisateur, hors sandbox (mode de permissions %q). Timeout par défaut %s, ajustable via \"timeout_seconds\" jusqu'à %s. Chaque appel repart de zéro, sans mémoire des appels précédents.", t.permissionMode(), t.effectiveTimeout(), t.effectiveMaxTimeout())
 }
 
 func (t *ClaudeTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"prompt": {"type": "string", "description": "Tâche à réaliser, autoporteuse : objectif, contexte, contraintes et critère de réussite. Claude Code n'a accès à rien d'autre de ta conversation."},
+			"prompt": {"type": "string", "description": "Demande EXACTE de l'utilisateur, recopiée mot pour mot, sans reformulation, résumé ni ajout de contexte ou d'instructions. N'appelle cet outil que si l'utilisateur a explicitement demandé de passer par Claude Code."},
 			"working_dir": {"type": "string", "description": "Chemin ABSOLU du répertoire dans lequel Claude Code travaille (typiquement la racine du dépôt concerné). Optionnel : par défaut, le répertoire de travail du bot."},
 			"timeout_seconds": {"type": "integer", "description": "Timeout pour cette tâche, en secondes. Optionnel, plafonné par la configuration.", "minimum": 1}
 		},
@@ -188,20 +189,40 @@ func (t *ClaudeTool) Call(ctx context.Context, argsJSON string) (string, error) 
 		return cmd.Process.Kill()
 	}
 
-	output, runErr := cmd.CombinedOutput()
+	// stdout (la réponse de Claude Code) et stderr séparés : stderr n'est
+	// renvoyé qu'en cas d'échec, pour ne pas mêler du bruit technique à la
+	// réponse que le modèle doit afficher telle quelle.
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	runErr := cmd.Run()
 
 	maxBytes := t.MaxOutputBytes
 	if maxBytes <= 0 {
 		maxBytes = 20000
 	}
+	output := bytes.TrimSpace(stdout.Bytes())
 	var b strings.Builder
+	b.WriteString("Réponse de Claude Code (à afficher telle quelle à l'utilisateur, en entier, sans reformulation) :\n\n")
 	if len(output) > maxBytes {
 		// Garde la FIN plutôt que le début : le résumé final de Claude Code
 		// est ce qui compte.
-		b.WriteString("[... début de la sortie tronqué ...]\n")
+		b.WriteString("[... début de la réponse tronqué ...]\n")
 		output = output[len(output)-maxBytes:]
 	}
+	if len(output) == 0 {
+		b.WriteString("[aucune réponse]")
+	}
 	b.Write(output)
+	if runErr != nil {
+		if errOut := bytes.TrimSpace(stderr.Bytes()); len(errOut) > 0 {
+			if len(errOut) > 4000 {
+				errOut = errOut[len(errOut)-4000:]
+			}
+			b.WriteString("\n\n[sortie d'erreur de Claude Code]\n")
+			b.Write(errOut)
+		}
+	}
 	if cctx.Err() == context.DeadlineExceeded {
 		b.WriteString(fmt.Sprintf("\n[Claude Code interrompu après %s (timeout) — des modifications partielles ont pu être faites dans %s]", timeout, workDir))
 	} else if runErr != nil {
