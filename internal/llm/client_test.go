@@ -185,14 +185,102 @@ func TestChatCompletionStreamAutoLoadsModel(t *testing.T) {
 
 	client := New(srv.URL+"/v1", "", "org/modele")
 	var got strings.Builder
-	full, _, err := client.ChatCompletionStream(context.Background(), []Message{{Role: "user", Content: "salut"}}, func(d string) { got.WriteString(d) })
+	msg, _, err := client.ChatCompletionStream(context.Background(), []Message{{Role: "user", Content: "salut"}}, nil, StreamCallbacks{OnContent: func(d string) { got.WriteString(d) }})
 	if err != nil {
 		t.Fatalf("ChatCompletionStream: %v", err)
 	}
+	full := msg.Content
 	if full != "bonjour" || got.String() != "bonjour" {
 		t.Fatalf("texte = %q / onDelta = %q, attendu %q", full, got.String(), "bonjour")
 	}
 	if loadCalls != 1 {
 		t.Fatalf("appels /load = %d, attendu 1", loadCalls)
+	}
+}
+
+// Le streaming reconstitue raisonnement, texte, tool_calls fragmentés (id et
+// nom dans le premier fragment, arguments concaténés ensuite) et
+// finish_reason, et transmet max_tokens dans la requête.
+func TestChatCompletionStreamAssemblesToolCallsAndReasoning(t *testing.T) {
+	var gotMaxTokens int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			MaxTokens int    `json:"max_tokens"`
+			Tools     []Tool `json:"tools"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		gotMaxTokens = req.MaxTokens
+		if len(req.Tools) != 1 {
+			t.Errorf("tools transmis = %d, attendu 1", len(req.Tools))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, chunk := range []string{
+			`{"choices":[{"delta":{"reasoning_content":"je "}}]}`,
+			`{"choices":[{"delta":{"reasoning_content":"réfléchis"}}]}`,
+			`{"choices":[{"delta":{"content":"je lance"}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"run_shell","arguments":""}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
+			`{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`,
+		} {
+			_, _ = w.Write([]byte("data: " + chunk + "\n\n"))
+		}
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	client := New(srv.URL+"/v1", "", "m")
+	client.MaxTokens = 123
+	var reasoning, content strings.Builder
+	msg, usage, err := client.ChatCompletionStream(context.Background(), []Message{{Role: "user", Content: "ls"}},
+		[]Tool{{Type: "function", Function: ToolFunction{Name: "run_shell"}}},
+		StreamCallbacks{OnContent: func(d string) { content.WriteString(d) }, OnReasoning: func(d string) { reasoning.WriteString(d) }})
+	if err != nil {
+		t.Fatalf("ChatCompletionStream: %v", err)
+	}
+	if gotMaxTokens != 123 {
+		t.Errorf("max_tokens = %d, attendu 123", gotMaxTokens)
+	}
+	if reasoning.String() != "je réfléchis" || msg.ReasoningContent != "je réfléchis" {
+		t.Errorf("raisonnement = %q / %q", reasoning.String(), msg.ReasoningContent)
+	}
+	if content.String() != "je lance" || msg.Content != "je lance" {
+		t.Errorf("contenu = %q / %q", content.String(), msg.Content)
+	}
+	if len(msg.ToolCalls) != 1 {
+		t.Fatalf("tool_calls = %+v, attendu 1", msg.ToolCalls)
+	}
+	tc := msg.ToolCalls[0]
+	if tc.ID != "call_1" || tc.Function.Name != "run_shell" || tc.Function.Arguments != `{"command":"ls"}` {
+		t.Errorf("tool_call = %+v", tc)
+	}
+	if msg.FinishReason != "tool_calls" {
+		t.Errorf("finish_reason = %q", msg.FinishReason)
+	}
+	if usage.TotalTokens != 15 {
+		t.Errorf("usage = %+v", usage)
+	}
+}
+
+// Sans limite configurée, max_tokens n'est pas transmis du tout (le serveur
+// applique la sienne), et finish_reason est lu aussi en non-streamé.
+func TestChatCompletionOmitsMaxTokensWhenUnsetAndReadsFinishReason(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if _, ok := req["max_tokens"]; ok {
+			t.Errorf("max_tokens transmis alors que MaxTokens=0: %v", req["max_tokens"])
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"coupé"},"finish_reason":"length"}]}`))
+	}))
+	defer srv.Close()
+
+	msg, _, err := New(srv.URL+"/v1", "", "m").ChatCompletion(context.Background(), []Message{{Role: "user", Content: "x"}}, nil)
+	if err != nil {
+		t.Fatalf("ChatCompletion: %v", err)
+	}
+	if msg.FinishReason != FinishReasonLength {
+		t.Errorf("finish_reason = %q, attendu %q", msg.FinishReason, FinishReasonLength)
 	}
 }

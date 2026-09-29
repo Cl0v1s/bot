@@ -45,7 +45,7 @@ func TestRunSurvivesCompactionFailure(t *testing.T) {
 	conv.AddUser("bonjour")
 
 	var warnings []string
-	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, func(e Event) {
+	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, false, func(e Event) {
 		if e.Kind == EventWarning {
 			warnings = append(warnings, e.Result)
 		}
@@ -100,7 +100,7 @@ func TestRunTruncatesOversizedHistoryAfterCompactionFailure(t *testing.T) {
 	}
 
 	var warnings []string
-	_, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, func(e Event) {
+	_, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, false, func(e Event) {
 		if e.Kind == EventWarning {
 			warnings = append(warnings, e.Result)
 		}
@@ -165,7 +165,7 @@ func TestRunInjectsNudgeAfterConsecutiveShellFailures(t *testing.T) {
 	registry := tools.NewRegistry(&tools.ShellTool{Timeout: 2 * time.Second})
 
 	var warnings []string
-	reply, _, err := Run(context.Background(), client, conv, registry, 5, 2, func(e Event) {
+	reply, _, err := Run(context.Background(), client, conv, registry, 5, 2, false, func(e Event) {
 		if e.Kind == EventWarning {
 			warnings = append(warnings, e.Result)
 		}
@@ -231,7 +231,7 @@ func TestRunDoesNotInjectNudgeWhenDisabled(t *testing.T) {
 	conv.AddUser("fais un truc qui échoue")
 	registry := tools.NewRegistry(&tools.ShellTool{Timeout: 2 * time.Second})
 
-	_, _, err := Run(context.Background(), client, conv, registry, 8, 0, nil)
+	_, _, err := Run(context.Background(), client, conv, registry, 8, 0, false, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestRunResetsCounterOnShellSuccess(t *testing.T) {
 	registry := tools.NewRegistry(&tools.ShellTool{Timeout: 2 * time.Second})
 
 	// Seuil 2 : échec, succès, échec -> jamais 2 échecs D'AFFILÉE.
-	_, _, err := Run(context.Background(), client, conv, registry, 8, 2, nil)
+	_, _, err := Run(context.Background(), client, conv, registry, 8, 2, false, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -329,7 +329,7 @@ func TestRunRetriesAfterContextOverflowByDroppingOldest(t *testing.T) {
 	before := len(conv.Messages)
 
 	var warnings []string
-	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, func(e Event) {
+	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, false, func(e Event) {
 		if e.Kind == EventWarning {
 			warnings = append(warnings, e.Result)
 		}
@@ -342,5 +342,59 @@ func TestRunRetriesAfterContextOverflowByDroppingOldest(t *testing.T) {
 	}
 	if lastCount-1 >= before { // -1 : system prompt
 		t.Fatalf("historique non réduit avant le dernier essai (%d messages envoyés, %d au départ)", lastCount-1, before)
+	}
+}
+
+// Une réponse coupée par max_tokens ne doit jamais faire exécuter ses
+// tool_calls (arguments probablement tronqués) : le tour s'arrête avec un
+// avertissement, et l'historique garde un message assistant non vide.
+func TestRunDoesNotExecuteToolCallsOfTruncatedResponse(t *testing.T) {
+	var calls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{
+					"role": "assistant",
+					"tool_calls": []map[string]any{{
+						"id": "c1", "type": "function",
+						"function": map[string]any{"name": "run_shell", "arguments": `{"command":"rm -rf /tm`},
+					}},
+				},
+				"finish_reason": "length",
+			}},
+		})
+	}))
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+	client.MaxTokens = 50
+
+	conv := convo.New("sys", 100000, 0.95, 0)
+	conv.AddUser("nettoie")
+
+	var warnings []string
+	reply, _, err := Run(context.Background(), client, conv, tools.NewRegistry(), 4, 0, false, func(e Event) {
+		switch e.Kind {
+		case EventWarning:
+			warnings = append(warnings, e.Result)
+		case EventToolCall:
+			t.Errorf("tool_call exécuté malgré une réponse tronquée: %+v", e)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 1 {
+		t.Errorf("appels LLM = %d, attendu 1 (pas de nouvelle étape après troncature)", n)
+	}
+	if reply != truncatedPlaceholder {
+		t.Errorf("reply = %q, attendu %q", reply, truncatedPlaceholder)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "max_tokens=50") {
+		t.Errorf("avertissements = %v", warnings)
+	}
+	last := conv.Messages[len(conv.Messages)-1]
+	if last.Role != "assistant" || len(last.ToolCalls) != 0 || last.Content == "" {
+		t.Errorf("dernier message = %+v", last)
 	}
 }

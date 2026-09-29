@@ -449,9 +449,59 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				}
 			}
 
+			// streamed : état de l'affichage en streaming — dernier type de
+			// fragment affiché (raisonnement ou réponse), pour n'imprimer
+			// l'en-tête "┄ réflexion" qu'au début d'un bloc de raisonnement
+			// et séparer celui-ci de la réponse qui suit. streamAfterEvent
+			// : dernier affichage = un bloc d'outil/avertissement, dont la
+			// réponse qui suit est séparée par une ligne vide.
+			const (
+				streamNone = iota
+				streamAfterEvent
+				streamReasoning
+				streamContent
+			)
+			streamed := streamNone
+			onReasoning := func(d string) {
+				clearThinking()
+				if streamed != streamReasoning {
+					fmt.Fprint(out, color(ansiGray, "\n┄ réflexion\n┆ "))
+					streamed = streamReasoning
+				}
+				fmt.Fprint(out, color(ansiGray, strings.ReplaceAll(d, "\n", "\n┆ ")))
+			}
+			onContent := func(d string) {
+				clearThinking()
+				switch streamed {
+				case streamReasoning:
+					fmt.Fprint(out, "\n\n")
+				case streamAfterEvent:
+					fmt.Fprint(out, "\n")
+				}
+				streamed = streamContent
+				fmt.Fprint(out, d)
+			}
+			// endStream termine la ligne en cours après un streaming, pour
+			// que la suite (prompt, message d'erreur) démarre proprement.
+			endStream := func() {
+				if streamed == streamReasoning || streamed == streamContent {
+					fmt.Fprintln(out)
+				}
+				streamed = streamNone
+			}
+
 			if !registry.Empty() {
-				reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, toolsCfg.MaxConsecutiveShellFailures, func(e agent.Event) {
+				_, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, toolsCfg.MaxConsecutiveShellFailures, true, func(e agent.Event) {
+					switch e.Kind {
+					case agent.EventReasoningDelta:
+						onReasoning(e.Result)
+						return
+					case agent.EventContentDelta:
+						onContent(e.Result)
+						return
+					}
 					clearThinking()
+					endStream()
 					code := ansiYellow // appel d'outil
 					switch {
 					case e.Kind == agent.EventReasoning:
@@ -463,14 +513,15 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 						}
 					}
 					fmt.Fprint(out, color(code, e.Format()))
+					streamed = streamAfterEvent
 				})
 				clearThinking()
+				endStream()
 				if err != nil {
 					cancelled = errors.Is(err, context.Canceled)
 					reqErrorLine(err)
 					return
 				}
-				fmt.Fprintln(out, "\n"+reply)
 				return
 			}
 
@@ -488,18 +539,22 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				errorLine("[avertissement: contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé]", dropped)
 			}
 
-			reply, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), func(delta string) {
-				clearThinking()
-				fmt.Fprint(out, delta)
-			})
+			msg, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), nil, llm.StreamCallbacks{OnContent: onContent, OnReasoning: onReasoning})
 			clearThinking()
+			endStream()
 			if err != nil {
 				cancelled = errors.Is(err, context.Canceled)
 				reqErrorLine(err)
 				return
 			}
-			fmt.Fprintln(out)
 
+			reply := msg.Content
+			if msg.FinishReason == llm.FinishReasonLength {
+				errorLine("[avertissement: réponse interrompue par la limite de tokens de sortie (max_tokens=%d, voir LLM_MAX_TOKENS) : le modèle est peut-être parti en boucle]", client.MaxTokens)
+				if strings.TrimSpace(reply) == "" {
+					reply = "[réponse interrompue : limite de tokens de sortie atteinte]"
+				}
+			}
 			conv.AddAssistant(reply)
 			conv.RecordUsage(usage)
 		}()

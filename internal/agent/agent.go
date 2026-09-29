@@ -111,6 +111,13 @@ const (
 	// continuer (ex: échec de la compaction automatique du contexte — voir
 	// Run) — à afficher, pas à faire échouer la réponse pour autant.
 	EventWarning
+	// EventContentDelta / EventReasoningDelta : fragment (dans Result) du
+	// texte de réponse / du raisonnement du modèle, au fil de la génération.
+	// Émis uniquement quand Run est appelé avec stream=true — EventReasoning
+	// n'est alors plus émis, son contenu ayant déjà été montré fragment par
+	// fragment.
+	EventContentDelta
+	EventReasoningDelta
 )
 
 type Event struct {
@@ -197,18 +204,42 @@ func shellCallFailed(result string, callErr error) bool {
 		strings.Contains(result, "[commande interrompue après")
 }
 
+// truncatedPlaceholder : contenu enregistré dans l'historique à la place
+// d'une réponse coupée par max_tokens avant d'avoir produit le moindre texte
+// (tout le budget passé en raisonnement) — un message assistant vide
+// casserait l'alternance user/assistant exigée par certains gabarits de chat
+// au tour suivant.
+const truncatedPlaceholder = "[réponse interrompue : limite de tokens de sortie atteinte]"
+
 // Run exécute la boucle agentique sur la conversation conv, jusqu'à une
 // réponse finale sans tool_calls. onEvent (optionnel) est appelé pour
 // chaque appel/résultat d'outil, afin d'en permettre un affichage séparé du
 // texte de réponse au fur et à mesure.
 //
+// stream : chaque étape est demandée en streaming, et le texte de réponse
+// et le raisonnement sont transmis à onEvent au fil de la génération
+// (EventContentDelta/EventReasoningDelta) — le texte final retourné a alors
+// déjà été entièrement transmis par ce biais.
+//
 // maxConsecutiveShellFailures : voir shellFailureNudge et
 // config.Config.AgentMaxConsecutiveShellFailures. <= 0 = désactivé.
-func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, registry *tools.Registry, maxSteps int, maxConsecutiveShellFailures int, onEvent func(Event)) (string, llm.Usage, error) {
+func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, registry *tools.Registry, maxSteps int, maxConsecutiveShellFailures int, stream bool, onEvent func(Event)) (string, llm.Usage, error) {
 	if maxSteps <= 0 {
 		maxSteps = defaultMaxSteps
 	}
 	specs := registry.Specs()
+
+	complete := func() (llm.Message, llm.Usage, error) {
+		if !stream {
+			return client.ChatCompletion(ctx, conv.Full(), specs)
+		}
+		var cb llm.StreamCallbacks
+		if onEvent != nil {
+			cb.OnContent = func(d string) { onEvent(Event{Kind: EventContentDelta, Result: d}) }
+			cb.OnReasoning = func(d string) { onEvent(Event{Kind: EventReasoningDelta, Result: d}) }
+		}
+		return client.ChatCompletionStream(ctx, conv.Full(), specs, cb)
+	}
 
 	var lastUsage llm.Usage
 	// compactionFailed : dès qu'une tentative échoue dans cet appel à Run,
@@ -258,7 +289,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// qui ne compte notamment pas la définition des outils), on supprime
 		// une part des plus vieux messages et on retente, plutôt que de
 		// faire échouer tout le tour.
-		msg, usage, err := client.ChatCompletion(ctx, conv.Full(), specs)
+		msg, usage, err := complete()
 		for attempt := 1; err != nil && convo.IsContextOverflow(err) && attempt <= maxOverflowRetries && ctx.Err() == nil; attempt++ {
 			dropped := conv.DropOldest(overflowDropFraction)
 			if dropped == 0 {
@@ -267,12 +298,32 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 			if onEvent != nil {
 				onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("requête refusée pour dépassement de contexte : %d message(s) le(s) plus ancien(s) supprimé(s), nouvel essai (%d/%d)", dropped, attempt, maxOverflowRetries)})
 			}
-			msg, usage, err = client.ChatCompletion(ctx, conv.Full(), specs)
+			msg, usage, err = complete()
 		}
 		if err != nil {
 			return "", lastUsage, err
 		}
 		lastUsage = usage
+
+		// Réponse coupée par max_tokens : d'éventuels tool_calls sont
+		// probablement incomplets (arguments JSON tronqués, ou lot
+		// d'appels interrompu en cours de route) — on ne les exécute pas,
+		// et le tour s'arrête sur ce qui a été produit, avec un
+		// avertissement explicite plutôt qu'une réponse silencieusement
+		// tronquée.
+		if msg.FinishReason == llm.FinishReasonLength {
+			msg.ToolCalls = nil
+			if strings.TrimSpace(msg.Content) == "" {
+				msg.Content = truncatedPlaceholder
+			}
+			if onEvent != nil {
+				limit := "max_tokens"
+				if client.MaxTokens > 0 {
+					limit = fmt.Sprintf("max_tokens=%d", client.MaxTokens)
+				}
+				onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("réponse interrompue par la limite de tokens de sortie (%s, voir LLM_MAX_TOKENS) : le modèle est peut-être parti en boucle", limit)})
+			}
+		}
 
 		// Enregistré immédiatement après cet AppendRaw (avant d'ajouter les
 		// résultats d'outils ci-dessous, dont le coût réel n'est pas encore
@@ -294,7 +345,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// serveur le distingue, sinon le Content écrit à côté des
 		// tool_calls) : à afficher avant ceux-ci plutôt qu'à le laisser
 		// invisible dans l'historique.
-		if onEvent != nil {
+		if onEvent != nil && !stream {
 			note := strings.TrimSpace(msg.ReasoningContent)
 			if note == "" {
 				note = strings.TrimSpace(msg.Content)

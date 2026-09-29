@@ -27,7 +27,17 @@ type Message struct {
 	// renvoie pas son propre raisonnement au modèle) : uniquement lu depuis
 	// une réponse, pour affichage — voir agent.EventReasoning.
 	ReasoningContent string `json:"reasoning_content,omitempty"`
+
+	// FinishReason : raison de fin de génération rapportée par le serveur
+	// ("stop", "tool_calls", "length"...). Jamais sérialisé : renseigné par
+	// le client à la lecture d'une réponse. FinishReasonLength signale une
+	// réponse coupée par la limite max_tokens (voir Client.MaxTokens).
+	FinishReason string `json:"-"`
 }
+
+// FinishReasonLength : finish_reason d'une génération interrompue par la
+// limite de tokens de sortie (max_tokens) plutôt que terminée normalement.
+const FinishReasonLength = "length"
 
 // Tool décrit une fonction proposée au LLM (format OpenAI "function tool").
 type Tool struct {
@@ -75,6 +85,15 @@ type Client struct {
 	// config.Config.ContextMaxTokens) pour obtenir le contexte réellement
 	// voulu plutôt qu'une valeur arbitraire choisie par le serveur.
 	ContextTokens int
+
+	// MaxTokens : nombre maximal de tokens générés par réponse (champ
+	// "max_tokens" de la requête, raisonnement compris sur les serveurs qui
+	// le comptent — llama.cpp notamment). 0 = non transmis : le serveur
+	// applique alors sa propre limite, souvent toute la fenêtre de contexte
+	// (vu avec Unsloth Studio/llama.cpp : n_predict = 65000) — un modèle qui
+	// part en boucle dans son raisonnement peut alors générer pendant des
+	// dizaines de minutes avant de rendre la main.
+	MaxTokens int
 }
 
 // DefaultTimeout : durée maximale d'une requête complète au LLM (voir
@@ -105,11 +124,13 @@ type chatRequest struct {
 	Stream        bool           `json:"stream"`
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 	Tools         []Tool         `json:"tools,omitempty"`
+	MaxTokens     int            `json:"max_tokens,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message      Message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *Usage `json:"usage"`
 	Error *struct {
@@ -207,10 +228,11 @@ func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools [
 
 func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, tools []Tool) (Message, Usage, error) {
 	reqBody, err := json.Marshal(chatRequest{
-		Model:    c.Model,
-		Messages: messages,
-		Stream:   false,
-		Tools:    tools,
+		Model:     c.Model,
+		Messages:  messages,
+		Stream:    false,
+		Tools:     tools,
+		MaxTokens: c.MaxTokens,
 	})
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -255,48 +277,79 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 		usage = *parsed.Usage
 	}
 
-	return parsed.Choices[0].Message, usage, nil
+	msg := parsed.Choices[0].Message
+	msg.FinishReason = parsed.Choices[0].FinishReason
+	return msg, usage, nil
 }
 
-// ChatCompletionStream envoie l'historique et appelle onDelta pour chaque
-// fragment de texte reçu (format SSE "data: {...}"). Retourne le texte
-// complet et l'usage de tokens rapporté par le serveur (demandé via
-// stream_options.include_usage, supporté par les serveurs llama.cpp/vLLM/etc.
-// compatibles OpenAI récents) — avec la même tentative de chargement
-// automatique + relance unique que ChatCompletion (voir
-// modelNotLoadedSubstring) si le serveur répond "aucun modèle chargé".
+// StreamCallbacks : fonctions appelées au fil du streaming (voir
+// ChatCompletionStream), toutes optionnelles. OnContent reçoit chaque
+// fragment du texte de réponse, OnReasoning chaque fragment de raisonnement
+// ("reasoning_content", voir Message.ReasoningContent). Les tool_calls ne
+// sont pas transmis fragment par fragment : ils ne sont exploitables qu'une
+// fois leurs arguments complets, et sont rendus dans le Message final.
+type StreamCallbacks struct {
+	OnContent   func(string)
+	OnReasoning func(string)
+}
+
+// ChatCompletionStream envoie l'historique (et, si fourni, la liste de tools
+// proposés) en mode streaming (format SSE "data: {...}"), appelle cb au fil
+// des fragments reçus, et retourne le message assistant complet reconstitué
+// (texte, raisonnement, tool_calls, finish_reason) et l'usage de tokens
+// rapporté par le serveur (demandé via stream_options.include_usage,
+// supporté par les serveurs llama.cpp/vLLM/etc. compatibles OpenAI récents)
+// — avec la même tentative de chargement automatique + relance unique que
+// ChatCompletion (voir modelNotLoadedSubstring) si le serveur répond "aucun
+// modèle chargé".
 //
-// Si le premier essai a déjà appelé onDelta avant d'échouer (peu probable
-// pour cette erreur précise, qui survient avant tout token produit, mais pas
-// structurellement impossible), la relance rappelle onDelta depuis le début
-// : un onDelta idempotent-à-l'affichage (ex: impression directe sur la
-// sortie, comme le fait le mode chat) afficherait alors un double texte
-// partiel — cas non observé en pratique pour cette erreur précise, donc pas
-// traité spécifiquement ici.
-func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, onDelta func(string)) (string, Usage, error) {
-	full, usage, err := c.chatCompletionStreamOnce(ctx, messages, onDelta)
+// Si le premier essai a déjà appelé cb avant d'échouer (peu probable pour
+// cette erreur précise, qui survient avant tout token produit, mais pas
+// structurellement impossible), la relance rappelle cb depuis le début : un
+// affichage direct sur la sortie (comme le fait le mode chat) montrerait
+// alors un double texte partiel — cas non observé en pratique pour cette
+// erreur précise, donc pas traité spécifiquement ici.
+func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, tools []Tool, cb StreamCallbacks) (Message, Usage, error) {
+	msg, usage, err := c.chatCompletionStreamOnce(ctx, messages, tools, cb)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), modelNotLoadedSubstring) {
 		if loadErr := c.tryLoadModel(ctx); loadErr == nil {
-			return c.chatCompletionStreamOnce(ctx, messages, onDelta)
+			return c.chatCompletionStreamOnce(ctx, messages, tools, cb)
 		}
 	}
-	return full, usage, err
+	return msg, usage, err
 }
 
-func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Message, onDelta func(string)) (string, Usage, error) {
+// streamToolCallDelta : fragment d'un tool_call en streaming (format
+// OpenAI). Index identifie l'appel auquel le fragment appartient (plusieurs
+// appels possibles dans une même réponse) ; id, type et nom n'arrivent
+// normalement que dans le premier fragment, les arguments sont concaténés
+// au fil des fragments suivants.
+type streamToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Message, tools []Tool, cb StreamCallbacks) (Message, Usage, error) {
 	reqBody, err := json.Marshal(chatRequest{
 		Model:         c.Model,
 		Messages:      messages,
 		Stream:        true,
 		StreamOptions: &streamOptions{IncludeUsage: true},
+		Tools:         tools,
+		MaxTokens:     c.MaxTokens,
 	})
 	if err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -306,16 +359,18 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", Usage{}, fmt.Errorf("LLM a répondu avec le status %d: %s", resp.StatusCode, string(body))
+		return Message{}, Usage{}, fmt.Errorf("LLM a répondu avec le status %d: %s", resp.StatusCode, string(body))
 	}
 
-	var full strings.Builder
+	var content, reasoning strings.Builder
+	var toolCalls []ToolCall
+	var finishReason string
 	var usage Usage
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -335,13 +390,22 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content          string                `json:"content"`
+					ReasoningContent string                `json:"reasoning_content"`
+					ToolCalls        []streamToolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
+				FinishReason string `json:"finish_reason"`
 			} `json:"choices"`
 			Usage *Usage `json:"usage"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 		}
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue // fragment ignoré, ne casse pas le stream
+		}
+		if chunk.Error != nil {
+			return Message{}, usage, fmt.Errorf("erreur LLM: %s", chunk.Error.Message)
 		}
 		if chunk.Usage != nil {
 			usage = *chunk.Usage
@@ -349,18 +413,50 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		if len(chunk.Choices) == 0 {
 			continue
 		}
-		delta := chunk.Choices[0].Delta.Content
-		if delta == "" {
-			continue
+		choice := chunk.Choices[0]
+		if choice.FinishReason != "" {
+			finishReason = choice.FinishReason
 		}
-		full.WriteString(delta)
-		if onDelta != nil {
-			onDelta(delta)
+		if d := choice.Delta.ReasoningContent; d != "" {
+			reasoning.WriteString(d)
+			if cb.OnReasoning != nil {
+				cb.OnReasoning(d)
+			}
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return full.String(), usage, err
+		if d := choice.Delta.Content; d != "" {
+			content.WriteString(d)
+			if cb.OnContent != nil {
+				cb.OnContent(d)
+			}
+		}
+		for _, tc := range choice.Delta.ToolCalls {
+			if tc.Index < 0 {
+				continue
+			}
+			for len(toolCalls) <= tc.Index {
+				toolCalls = append(toolCalls, ToolCall{Type: "function"})
+			}
+			call := &toolCalls[tc.Index]
+			if tc.ID != "" {
+				call.ID = tc.ID
+			}
+			if tc.Type != "" {
+				call.Type = tc.Type
+			}
+			call.Function.Name += tc.Function.Name
+			call.Function.Arguments += tc.Function.Arguments
+		}
 	}
 
-	return full.String(), usage, nil
+	msg := Message{
+		Role:             "assistant",
+		Content:          content.String(),
+		ReasoningContent: reasoning.String(),
+		ToolCalls:        toolCalls,
+		FinishReason:     finishReason,
+	}
+	if err := scanner.Err(); err != nil {
+		return msg, usage, err
+	}
+	return msg, usage, nil
 }

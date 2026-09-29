@@ -99,6 +99,7 @@ func main() {
 	client := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
 	client.HTTPClient.Timeout = cfg.LLMTimeout
 	client.ContextTokens = cfg.ContextMaxTokens
+	client.MaxTokens = cfg.LLMMaxTokens
 
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
 	// lancé : sinon, lancer le programme depuis un dossier différent d'une

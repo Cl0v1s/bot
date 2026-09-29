@@ -26,6 +26,10 @@ type Config struct {
 	// l'annulation du contexte, ex: Ctrl+C en mode chat, interrompt alors la
 	// requête).
 	LLMTimeout time.Duration
+	// LLMMaxTokens : nombre maximal de tokens générés par réponse (voir
+	// llm.Client.MaxTokens). 0 = aucune limite transmise (le serveur
+	// applique la sienne).
+	LLMMaxTokens int
 
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
@@ -334,6 +338,12 @@ func Load() Config {
 		llmTimeout = 10 * time.Minute
 	}
 
+	// Comme LLM_TIMEOUT, 0 est une valeur valide (pas de limite).
+	llmMaxTokens, err := strconv.Atoi(getenv("LLM_MAX_TOKENS", "8192"))
+	if err != nil || llmMaxTokens < 0 {
+		llmMaxTokens = 8192
+	}
+
 	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.95"), 64)
 	if err != nil || contextCompactAt <= 0 || contextCompactAt > 1 {
 		contextCompactAt = 0.95
@@ -407,6 +417,7 @@ func Load() Config {
 		LLMModel:     getenv("LLM_MODEL", "local-model"),
 		SystemPrompt: getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
 		LLMTimeout:   llmTimeout,
+		LLMMaxTokens: llmMaxTokens,
 
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,

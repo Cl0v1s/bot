@@ -312,7 +312,7 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	if !opts.Tools.Empty() {
 		// Les appels d'outils et leurs résultats sont journalisés à part,
 		// nettement séparés du texte de la réponse envoyée par mail.
-		reply, _, err = agent.Run(ctx, client, conv, opts.Tools, opts.AgentMaxSteps, opts.AgentMaxConsecutiveShellFailures, func(e agent.Event) {
+		reply, _, err = agent.Run(ctx, client, conv, opts.Tools, opts.AgentMaxSteps, opts.AgentMaxConsecutiveShellFailures, false, func(e agent.Event) {
 			log.Print(strings.TrimRight(e.Format(), "\n"))
 		})
 		if err != nil {
