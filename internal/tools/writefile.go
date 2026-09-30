@@ -10,7 +10,7 @@ import (
 )
 
 // WriteFileTool écrit (crée ou remplace) un fichier texte local, ou en
-// modifie une portion ciblée (voir "offset"/"length"). L'accès n'est
+// modifie un passage repéré par son texte exact ("old_text"). L'accès n'est
 // autorisé que si le répertoire du fichier a été préautorisé ou accordé via
 // RequestDirectoryAccessTool — voir DirPermissions.
 type WriteFileTool struct {
@@ -37,7 +37,8 @@ func (t *WriteFileTool) Name() string { return "write_file" }
 
 func (t *WriteFileTool) Description() string {
 	return "Écrit (crée ou remplace intégralement) un fichier texte local, dans un répertoire déjà autorisé (voir request_directory_access). Crée les répertoires parents si besoin. " +
-		"Pour modifier une portion ciblée d'un fichier EXISTANT sans regénérer tout son contenu, utilise \"offset\" (et éventuellement \"length\") — repère d'abord la plage de lignes concernée avec read_file en mode \"search\" (qui numérote chaque ligne affichée), plutôt que de compter toi-même les lignes d'une lecture complète (non numérotée) : \"length\" > 0 remplace ces lignes par \"content\", \"length\" omis/0 insère \"content\" avant la ligne \"offset\" sans rien supprimer. Pour MODIFIER des lignes existantes, utilise toujours \"length\" (remplacement) : une insertion laisse l'ancienne version en place, en doublon. \"content\" ne doit contenir que les lignes nouvelles ou de remplacement, jamais les lignes voisines qui restent en place. Le résultat affiche la zone modifiée, numérotée : vérifie-la. Sans \"offset\", \"content\" remplace tout le fichier (ou le crée)."
+		"Pour MODIFIER un fichier EXISTANT, utilise \"old_text\" : recopie EXACTEMENT le passage actuel tel que read_file l'affiche (une ou plusieurs lignes entières, espaces et ponctuation compris), et \"content\" = sa nouvelle version ; seul ce passage est remplacé, sans compter aucune ligne. \"old_text\" doit apparaître une seule fois dans le fichier : s'il est ambigu, inclus une ligne voisine de plus. \"content\" vide = suppression du passage. Pour INSÉRER sans rien supprimer, prends comme \"old_text\" la ligne après laquelle insérer, et comme \"content\" cette même ligne suivie des nouvelles. " +
+		"Le résultat d'une modification affiche la zone modifiée, numérotée : vérifie-la. Sans \"old_text\", \"content\" remplace tout le fichier (ou le crée) : à réserver à un nouveau fichier ou à une réécriture complète voulue."
 }
 
 func (t *WriteFileTool) ParametersSchema() json.RawMessage {
@@ -45,9 +46,8 @@ func (t *WriteFileTool) ParametersSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"path": {"type": "string", "description": "Chemin ABSOLU du fichier à écrire, dans un répertoire déjà autorisé. Un chemin relatif est refusé."},
-			"content": {"type": "string", "description": "Contenu texte. Sans \"offset\" : remplace tout le fichier (ou le crée). Avec \"offset\" : les lignes à insérer/substituer, découpées sur les sauts de ligne (un saut de ligne final éventuel est ignoré ; vide avec \"length\" > 0 = suppression de ces lignes). Uniquement les lignes nouvelles ou de remplacement, jamais les lignes voisines qui restent en place."},
-			"offset": {"type": "integer", "minimum": 1, "description": "Numéro de la ligne (1 = première ligne) à partir de laquelle appliquer \"content\", sur un fichier qui doit déjà exister. Sans \"length\" (ou length=0) : insère \"content\" avant cette ligne, sans rien supprimer (offset = nombre de lignes + 1 pour ajouter à la fin). Avec \"length\" : voir ce paramètre. Omis = remplace tout le fichier avec \"content\"."},
-			"length": {"type": "integer", "minimum": 0, "description": "Avec \"offset\" : nombre de lignes existantes à remplacer par \"content\", à partir de la ligne \"offset\" incluse. 0 ou omis = insertion pure (rien supprimé). Sans effet sans \"offset\"."}
+			"content": {"type": "string", "description": "Contenu texte. Avec \"old_text\" : la nouvelle version de ce passage (vide = le supprimer). Sans \"old_text\" : remplace tout le fichier (ou le crée)."},
+			"old_text": {"type": "string", "description": "Passage EXISTANT à remplacer par \"content\", recopié exactement depuis read_file (lignes entières, sans numéros de ligne). Doit apparaître une seule fois dans le fichier. À utiliser pour toute modification d'un fichier existant."}
 		},
 		"required": ["path", "content"],
 		"additionalProperties": false
@@ -57,8 +57,14 @@ func (t *WriteFileTool) ParametersSchema() json.RawMessage {
 type writeFileArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
-	Offset  int    `json:"offset"`
-	Length  int    `json:"length"`
+	OldText string `json:"old_text"`
+	// Offset/Length : ancien mode d'édition par numéros de ligne, supprimé
+	// (les modèles comptaient mal les lignes d'une lecture non numérotée).
+	// Toujours décodés pour répondre par une erreur explicite plutôt que
+	// "unknown field", un modèle pouvant reprendre une habitude vue plus
+	// tôt dans la conversation.
+	Offset int `json:"offset"`
+	Length int `json:"length"`
 }
 
 func (t *WriteFileTool) Call(ctx context.Context, argsJSON string) (string, error) {
@@ -75,11 +81,8 @@ func (t *WriteFileTool) Call(ctx context.Context, argsJSON string) (string, erro
 	if err := requireAbsolutePath("path", args.Path); err != nil {
 		return "", err
 	}
-	if args.Offset < 0 {
-		return "", fmt.Errorf(`paramètre "offset" invalide : doit être positif ou nul`)
-	}
-	if args.Length < 0 {
-		return "", fmt.Errorf(`paramètre "length" invalide : doit être positif ou nul`)
+	if args.Offset != 0 || args.Length != 0 {
+		return "", fmt.Errorf(`"offset"/"length" n'existent pas pour write_file : pour modifier un passage, passe-le tel quel dans "old_text" et sa nouvelle version dans "content"`)
 	}
 
 	resolved, err := t.Perms.CheckFileWrite(args.Path)
@@ -110,143 +113,112 @@ func (t *WriteFileTool) Call(ctx context.Context, argsJSON string) (string, erro
 		return "", err
 	}
 
-	if args.Offset > 0 {
+	if summary != "" {
 		return fmt.Sprintf("fichier %q modifié (%d octets au total) : %s", args.Path, len(finalContent), summary), nil
 	}
 	return fmt.Sprintf("fichier %q écrit (%d octets)", args.Path, len(finalContent)), nil
 }
 
 // computeFinalContent retourne le contenu complet à écrire dans resolved :
-// args.Content tel quel si args.Offset est omis (remplacement intégral —
-// comportement historique, fonctionne aussi pour créer un nouveau fichier),
-// sinon le contenu ACTUEL de resolved avec args.Content inséré/substitué à
-// partir de la ligne args.Offset (voir Description). summary (mode offset
-// uniquement) décrit ce qui a été fait, avec un extrait numéroté de la zone
-// modifiée : sans ce retour, le modèle n'a aucun moyen de voir qu'il a
-// inséré au mauvais endroit, ou inséré une nouvelle version d'un passage au
-// lieu de le remplacer.
+// args.Content tel quel sans "old_text" (remplacement intégral ou
+// création), sinon le contenu actuel avec le passage remplacé (voir
+// replaceOldText). summary (modification uniquement) décrit ce qui a été
+// fait, avec un extrait numéroté de la zone modifiée pour que le modèle
+// puisse vérifier le résultat.
 func (t *WriteFileTool) computeFinalContent(resolved string, args writeFileArgs) (final, summary string, err error) {
-	if args.Offset == 0 {
-		return args.Content, "", nil
+	if args.OldText != "" {
+		return replaceOldText(resolved, args)
 	}
+	return args.Content, "", nil
+}
 
-	existing, err := os.ReadFile(resolved)
+// replaceOldText implémente "old_text" : remplacement d'un passage repéré
+// par son texte exact plutôt que par des numéros de ligne, que les modèles
+// comptent mal sur une lecture non numérotée (observé : la ligne 23 visée à
+// la place de la 20, écrasant une ligne sans rapport). Le passage doit être
+// unique, pour qu'aucune autre occurrence ne soit modifiée par erreur.
+func replaceOldText(resolved string, args writeFileArgs) (final, summary string, err error) {
+	data, err := os.ReadFile(resolved)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", "", fmt.Errorf("%q n'existe pas encore : \"offset\" ne peut modifier qu'un fichier existant — omets \"offset\" pour créer ce fichier avec \"content\" comme contenu complet", args.Path)
+			return "", "", fmt.Errorf("%q n'existe pas : \"old_text\" ne peut modifier qu'un fichier existant — omets-le pour créer ce fichier avec \"content\" comme contenu complet", args.Path)
 		}
 		return "", "", fmt.Errorf("lecture de %q avant modification: %w", args.Path, err)
 	}
-	if len(existing) > 0 && isLikelyBinaryContent(existing) {
-		return "", "", fmt.Errorf("%q semble être un fichier binaire : \"offset\" (édition ligne à ligne) ne s'applique qu'à du texte", args.Path)
+	if isLikelyBinaryContent(data) {
+		return "", "", fmt.Errorf("%q semble être un fichier binaire : \"old_text\" ne s'applique qu'à du texte", args.Path)
+	}
+	existing := string(data)
+	oldText, content := args.OldText, args.Content
+	// Fichier aux fins de ligne Windows : le modèle recopie des "\n".
+	if !strings.Contains(existing, oldText) && strings.Contains(existing, "\r\n") {
+		oldText = strings.ReplaceAll(oldText, "\n", "\r\n")
+		content = strings.ReplaceAll(content, "\n", "\r\n")
+	}
+	if oldText == content {
+		return "", "", fmt.Errorf(`"content" est identique à "old_text" : rien à modifier`)
 	}
 
-	lines, trailingNewline := splitFileLines(existing)
-	newLines := splitContentLines(args.Content)
-
-	insertIdx := args.Offset - 1      // 0-based
-	endIdx := insertIdx + args.Length // exclusif, 0-based ; = insertIdx en insertion pure
-	if args.Length > 0 {
-		if insertIdx > len(lines) || endIdx > len(lines) {
-			return "", "", fmt.Errorf(
-				"la plage demandée (lignes %d à %d) dépasse la fin du fichier (%d ligne(s)) : relis le fichier (read_file) pour un offset/length à jour avant de réessayer",
-				args.Offset, args.Offset+args.Length-1, len(lines),
-			)
-		}
-	} else {
-		if insertIdx > len(lines) {
-			return "", "", fmt.Errorf(
-				"offset %d dépasse la fin du fichier (%d ligne(s) ; offset max pour insérer en fin de fichier : %d) : relis le fichier (read_file) pour un offset à jour avant de réessayer",
-				args.Offset, len(lines), len(lines)+1,
-			)
-		}
-		if len(newLines) == 0 {
-			return "", "", fmt.Errorf(`"content" vide : rien à insérer (pour supprimer des lignes, passe "length" avec un "content" vide)`)
-		}
+	switch n := strings.Count(existing, oldText); {
+	case n == 0:
+		return "", "", fmt.Errorf("\"old_text\" introuvable dans %q : fichier non modifié. Il doit être recopié EXACTEMENT (espaces, ponctuation, retours à la ligne) depuis une lecture récente du fichier, sans numéros de ligne%s", args.Path, oldTextHint(existing, args.OldText))
+	case n > 1:
+		return "", "", fmt.Errorf("\"old_text\" apparaît %d fois dans %q (lignes %s) : fichier non modifié. Ajoute une ligne voisine à \"old_text\" (et à \"content\") pour désigner une seule occurrence", n, args.Path, occurrenceLines(existing, oldText))
 	}
 
-	if err := checkBoundaryDuplicate(lines, newLines, insertIdx, endIdx); err != nil {
-		return "", "", err
-	}
+	idx := strings.Index(existing, oldText)
+	final = existing[:idx] + content + existing[idx+len(oldText):]
 
-	result := make([]string, 0, len(lines)-args.Length+len(newLines))
-	result = append(result, lines[:insertIdx]...)
-	result = append(result, newLines...)
-	result = append(result, lines[endIdx:]...)
-
-	final = strings.Join(result, "\n")
-	if trailingNewline && len(result) > 0 {
-		final += "\n"
+	lines, _ := splitFileLines([]byte(final))
+	startLine := strings.Count(final[:idx], "\n")
+	newLines := 0
+	if content != "" {
+		newLines = strings.Count(strings.TrimSuffix(content, "\n"), "\n") + 1
 	}
-
-	var action string
-	if args.Length > 0 {
-		action = fmt.Sprintf("lignes %d-%d (%d) remplacées par %d ligne(s)", args.Offset, endIdx, args.Length, len(newLines))
-	} else {
-		action = fmt.Sprintf("%d ligne(s) insérée(s) avant l'ancienne ligne %d, aucune supprimée", len(newLines), args.Offset)
-	}
-	return final, action + "\n" + editExcerpt(result, insertIdx, len(newLines)), nil
+	oldLines := strings.Count(strings.TrimSuffix(oldText, "\n"), "\n") + 1
+	action := fmt.Sprintf("passage de %d ligne(s) remplacé par %d ligne(s), à partir de la ligne %d", oldLines, newLines, startLine+1)
+	return final, action + "\n" + editExcerpt(lines, startLine, newLines), nil
 }
 
-// splitContentLines découpe le "content" d'une édition par offset en lignes.
-// Un saut de ligne final est ignoré : un modèle termine presque toujours son
-// contenu par "\n", ce qui ajoutait sinon une ligne vide parasite à chaque
-// édition. "" = aucune ligne (suppression pure avec "length") ; "\n" = une
-// ligne vide.
-func splitContentLines(content string) []string {
-	if content == "" {
-		return nil
-	}
-	content = strings.TrimSuffix(content, "\n")
-	content = strings.TrimSuffix(content, "\r")
-	return strings.Split(content, "\n")
-}
-
-// checkBoundaryDuplicate refuse une édition dont le contenu commence par les
-// lignes qui restent juste avant la zone modifiée, ou se termine par celles
-// qui restent juste après : ces lignes se retrouveraient en double. Deux
-// erreurs typiques d'un modèle : inclure dans "content" la ligne d'ancrage
-// (ex: le titre sous lequel il insère), ou relancer une insertion déjà faite
-// par un appel précédent. Seul un recouvrement comportant au moins une ligne
-// significative (voir isSignificantLine) compte : une accolade ou une ligne
-// vide identique de part et d'autre est banale.
-func checkBoundaryDuplicate(lines, newLines []string, insertIdx, endIdx int) error {
-	before := lines[:insertIdx]
-	after := lines[endIdx:]
-	for m := len(newLines); m >= 1; m-- {
-		if m <= len(before) && equalLines(newLines[:m], before[len(before)-m:]) && anySignificant(newLines[:m]) {
-			return fmt.Errorf("les %d première(s) ligne(s) de \"content\" sont identiques aux lignes %d-%d, juste avant la zone modifiée, qui restent en place : elles seraient en double — fichier non modifié. Retire-les de \"content\" (ou étends la plage avec offset/length pour les remplacer). Si ce contenu a déjà été inséré par un appel précédent, n'insère rien de plus", m, insertIdx-m+1, insertIdx)
-		}
-		if m <= len(after) && equalLines(newLines[len(newLines)-m:], after[:m]) && anySignificant(newLines[len(newLines)-m:]) {
-			return fmt.Errorf("les %d dernière(s) ligne(s) de \"content\" sont identiques aux lignes %d-%d, juste après la zone modifiée, qui restent en place : elles seraient en double — fichier non modifié. Retire-les de \"content\" (ou étends \"length\" pour les remplacer). Si ce contenu a déjà été inséré par un appel précédent, n'insère rien de plus", m, endIdx+1, endIdx+m)
-		}
-	}
-	return nil
-}
-
-func equalLines(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if strings.TrimRight(a[i], " \t\r") != strings.TrimRight(b[i], " \t\r") {
-			return false
-		}
-	}
-	return true
-}
-
-func anySignificant(lines []string) bool {
-	for _, l := range lines {
+// oldTextHint aide à corriger un "old_text" introuvable : si sa première
+// ligne significative existe dans le fichier (le passage a été mal recopié
+// plus loin), indique où, avec son contenu exact.
+func oldTextHint(existing, oldText string) string {
+	var first string
+	for _, l := range strings.Split(oldText, "\n") {
 		if isSignificantLine(l) {
-			return true
+			first = strings.TrimSpace(l)
+			break
 		}
 	}
-	return false
+	if first == "" {
+		return ""
+	}
+	for i, l := range strings.Split(existing, "\n") {
+		if strings.TrimSpace(l) == first {
+			return fmt.Sprintf(". Sa première ligne existe bien (ligne %d) : c'est la suite du passage qui diffère ; relis le fichier (read_file avec \"offset\" %d) et recopie-le tel quel", i+1, i+1)
+		}
+	}
+	return ". Relis le fichier (read_file) pour recopier le passage tel qu'il est actuellement"
+}
+
+// occurrenceLines liste les numéros de ligne (1-based) où commence chaque
+// occurrence de sub dans s.
+func occurrenceLines(s, sub string) string {
+	var nums []string
+	for off := 0; ; {
+		i := strings.Index(s[off:], sub)
+		if i < 0 {
+			break
+		}
+		nums = append(nums, fmt.Sprint(strings.Count(s[:off+i], "\n")+1))
+		off += i + len(sub)
+	}
+	return strings.Join(nums, ", ")
 }
 
 // isSignificantLine : au moins 3 lettres ou chiffres — exclut lignes vides,
-// accolades, séparateurs ("---", "*/"...).
+// accolades, séparateurs ("---", "*/"...). Voir oldTextHint.
 func isSignificantLine(line string) bool {
 	n := 0
 	for _, r := range line {
@@ -291,8 +263,8 @@ func editExcerpt(result []string, start, n int) string {
 // splitFileLines découpe data en lignes, en détectant séparément si le
 // fichier se terminait par un saut de ligne — distinction perdue par un
 // simple bufio.Scanner (qui traite "a\nb\n" et "a\nb" de façon identique) et
-// nécessaire ici pour reproduire fidèlement la même convention en sortie
-// (voir Call). Un fichier vide (0 octet) a 0 ligne, pas une ligne vide.
+// nécessaire pour numéroter correctement la zone modifiée (voir
+// editExcerpt). Un fichier vide (0 octet) a 0 ligne, pas une ligne vide.
 func splitFileLines(data []byte) (lines []string, trailingNewline bool) {
 	if len(data) == 0 {
 		return nil, false

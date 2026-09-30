@@ -119,7 +119,7 @@ func TestRecordCommandFailure(t *testing.T) {
 
 func TestSTTTranscribe(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/audio/transcriptions" {
+		if r.URL.Path != "/api/inference/audio/transcribe/raw" {
 			http.Error(w, "chemin "+r.URL.Path, http.StatusNotFound)
 			return
 		}
@@ -127,25 +127,18 @@ func TestSTTTranscribe(t *testing.T) {
 			http.Error(w, "auth", http.StatusUnauthorized)
 			return
 		}
-		if err := r.ParseMultipartForm(1 << 20); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		q := r.URL.Query()
+		data, _ := io.ReadAll(r.Body)
+		if string(data[:4]) != "RIFF" || r.Header.Get("Content-Type") != "audio/wav" ||
+			q.Get("model") != "m" || q.Get("language") != "fr" || q.Get("engine") != "gguf" || q.Get("device") != "cpu" {
+			http.Error(w, "champs "+r.URL.RawQuery, http.StatusBadRequest)
 			return
 		}
-		f, _, err := r.FormFile("file")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		data, _ := io.ReadAll(f)
-		if string(data[:4]) != "RIFF" || r.FormValue("model") != "m" || r.FormValue("language") != "fr" || r.FormValue("response_format") != "json" {
-			http.Error(w, "champs", http.StatusBadRequest)
-			return
-		}
-		w.Write([]byte(`{"text":"  Bonjour le bot. "}`))
+		w.Write([]byte(`{"text":"  Bonjour le bot. ","language":"fr"}`))
 	}))
 	defer srv.Close()
 
-	s := STT{BaseURL: srv.URL + "/v1/", APIKey: "k", Model: "m", Language: "fr"}
+	s := STT{BaseURL: srv.URL + "/v1/", APIKey: "k", Model: "m", Language: "fr", Engine: "gguf", Device: "cpu"}
 	text, err := s.Transcribe(context.Background(), encodeWAV(tone(100*time.Millisecond, 1000)))
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +150,14 @@ func TestSTTTranscribe(t *testing.T) {
 	s.APIKey = "mauvaise"
 	if _, err := s.Transcribe(context.Background(), encodeWAV(nil)); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// Les paramètres vides ne sont pas envoyés : le serveur garde ses défauts.
+func TestSTTEndpointOmitsEmptyParams(t *testing.T) {
+	got := STT{BaseURL: "http://h:8888/v1", Model: "small"}.endpoint()
+	if got != "http://h:8888/api/inference/audio/transcribe/raw?model=small" {
+		t.Errorf("endpoint = %q", got)
 	}
 }
 

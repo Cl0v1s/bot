@@ -148,8 +148,7 @@ type Config struct {
 	// Voice* / STT* : commande vocale du mode chat (voir internal/voice).
 	// VoiceRecordCmd : commande de capture qui écrit du PCM s16 mono 16 kHz
 	// brut sur sa sortie standard ; vide = pw-record. La transcription passe
-	// toujours par le serveur du LLM (LLMBaseURL/LLMAPIKey) : Unsloth Studio
-	// sert aussi /v1/audio/transcriptions.
+	// toujours par le serveur du LLM (LLMBaseURL/LLMAPIKey), Unsloth Studio.
 	VoiceEnabled          bool
 	VoiceRecordCmd        []string
 	VoiceMaxDuration      time.Duration
@@ -157,6 +156,11 @@ type Config struct {
 	VoiceSilenceThreshold float64
 	STTModel              string
 	STTLanguage           string
+	// STTEngine / STTDevice : moteur et emplacement du modèle de dictée sur
+	// Unsloth Studio ("gguf" = whisper.cpp et "cpu" par défaut, pour laisser
+	// tout le GPU au LLM ; "" = au choix du serveur). Voir voice.STT.
+	STTEngine string
+	STTDevice string
 }
 
 // SkillsDir retourne le sous-répertoire "skills" du workspace, où les
@@ -506,8 +510,10 @@ func Load() Config {
 		VoiceMaxDuration:      voiceMaxDuration,
 		VoiceSilenceStop:      voiceSilenceStop,
 		VoiceSilenceThreshold: voiceSilenceThreshold,
-		STTModel:              getenv("STT_MODEL", "qwen3-asr-0.6b"),
+		STTModel:              getenv("STT_MODEL", "large-v3-turbo"),
 		STTLanguage:           getenv("STT_LANGUAGE", "fr"),
+		STTEngine:             getenvAllowEmpty("STT_ENGINE", "gguf"),
+		STTDevice:             getenvAllowEmpty("STT_DEVICE", "cpu"),
 	}
 }
 

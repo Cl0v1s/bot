@@ -153,6 +153,8 @@ func main() {
 					APIKey:   cfg.LLMAPIKey,
 					Model:    cfg.STTModel,
 					Language: cfg.STTLanguage,
+					Engine:   cfg.STTEngine,
+					Device:   cfg.STTDevice,
 				},
 			},
 		}

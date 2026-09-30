@@ -150,12 +150,12 @@ Parler au bot sans avoir le focus sur le terminal, tout en local. Avec `VOICE_EN
 Déroulé :
 1. Un appui sur le raccourci démarre l'enregistrement du micro (`pw-record`).
 2. L'enregistrement s'arrête au second appui, ou tout seul après `VOICE_SILENCE_STOP` de silence.
-3. L'audio est transcrit par un serveur STT local au format OpenAI (`POST /audio/transcriptions`).
+3. L'audio est transcrit en local par Unsloth Studio, le même serveur que le LLM (voir « Serveur STT » ci-dessous).
 4. Le texte est traité **exactement comme une ligne tapée** : message de chat (mis en file si un tour est en cours), commande `/…`, ou réponse à une confirmation en attente. On peut donc répondre « oui » ou « non » à voix haute ; la question s'affiche aussi en notification.
 
 L'état (écoute, transcription, texte envoyé, erreurs) s'affiche en notifications de bureau (`notify-send`). Les réponses du modèle restent écrites dans le terminal (pas de synthèse vocale).
 
-**Serveur STT.** La transcription passe par le même serveur que le LLM (`LLM_BASE_URL`, `LLM_API_KEY`) : Unsloth Studio sert `/v1/audio/transcriptions` avec un modèle de dictée chargé à côté du modèle de chat, sans l'évincer. Le modèle (`STT_MODEL`, `qwen3-asr-0.6b` par défaut ; aussi `qwen3-asr-1.7b` ou les Whisper `tiny` … `large-v3`) est à télécharger une fois dans Unsloth Studio, Paramètres → Voix (il n'est pas dans le Model Hub).
+**Serveur STT.** La transcription passe par le même serveur que le LLM (`LLM_BASE_URL`, `LLM_API_KEY`), Unsloth Studio, via sa route `/api/inference/audio/transcribe/raw` : contrairement à sa route OpenAI, elle impose à chaque requête le moteur et le périphérique. Par défaut, Whisper `large-v3-turbo` sous whisper.cpp (`STT_ENGINE=gguf`) sur le CPU (`STT_DEVICE=cpu`), pour laisser tout le GPU au LLM : ~2 Go de RAM, aucune VRAM. Le modèle est à télécharger une fois dans Unsloth Studio, Paramètres → Voix (il n'est pas dans le Model Hub). Sur un CPU modeste, `STT_MODEL=small` est environ trois fois plus rapide mais moins précis. Qwen3-ASR (`STT_ENGINE=mtmd`) est rapide, mais Unsloth le lance sans limite de contexte : il réserve environ 8 Go de RAM (ou de VRAM).
 
 **Raccourci global (GNOME).** Paramètres → Clavier → Raccourcis clavier → Raccourcis personnalisés : commande `/chemin/vers/bot voice toggle`, touche au choix (ex. Super+Espace). Le processus lancé par le raccourci doit trouver le même `$XDG_RUNTIME_DIR` que `bot chat`, ce qui est le cas dans une même session de bureau.
 
