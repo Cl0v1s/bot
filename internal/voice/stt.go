@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -24,10 +26,51 @@ type STT struct {
 	// modèle côté serveur).
 	Timeout    time.Duration
 	HTTPClient *http.Client
+	// MaxRetries : relances après une erreur passagère (voir errRetryable),
+	// espacées de RetryBackoff doublé à chaque fois. 0 = 3 relances à partir
+	// de 1 s : Unsloth Studio décharge le modèle de dictée après quelques
+	// minutes d'inactivité et répond 500 « Could not reach an upstream
+	// service » le temps de le relancer. < 0 = aucune relance.
+	MaxRetries   int
+	RetryBackoff time.Duration
+	// OnRetry, si non nil, est appelé avant chaque relance.
+	OnRetry func(attempt, max int, err error)
 }
 
-// Transcribe envoie wav et retourne le texte reconnu.
+// errRetryable : échec passager côté serveur (5xx) ou connexion, qui
+// justifie de rejouer la requête à l'identique.
+type errRetryable struct{ err error }
+
+func (e errRetryable) Error() string { return e.err.Error() }
+func (e errRetryable) Unwrap() error { return e.err }
+
+// Transcribe envoie wav et retourne le texte reconnu, en relançant la
+// requête sur une erreur passagère (voir MaxRetries).
 func (s STT) Transcribe(ctx context.Context, wav []byte) (string, error) {
+	maxRetries, backoff := s.MaxRetries, s.RetryBackoff
+	if maxRetries == 0 {
+		maxRetries = 3
+	}
+	if backoff <= 0 {
+		backoff = time.Second
+	}
+	text, err := s.transcribeOnce(ctx, wav)
+	for attempt := 1; attempt <= maxRetries && errors.As(err, new(errRetryable)) && ctx.Err() == nil; attempt++ {
+		if s.OnRetry != nil {
+			s.OnRetry(attempt, maxRetries, err)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		text, err = s.transcribeOnce(ctx, wav)
+	}
+	return text, err
+}
+
+func (s STT) transcribeOnce(ctx context.Context, wav []byte) (string, error) {
 	var body bytes.Buffer
 	mw := multipart.NewWriter(&body)
 	fw, err := mw.CreateFormFile("file", "voice.wav")
@@ -71,7 +114,14 @@ func (s STT) Transcribe(ctx context.Context, wav []byte) (string, error) {
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("requête STT : %w", err)
+		err = fmt.Errorf("requête STT : %w", err)
+		if ctx.Err() == nil {
+			var ne net.Error
+			if !errors.As(err, &ne) || !ne.Timeout() {
+				return "", errRetryable{err}
+			}
+		}
+		return "", err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -79,7 +129,11 @@ func (s STT) Transcribe(ctx context.Context, wav []byte) (string, error) {
 		return "", fmt.Errorf("lecture de la réponse STT : %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("STT : statut %d : %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		err := fmt.Errorf("STT : statut %d : %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		if resp.StatusCode >= 500 {
+			return "", errRetryable{err}
+		}
+		return "", err
 	}
 	var parsed struct {
 		Text string `json:"text"`

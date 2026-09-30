@@ -238,3 +238,34 @@ func TestSessionEndToEnd(t *testing.T) {
 		t.Errorf("commande inconnue : %q", resp)
 	}
 }
+
+// Unsloth Studio répond 500 le temps de relancer le modèle de dictée
+// déchargé : la requête est rejouée, une erreur 4xx ne l'est pas.
+func TestSTTRetriesServerErrors(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		switch {
+		case r.FormValue("model") == "absent":
+			http.Error(w, `{"error":"not downloaded"}`, http.StatusConflict)
+		case calls < 3:
+			http.Error(w, `{"error":{"message":"Could not reach an upstream service."}}`, http.StatusInternalServerError)
+		default:
+			w.Write([]byte(`{"text":"ok"}`))
+		}
+	}))
+	defer srv.Close()
+
+	var retries []int
+	s := STT{BaseURL: srv.URL, RetryBackoff: time.Millisecond, OnRetry: func(a, max int, err error) { retries = append(retries, a) }}
+	text, err := s.Transcribe(context.Background(), encodeWAV(nil))
+	if err != nil || text != "ok" || calls != 3 || len(retries) != 2 {
+		t.Fatalf("text=%q err=%v calls=%d retries=%v", text, err, calls, retries)
+	}
+
+	calls = 0
+	s.Model = "absent"
+	if _, err := s.Transcribe(context.Background(), encodeWAV(nil)); err == nil || calls != 1 {
+		t.Errorf("4xx rejouée : calls=%d err=%v", calls, err)
+	}
+}

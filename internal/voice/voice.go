@@ -185,7 +185,11 @@ func (s *Session) run(stop <-chan struct{}) {
 	}
 	sound("complete")
 	s.notif.show("bot : transcription…", "", true, false)
-	text, err := s.cfg.STT.Transcribe(s.ctx, encodeWAV(pcm))
+	stt := s.cfg.STT
+	stt.OnRetry = func(attempt, max int, err error) {
+		s.notif.show("bot : transcription…", fmt.Sprintf("Serveur indisponible, nouvel essai (%d/%d)…", attempt, max), true, false)
+	}
+	text, err := stt.Transcribe(s.ctx, encodeWAV(pcm))
 	s.setState(stateIdle)
 	if err != nil {
 		if s.ctx.Err() == nil {
