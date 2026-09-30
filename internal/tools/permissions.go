@@ -20,6 +20,7 @@ import (
 var (
 	sandboxReady     = sandbox.Ready
 	sandboxCanAccess = sandbox.CanAccess
+	sandboxGrant     = sandbox.GrantDirectory
 )
 
 // DirGrantFunc demande à un humain l'autorisation d'accéder au répertoire
@@ -349,7 +350,8 @@ func checkExistingFile(abs string, write bool) error {
 
 // RequestAccess est le seul moyen d'ajouter un répertoire à la liste
 // autorisée après le démarrage. Si le répertoire est déjà autorisé, retourne
-// true immédiatement. Sinon, sollicite le callback de confirmation (s'il y
+// true sans solliciter personne — après avoir réappliqué les droits du
+// groupe sandbox sur son contenu (voir resyncGranted). Sinon, sollicite le callback de confirmation (s'il y
 // en a un) ; toute demande sans callback disponible (mode mail) est
 // automatiquement refusée, sans jamais toucher à la liste ni au fichier
 // partagé.
@@ -360,6 +362,9 @@ func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) 
 	}
 
 	if p.checkAccess(abs, false) {
+		if err := resyncGranted(abs); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
 
@@ -423,6 +428,31 @@ func (p *DirPermissions) RequestAccess(ctx context.Context, dir, reason string) 
 	}
 
 	return true, nil
+}
+
+// resyncGranted réapplique sandbox.GrantDirectory (groupe sandbox + g+rw
+// récursif) sur un répertoire DÉJÀ autorisé : l'accès au répertoire lui-même
+// peut être intact alors que des fichiers ajoutés depuis hors du harnais (ou
+// recréés en 0644 par un outil) ne sont plus accessibles au compte sandbox en
+// lecture/écriture. Le modèle redemande alors l'accès pour réparer — sans
+// ce resync, il obtiendrait "accès accordé" sans que rien ne change.
+//
+// Sans effet hors sandbox, pour un répertoire inexistant, protégé, trop
+// large (voir checkNotTooBroad — ex: /tmp, accessible via AlwaysAllow mais
+// qu'on ne veut jamais parcourir en entier) ou appartenant à un autre
+// utilisateur (GrantDirectory y échouerait à coup sûr, voir
+// dirOwnedByOther).
+func resyncGranted(abs string) error {
+	if !sandboxReady() || checkNotProtected(abs) != nil || checkNotTooBroad(abs) != nil || dirOwnedByOther(abs) {
+		return nil
+	}
+	if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+		return nil
+	}
+	if err := sandboxGrant(abs); err != nil {
+		return fmt.Errorf("répertoire %q déjà autorisé, mais la réapplication des droits du groupe %q a échoué : %w", abs, sandbox.Group, err)
+	}
+	return nil
 }
 
 // tooBroadDirs : répertoires système jamais accordables tels quels (voir

@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ConfigFilePath ne doit jamais dépendre du répertoire courant : c'est
@@ -63,5 +65,26 @@ func TestEnsureConfigFileCreatesWithDefaultContentOnlyIfAbsent(t *testing.T) {
 	}
 	if string(got) != "REEL=vrai_reglage\n" {
 		t.Fatalf("le fichier existant a été écrasé : %q", got)
+	}
+}
+
+func TestVoiceConfigDefaultsAndOverrides(t *testing.T) {
+	for _, k := range []string{"VOICE_SILENCE_STOP", "VOICE_RECORD_CMD", "VOICE_ENABLED"} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+	c := Load()
+	if c.VoiceEnabled || c.VoiceSilenceStop != 2*time.Second || len(c.VoiceRecordCmd) != 0 {
+		t.Errorf("défauts : enabled=%v silence=%v cmd=%v", c.VoiceEnabled, c.VoiceSilenceStop, c.VoiceRecordCmd)
+	}
+
+	t.Setenv("VOICE_SILENCE_STOP", "0")
+	t.Setenv("VOICE_RECORD_CMD", "arecord -q -t raw")
+	c = Load()
+	if c.VoiceSilenceStop != 0 {
+		t.Errorf("silence = %v", c.VoiceSilenceStop)
+	}
+	if strings.Join(c.VoiceRecordCmd, "|") != "arecord|-q|-t|raw" {
+		t.Errorf("cmd = %v", c.VoiceRecordCmd)
 	}
 }

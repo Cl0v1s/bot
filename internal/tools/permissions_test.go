@@ -317,3 +317,80 @@ func TestWithPersistenceRefusesSymlinkedFile(t *testing.T) {
 		t.Fatal("attendu une erreur pour un fichier de persistance en lien symbolique")
 	}
 }
+
+// withSandboxGrant remplace sandbox.GrantDirectory pour la durée du test, et
+// retourne la liste des répertoires sur lesquels il a été appelé.
+func withSandboxGrant(t *testing.T, err error) *[]string {
+	t.Helper()
+	var calls []string
+	prev := sandboxGrant
+	sandboxGrant = func(dir string) error {
+		calls = append(calls, dir)
+		return err
+	}
+	t.Cleanup(func() { sandboxGrant = prev })
+	return &calls
+}
+
+// Un répertoire déjà autorisé redemandé via request_directory_access : pas
+// de nouvelle confirmation, mais les droits du groupe sandbox sont
+// réappliqués (fichiers ajoutés depuis sans g+rw).
+func TestRequestAccessResyncsAlreadyGrantedDirectory(t *testing.T) {
+	withSandboxReady(t, true)
+	dir := canonicalTempDir(t)
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	sandboxCanAccess = func(path string, write bool) bool { return path == dir }
+	calls := withSandboxGrant(t, nil)
+
+	perms := NewDirPermissions(func(ctx context.Context, abs, reason string) (bool, error) {
+		t.Fatal("aucune confirmation attendue pour un répertoire déjà autorisé")
+		return false, nil
+	})
+	ok, err := perms.RequestAccess(context.Background(), dir, "")
+	if err != nil || !ok {
+		t.Fatalf("RequestAccess: ok=%v err=%v", ok, err)
+	}
+	if len(*calls) != 1 || (*calls)[0] != dir {
+		t.Fatalf("GrantDirectory appelé sur %v, attendu [%s]", *calls, dir)
+	}
+}
+
+// Un échec de la réapplication est remonté au modèle, pas masqué derrière
+// un "accès accordé".
+func TestRequestAccessReportsResyncFailure(t *testing.T) {
+	withSandboxReady(t, true)
+	dir := canonicalTempDir(t)
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	sandboxCanAccess = func(path string, write bool) bool { return path == dir }
+	withSandboxGrant(t, os.ErrPermission)
+
+	if ok, err := NewDirPermissions(nil).RequestAccess(context.Background(), dir, ""); err == nil || ok {
+		t.Fatalf("attendu une erreur, reçu ok=%v err=%v", ok, err)
+	}
+}
+
+// Jamais de parcours récursif d'un répertoire trop large (ex: /tmp, toujours
+// accessible via AlwaysAllow), ni hors sandbox.
+func TestRequestAccessDoesNotResyncTooBroadOrUnsandboxed(t *testing.T) {
+	withSandboxReady(t, true)
+	prevCanAccess := sandboxCanAccess
+	t.Cleanup(func() { sandboxCanAccess = prevCanAccess })
+	sandboxCanAccess = func(path string, write bool) bool { return true }
+	calls := withSandboxGrant(t, nil)
+
+	if ok, err := NewDirPermissions(nil).RequestAccess(context.Background(), "/tmp", ""); err != nil || !ok {
+		t.Fatalf("RequestAccess(/tmp): ok=%v err=%v", ok, err)
+	}
+	withSandboxReady(t, false)
+	perms := NewDirPermissions(nil)
+	dir := canonicalTempDir(t)
+	perms.AlwaysAllow(dir)
+	if ok, err := perms.RequestAccess(context.Background(), dir, ""); err != nil || !ok {
+		t.Fatalf("RequestAccess hors sandbox: ok=%v err=%v", ok, err)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("GrantDirectory ne doit pas être appelé, appelé sur %v", *calls)
+	}
+}

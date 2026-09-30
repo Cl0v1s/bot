@@ -94,6 +94,14 @@ type Client struct {
 	// part en boucle dans son raisonnement peut alors générer pendant des
 	// dizaines de minutes avant de rendre la main.
 	MaxTokens int
+
+	// MaxRetries / RetryBackoff : relances automatiques d'une requête après
+	// une erreur transitoire — connexion au serveur impossible ou coupée,
+	// flux interrompu en cours de génération (EOF inattendu), status
+	// 502/503/504 — et délai avant la première, doublé ensuite (voir
+	// withRetry). MaxRetries = 0 désactive les relances.
+	MaxRetries   int
+	RetryBackoff time.Duration
 }
 
 // DefaultTimeout : durée maximale d'une requête complète au LLM (voir
@@ -111,6 +119,8 @@ func New(baseURL, apiKey, model string) *Client {
 		HTTPClient: &http.Client{
 			Timeout: DefaultTimeout,
 		},
+		MaxRetries:   DefaultMaxRetries,
+		RetryBackoff: DefaultRetryBackoff,
 	}
 }
 
@@ -210,8 +220,15 @@ func (c *Client) tryLoadModel(ctx context.Context) error {
 // tools proposés) et retourne le message assistant complet (non-streamé,
 // avec ses éventuels tool_calls) ainsi que l'usage de tokens — avec une
 // tentative de chargement automatique du modèle puis une seule relance si le
-// serveur répond "aucun modèle chargé" (voir modelNotLoadedSubstring).
+// serveur répond "aucun modèle chargé" (voir modelNotLoadedSubstring), et
+// des relances automatiques sur erreur transitoire (voir withRetry).
 func (c *Client) ChatCompletion(ctx context.Context, messages []Message, tools []Tool) (Message, Usage, error) {
+	return c.withRetry(ctx, func() (Message, Usage, error) {
+		return c.chatCompletionWithAutoLoad(ctx, messages, tools)
+	})
+}
+
+func (c *Client) chatCompletionWithAutoLoad(ctx context.Context, messages []Message, tools []Tool) (Message, Usage, error) {
 	msg, usage, err := c.chatCompletionOnce(ctx, messages, tools)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), modelNotLoadedSubstring) {
 		if loadErr := c.tryLoadModel(ctx); loadErr == nil {
@@ -257,6 +274,9 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
+	if isUnavailableStatus(resp.StatusCode) {
+		return Message{}, Usage{}, &statusError{status: resp.StatusCode, body: string(body)}
+	}
 
 	var parsed chatResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -266,7 +286,7 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 		return Message{}, Usage{}, fmt.Errorf("erreur LLM: %s", parsed.Error.Message)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Message{}, Usage{}, fmt.Errorf("LLM a répondu avec le status %d: %s", resp.StatusCode, string(body))
+		return Message{}, Usage{}, &statusError{status: resp.StatusCode, body: string(body)}
 	}
 	if len(parsed.Choices) == 0 {
 		return Message{}, Usage{}, fmt.Errorf("réponse LLM sans choix: %s", string(body))
@@ -303,13 +323,20 @@ type StreamCallbacks struct {
 // ChatCompletion (voir modelNotLoadedSubstring) si le serveur répond "aucun
 // modèle chargé".
 //
-// Si le premier essai a déjà appelé cb avant d'échouer (peu probable pour
-// cette erreur précise, qui survient avant tout token produit, mais pas
-// structurellement impossible), la relance rappelle cb depuis le début : un
-// affichage direct sur la sortie (comme le fait le mode chat) montrerait
-// alors un double texte partiel — cas non observé en pratique pour cette
-// erreur précise, donc pas traité spécifiquement ici.
+// Les erreurs transitoires (connexion impossible ou coupée, flux interrompu
+// en pleine génération, status 502/503/504) sont elles aussi relancées
+// (voir withRetry). La génération interrompue ne pouvant pas être reprise
+// là où elle s'était arrêtée, une relance rappelle cb depuis le début de la
+// nouvelle réponse : l'appelant qui affiche les fragments au fil de l'eau
+// est prévenu avant chaque relance via WithRetryNotifier, pour pouvoir
+// signaler que le texte partiel déjà affiché est abandonné.
 func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, tools []Tool, cb StreamCallbacks) (Message, Usage, error) {
+	return c.withRetry(ctx, func() (Message, Usage, error) {
+		return c.chatCompletionStreamWithAutoLoad(ctx, messages, tools, cb)
+	})
+}
+
+func (c *Client) chatCompletionStreamWithAutoLoad(ctx context.Context, messages []Message, tools []Tool, cb StreamCallbacks) (Message, Usage, error) {
 	msg, usage, err := c.chatCompletionStreamOnce(ctx, messages, tools, cb)
 	if err != nil && strings.Contains(strings.ToLower(err.Error()), modelNotLoadedSubstring) {
 		if loadErr := c.tryLoadModel(ctx); loadErr == nil {
@@ -365,13 +392,14 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return Message{}, Usage{}, fmt.Errorf("LLM a répondu avec le status %d: %s", resp.StatusCode, string(body))
+		return Message{}, Usage{}, &statusError{status: resp.StatusCode, body: string(body)}
 	}
 
 	var content, reasoning strings.Builder
 	var toolCalls []ToolCall
 	var finishReason string
 	var usage Usage
+	done := false
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -381,6 +409,7 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			done = true
 			break
 		}
 		if data == "" {
@@ -457,6 +486,9 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 	}
 	if err := scanner.Err(); err != nil {
 		return msg, usage, err
+	}
+	if !done && finishReason == "" {
+		return msg, usage, errStreamTruncated
 	}
 	return msg, usage, nil
 }

@@ -18,7 +18,7 @@ type RequestDirectoryAccessTool struct {
 func (t *RequestDirectoryAccessTool) Name() string { return "request_directory_access" }
 
 func (t *RequestDirectoryAccessTool) Description() string {
-	return "Demande à l'utilisateur la permission d'accéder (lecture/écriture) à un répertoire local. Obligatoire avant tout read_file/write_file sur un répertoire pas encore autorisé : ces outils échoueront sinon."
+	return "Demande à l'utilisateur la permission d'accéder (lecture/écriture) à un répertoire local. Obligatoire avant tout read_file/write_file sur un répertoire pas encore autorisé : ces outils échoueront sinon. Sur un répertoire déjà autorisé, réapplique sans nouvelle confirmation les droits de lecture/écriture sur tout son contenu : à rappeler si un fichier de ce répertoire est refusé alors que le répertoire est autorisé."
 }
 
 func (t *RequestDirectoryAccessTool) ParametersSchema() json.RawMessage {

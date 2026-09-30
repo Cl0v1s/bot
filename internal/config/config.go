@@ -30,6 +30,11 @@ type Config struct {
 	// llm.Client.MaxTokens). 0 = aucune limite transmise (le serveur
 	// applique la sienne).
 	LLMMaxTokens int
+	// LLMMaxRetries : nombre de relances automatiques d'une requête au LLM
+	// après une erreur transitoire (connexion impossible ou coupée, flux
+	// interrompu, status 502/503/504 — voir llm.Client.MaxRetries). 0 =
+	// aucune relance.
+	LLMMaxRetries int
 
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
@@ -139,6 +144,19 @@ type Config struct {
 	// request_directory_access. Défaut : "bot-workspace" dans le dossier
 	// personnel de l'utilisateur courant.
 	WorkspaceDir string
+
+	// Voice* / STT* : commande vocale du mode chat (voir internal/voice).
+	// VoiceRecordCmd : commande de capture qui écrit du PCM s16 mono 16 kHz
+	// brut sur sa sortie standard ; vide = pw-record. La transcription passe
+	// toujours par le serveur du LLM (LLMBaseURL/LLMAPIKey) : Unsloth Studio
+	// sert aussi /v1/audio/transcriptions.
+	VoiceEnabled          bool
+	VoiceRecordCmd        []string
+	VoiceMaxDuration      time.Duration
+	VoiceSilenceStop      time.Duration
+	VoiceSilenceThreshold float64
+	STTModel              string
+	STTLanguage           string
 }
 
 // SkillsDir retourne le sous-répertoire "skills" du workspace, où les
@@ -344,6 +362,11 @@ func Load() Config {
 		llmMaxTokens = 8192
 	}
 
+	llmMaxRetries, err := strconv.Atoi(getenv("LLM_MAX_RETRIES", "5"))
+	if err != nil || llmMaxRetries < 0 {
+		llmMaxRetries = 5
+	}
+
 	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.95"), 64)
 	if err != nil || contextCompactAt <= 0 || contextCompactAt > 1 {
 		contextCompactAt = 0.95
@@ -410,14 +433,28 @@ func Load() Config {
 	if err != nil || agentRealUserWindow <= 0 {
 		agentRealUserWindow = 5 * time.Minute
 	}
+	voiceMaxDuration, err := time.ParseDuration(getenv("VOICE_MAX_DURATION", "60s"))
+	if err != nil || voiceMaxDuration <= 0 {
+		voiceMaxDuration = 60 * time.Second
+	}
+	// 0 est valide (désactive l'arrêt sur silence).
+	voiceSilenceStop, err := time.ParseDuration(getenv("VOICE_SILENCE_STOP", "2s"))
+	if err != nil || voiceSilenceStop < 0 {
+		voiceSilenceStop = 2 * time.Second
+	}
+	voiceSilenceThreshold, err := strconv.ParseFloat(getenv("VOICE_SILENCE_THRESHOLD", "500"), 64)
+	if err != nil || voiceSilenceThreshold < 0 {
+		voiceSilenceThreshold = 500
+	}
 
 	return Config{
-		LLMBaseURL:   getenv("LLM_BASE_URL", "http://localhost:8080/v1"),
-		LLMAPIKey:    getenvAllowEmpty("LLM_API_KEY", "sk-local"),
-		LLMModel:     getenv("LLM_MODEL", "local-model"),
-		SystemPrompt: getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
-		LLMTimeout:   llmTimeout,
-		LLMMaxTokens: llmMaxTokens,
+		LLMBaseURL:    getenv("LLM_BASE_URL", "http://localhost:8080/v1"),
+		LLMAPIKey:     getenvAllowEmpty("LLM_API_KEY", "sk-local"),
+		LLMModel:      getenv("LLM_MODEL", "local-model"),
+		SystemPrompt:  getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
+		LLMTimeout:    llmTimeout,
+		LLMMaxTokens:  llmMaxTokens,
+		LLMMaxRetries: llmMaxRetries,
 
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,
@@ -463,6 +500,14 @@ func Load() Config {
 		AgentRealUserWindow:              agentRealUserWindow,
 
 		WorkspaceDir: getenv("WORKSPACE_DIR", defaultWorkspaceDir()),
+
+		VoiceEnabled:          getenvBool("VOICE_ENABLED", false),
+		VoiceRecordCmd:        strings.Fields(getenv("VOICE_RECORD_CMD", "")),
+		VoiceMaxDuration:      voiceMaxDuration,
+		VoiceSilenceStop:      voiceSilenceStop,
+		VoiceSilenceThreshold: voiceSilenceThreshold,
+		STTModel:              getenv("STT_MODEL", "qwen3-asr-0.6b"),
+		STTLanguage:           getenv("STT_LANGUAGE", "fr"),
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"bot/internal/skills"
 	"bot/internal/smtpclient"
 	"bot/internal/tools"
+	"bot/internal/voice"
 )
 
 // defaultEnvContent : contenu du fichier de config créé au tout premier
@@ -51,6 +52,11 @@ func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
+	}
+	// Client du socket de contrôle vocal : doit répondre instantanément
+	// (lancé par un raccourci clavier), donc avant tout le reste.
+	if os.Args[1] == "voice" {
+		os.Exit(runVoiceCommand(os.Args[2:]))
 	}
 
 	// Le workspace (et son sous-répertoire skills/) est créé au démarrage et
@@ -100,6 +106,7 @@ func main() {
 	client.HTTPClient.Timeout = cfg.LLMTimeout
 	client.ContextTokens = cfg.ContextMaxTokens
 	client.MaxTokens = cfg.LLMMaxTokens
+	client.MaxRetries = cfg.LLMMaxRetries
 
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
 	// lancé : sinon, lancer le programme depuis un dossier différent d'une
@@ -133,6 +140,21 @@ func main() {
 			RealUserWindow:              cfg.AgentRealUserWindow,
 			WorkspaceDir:                cfg.WorkspaceDir,
 			SandboxSSHKey:               cfg.SandboxSSHKey,
+			Voice: voice.Config{
+				Enabled: cfg.VoiceEnabled,
+				Recorder: voice.Recorder{
+					Cmd:              cfg.VoiceRecordCmd,
+					MaxDuration:      cfg.VoiceMaxDuration,
+					SilenceStop:      cfg.VoiceSilenceStop,
+					SilenceThreshold: cfg.VoiceSilenceThreshold,
+				},
+				STT: voice.STT{
+					BaseURL:  cfg.LLMBaseURL,
+					APIKey:   cfg.LLMAPIKey,
+					Model:    cfg.STTModel,
+					Language: cfg.STTLanguage,
+				},
+			},
 		}
 		// Pas de contexte dérivé d'un signal ici : chat.Run gère lui-même
 		// Ctrl+C/SIGTERM (annulation de la requête en cours si une requête
@@ -299,9 +321,34 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: bot <chat|mail>")
-	fmt.Fprintln(os.Stderr, "  chat  démarre une session interactive dans la console")
-	fmt.Fprintln(os.Stderr, "  mail  démarre la boucle de lecture/réponse automatique aux mails")
+	fmt.Fprintln(os.Stderr, "usage: bot <chat|mail|voice>")
+	fmt.Fprintln(os.Stderr, "  chat   démarre une session interactive dans la console")
+	fmt.Fprintln(os.Stderr, "  mail   démarre la boucle de lecture/réponse automatique aux mails")
+	fmt.Fprintln(os.Stderr, "  voice [toggle|start|stop|cancel|status]")
+	fmt.Fprintln(os.Stderr, "         pilote la commande vocale de la session chat en cours (VOICE_ENABLED=true)")
+}
+
+// runVoiceCommand envoie une commande à la session chat qui écoute la
+// commande vocale et retourne le code de sortie. Sans session à l'écoute,
+// l'erreur est aussi notifiée : lancé depuis un raccourci clavier, il n'y a
+// pas de terminal pour la voir.
+func runVoiceCommand(args []string) int {
+	cmd := "toggle"
+	if len(args) > 0 {
+		cmd = args[0]
+	}
+	resp, err := voice.Send(voice.SocketPath(), cmd)
+	if err != nil {
+		msg := "Aucune session `bot chat` n'écoute la commande vocale (VOICE_ENABLED=true ?)."
+		fmt.Fprintf(os.Stderr, "%s (%v)\n", msg, err)
+		_ = exec.Command("notify-send", "-a", "bot", "-e", "--", "bot : voix indisponible", msg).Run()
+		return 1
+	}
+	fmt.Println(resp)
+	if strings.HasPrefix(resp, "err") {
+		return 1
+	}
+	return 0
 }
 
 // ensureMemoryFile crée path (MEMORY.md du workspace) avec un en-tête

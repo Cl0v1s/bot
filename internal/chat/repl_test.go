@@ -272,3 +272,17 @@ func TestRun_QueuedCommandSplitsMerge(t *testing.T) {
 		t.Fatalf("messages envoyés = %q, attendu %q", got, want)
 	}
 }
+
+// Les transcriptions vocales arrivent avec majuscule et ponctuation.
+func TestIsYes(t *testing.T) {
+	for _, s := range []string{"o", "Oui.", " oui ! ", "Ouais", "yes", "Y"} {
+		if !isYes(s) {
+			t.Errorf("isYes(%q) = false", s)
+		}
+	}
+	for _, s := range []string{"", "non", "Non.", "oui mais non", "n", "peut-être"} {
+		if isYes(s) {
+			t.Errorf("isYes(%q) = true", s)
+		}
+	}
+}

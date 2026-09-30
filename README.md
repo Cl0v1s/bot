@@ -35,6 +35,8 @@ Les réponses du modèle sont **streamées** en mode chat, y compris quand des o
 
 `LLM_MAX_TOKENS` (8192 par défaut, raisonnement compris ; 0 = ne rien transmettre) borne la longueur de chaque réponse (`max_tokens`). Sans cette limite, certains serveurs (llama.cpp via Unsloth Studio, vu en pratique) autorisent une génération jusqu'à remplir toute la fenêtre de contexte : un modèle parti en boucle dans son raisonnement peut alors bloquer un tour pendant des dizaines de minutes. Une réponse coupée par cette limite (`finish_reason: "length"`) est signalée par un avertissement, et ses éventuels appels d'outils (probablement tronqués) ne sont **pas** exécutés.
 
+`LLM_MAX_RETRIES` (5 par défaut ; 0 = désactivé) : en cas d'erreur transitoire — serveur injoignable ou redémarré, connexion réinitialisée, flux coupé en pleine réponse (`unexpected EOF`), status 502/503/504 —, la requête en cours est automatiquement rejouée avec un délai croissant (1 s, 2 s, 4 s…, plafonné à 30 s), avec un avertissement à chaque reprise. La génération interrompue ne pouvant pas être poursuivie là où elle s'était arrêtée, la réponse partielle déjà affichée est abandonnée et la réponse repart de zéro. Un dépassement de `LLM_TIMEOUT` n'est pas relancé.
+
 ## Gestion du contexte
 
 La taille du contexte est estimée grossièrement (~4 caractères/token). Quand elle atteint la fraction `CONTEXT_COMPACT_AT` (0.95 par défaut) de `LLM_CONTEXT_TOKENS`, les messages les plus anciens sont résumés en un seul message via un appel au LLM (avec un vrai résumé structuré — voir plus bas pourquoi le format de cet appel est particulier), en conservant tels quels les `CONTEXT_KEEP_LAST` derniers messages. Cet appel de résumé ne propose aucun outil au modèle (il ne doit produire que du texte) : une réponse vide ou invalide (ex: un appel d'outil échappé en texte) fait échouer la compaction plutôt que de remplacer l'historique par un résumé creux — elle sera retentée au tour suivant (une seule fois par tour), sans jamais bloquer la réponse.
@@ -140,6 +142,24 @@ Instructions détaillées pour le modèle, exemples, étapes à suivre...
 ```
 
 Au démarrage, seuls le nom et la description de chaque skill trouvée sont ajoutés au prompt système (avec le chemin du fichier) : le corps complet n'est lu par le modèle que s'il appelle `read_file` sur ce chemin, pour ne pas saturer le contexte avec des skills non pertinentes à la conversation en cours.
+
+## Commande vocale (mode chat)
+
+Parler au bot sans avoir le focus sur le terminal, tout en local. Avec `VOICE_ENABLED=true`, `bot chat` écoute sur un socket unix (`$XDG_RUNTIME_DIR/bot-voice.sock`) les commandes envoyées par `bot voice [toggle|start|stop|cancel|status]`.
+
+Déroulé :
+1. Un appui sur le raccourci démarre l'enregistrement du micro (`pw-record`).
+2. L'enregistrement s'arrête au second appui, ou tout seul après `VOICE_SILENCE_STOP` de silence.
+3. L'audio est transcrit par un serveur STT local au format OpenAI (`POST /audio/transcriptions`).
+4. Le texte est traité **exactement comme une ligne tapée** : message de chat (mis en file si un tour est en cours), commande `/…`, ou réponse à une confirmation en attente. On peut donc répondre « oui » ou « non » à voix haute ; la question s'affiche aussi en notification.
+
+L'état (écoute, transcription, texte envoyé, erreurs) s'affiche en notifications de bureau (`notify-send`). Les réponses du modèle restent écrites dans le terminal (pas de synthèse vocale).
+
+**Serveur STT.** La transcription passe par le même serveur que le LLM (`LLM_BASE_URL`, `LLM_API_KEY`) : Unsloth Studio sert `/v1/audio/transcriptions` avec un modèle de dictée chargé à côté du modèle de chat, sans l'évincer. Le modèle (`STT_MODEL`, `qwen3-asr-0.6b` par défaut ; aussi `qwen3-asr-1.7b` ou les Whisper `tiny` … `large-v3`) est à télécharger une fois dans Unsloth Studio, Paramètres → Voix (il n'est pas dans le Model Hub).
+
+**Raccourci global (GNOME).** Paramètres → Clavier → Raccourcis clavier → Raccourcis personnalisés : commande `/chemin/vers/bot voice toggle`, touche au choix (ex. Super+Espace). Le processus lancé par le raccourci doit trouver le même `$XDG_RUNTIME_DIR` que `bot chat`, ce qui est le cas dans une même session de bureau.
+
+Si l'écoute ne s'arrête jamais seule, ou si le bot répond « rien entendu », ajuster `VOICE_SILENCE_THRESHOLD` (niveau RMS du silence).
 
 ## Limites connues
 

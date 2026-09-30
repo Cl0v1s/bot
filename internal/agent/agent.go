@@ -204,6 +204,13 @@ func shellCallFailed(result string, callErr error) bool {
 		strings.Contains(result, "[commande interrompue après")
 }
 
+// RetryWarning : texte d'avertissement affiché avant une relance
+// automatique de la requête au LLM après une erreur transitoire (voir
+// llm.WithRetryNotifier) — partagé avec le mode chat sans outils.
+func RetryWarning(attempt, max int, err error) string {
+	return fmt.Sprintf("échec de la requête au LLM (%v) : reprise de la requête en cours (%d/%d), la réponse partielle éventuelle est abandonnée", err, attempt, max)
+}
+
 // truncatedPlaceholder : contenu enregistré dans l'historique à la place
 // d'une réponse coupée par max_tokens avant d'avoir produit le moindre texte
 // (tout le budget passé en raisonnement) — un message assistant vide
@@ -228,6 +235,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		maxSteps = defaultMaxSteps
 	}
 	specs := registry.Specs()
+	if onEvent != nil {
+		ctx = llm.WithRetryNotifier(ctx, func(attempt, max int, err error) {
+			onEvent(Event{Kind: EventWarning, Result: RetryWarning(attempt, max, err)})
+		})
+	}
 
 	complete := func() (llm.Message, llm.Usage, error) {
 		if !stream {

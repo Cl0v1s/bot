@@ -11,12 +11,14 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"unicode"
 
 	"bot/internal/agent"
 	"bot/internal/convo"
 	"bot/internal/llm"
 	"bot/internal/sandbox"
 	"bot/internal/tools"
+	"bot/internal/voice"
 )
 
 // ToolsConfig paramètre les tools disponibles en mode chat.
@@ -70,6 +72,9 @@ type ToolsConfig struct {
 	// puisse s'authentifier sur un dépôt distant — voir
 	// config.SandboxSSHKey et sandbox.EnsureSSHKeyAccess. "" = désactivé.
 	SandboxSSHKey string
+	// Voice : commande vocale (voir internal/voice). Les transcriptions sont
+	// traitées exactement comme des lignes tapées au clavier.
+	Voice voice.Config
 }
 
 // chatLine est le résultat d'une lecture de ligne au clavier, transmis par
@@ -184,13 +189,20 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// bloquante de term.Ask() ne s'en aperçoit jamais) — on resterait
 	// bloqué là jusqu'à ce qu'une réponse soit tapée, sans aucun moyen de
 	// s'en sortir au clavier.
-	askYesNo := func(ctx context.Context, prompt string) bool {
+	//
+	// detail résume la demande pour la notification de bureau envoyée quand
+	// la commande vocale est active (voiceSess) : on peut alors parler au bot
+	// sans regarder le terminal, où s'affiche le détail complet.
+	var voiceSess *voice.Session
+	askYesNo := func(ctx context.Context, detail, prompt string) bool {
 		fmt.Fprint(out, color(ansiMagenta, prompt))
 		ch := term.Ask()
+		if voiceSess != nil {
+			voiceSess.AskNotify(detail)
+		}
 		select {
 		case line := <-ch:
-			answer := strings.ToLower(strings.TrimSpace(line))
-			return answer == "o" || answer == "oui" || answer == "y" || answer == "yes"
+			return isYes(line)
 		case <-ctx.Done():
 			term.Cancel(ch)
 			fmt.Fprintln(out, color(ansiYellow, "\n[demande annulée (Ctrl+C)]"))
@@ -231,7 +243,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		} else {
 			fmt.Fprintln(out, color(ansiMagenta, "  (autorisation ponctuelle : uniquement pour cette commande)"))
 		}
-		if !askYesNo(ctx, "  autoriser ? [o/N] ") {
+		if !askYesNo(ctx, "Commande sous l'identité réelle : "+command, "  autoriser ? [o/N] ") {
 			return false, nil
 		}
 		if window {
@@ -247,7 +259,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		for _, line := range strings.Split(prompt, "\n") {
 			fmt.Fprintln(out, color(ansiMagenta, "  "+line))
 		}
-		return askYesNo(ctx, "  autoriser ? [o/N] "), nil
+		return askYesNo(ctx, fmt.Sprintf("Lancer Claude Code dans %s : %s", workDir, prompt), "  autoriser ? [o/N] "), nil
 	}
 
 	var registry *tools.Registry
@@ -259,7 +271,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		shellAvailable := !toolsCfg.SandboxUserEnabled
 		sandboxReady := false
 		if toolsCfg.SandboxUserEnabled {
-			if err := sandbox.Ensure(out, func(prompt string) bool { return askYesNo(ctx, prompt) }); err != nil {
+			if err := sandbox.Ensure(out, func(prompt string) bool { return askYesNo(ctx, "Mise en place du sandbox", prompt) }); err != nil {
 				fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] indisponible, run_shell ne sera pas proposé cette session : %v", err)))
 			} else {
 				sandboxReady = true
@@ -272,7 +284,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			if reason != "" {
 				fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  raison : %s", reason)))
 			}
-			if !askYesNo(ctx, "  autoriser ? [o/N] ") {
+			if !askYesNo(ctx, "Accès au répertoire "+dir, "  autoriser ? [o/N] ") {
 				return false, nil
 			}
 			if sandboxReady {
@@ -539,7 +551,16 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				errorLine("[avertissement: contexte encore trop grand après compaction : %d message(s) le plus ancien(s) supprimé(s) sans résumé]", dropped)
 			}
 
-			msg, usage, err := client.ChatCompletionStream(reqCtx, conv.Full(), nil, llm.StreamCallbacks{OnContent: onContent, OnReasoning: onReasoning})
+			// Même signalement des relances automatiques que agent.Run
+			// (EventWarning) : le texte partiel déjà affiché va être suivi
+			// d'une nouvelle réponse complète.
+			streamCtx := llm.WithRetryNotifier(reqCtx, func(attempt, max int, err error) {
+				clearThinking()
+				endStream()
+				fmt.Fprint(out, color(ansiYellow, agent.Event{Kind: agent.EventWarning, Result: agent.RetryWarning(attempt, max, err)}.Format()))
+				streamed = streamAfterEvent
+			})
+			msg, usage, err := client.ChatCompletionStream(streamCtx, conv.Full(), nil, llm.StreamCallbacks{OnContent: onContent, OnReasoning: onReasoning})
 			clearThinking()
 			endStream()
 			if err != nil {
@@ -633,6 +654,39 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 		}
 	}()
+
+	// Commande vocale : chaque transcription suit le même chemin qu'une
+	// ligne tapée (réponse à une confirmation en attente, sinon message de
+	// chat ou commande, mis en file si un tour est en cours).
+	if toolsCfg.Voice.Enabled {
+		sess, err := voice.Start(ctx, toolsCfg.Voice)
+		if err != nil {
+			fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[voix] désactivée : %v", err)))
+		} else {
+			voiceSess = sess
+			defer sess.Close()
+			fmt.Fprintln(out, color(ansiCyan, "[voix] active : `bot voice toggle` (raccourci global) pour parler."))
+			go func() {
+				for {
+					select {
+					case text := <-sess.Transcripts():
+						fmt.Fprintln(out, color(ansiInput, "🎙 "+text))
+						if term.Dispatch(text) {
+							select {
+							case chatLinesCh <- chatLine{text: text}:
+							case <-sess.Done():
+								return
+							}
+						}
+					case err := <-sess.Errors():
+						fmt.Fprintln(out, color(ansiRed, "[voix] "+err.Error()))
+					case <-sess.Done():
+						return
+					}
+				}
+			}()
+		}
+	}
 
 	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique, /compact pour compacter maintenant.")
 	showPrompt()
@@ -734,6 +788,19 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 		}
 	}
+}
+
+// isYes indique si line répond oui à une confirmation. Tolérant à la
+// sortie d'une transcription vocale (« Oui. », « Ouais ! »).
+func isYes(line string) bool {
+	answer := strings.ToLower(strings.TrimFunc(line, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsPunct(r)
+	}))
+	switch answer {
+	case "o", "oui", "ouais", "y", "yes":
+		return true
+	}
+	return false
 }
 
 // isQueueCommand indique si line (déjà nettoyée des espaces) est une
