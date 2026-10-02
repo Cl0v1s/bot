@@ -120,6 +120,10 @@ func main() {
 		conv := convo.New(systemPrompt, cfg.ContextMaxTokens, cfg.ContextCompactAt, cfg.ContextKeepLastMsg)
 		conv.MemoryFile = cfg.MemoryFile()
 
+		var tts *voice.Speaker
+		if cfg.VoiceTTSEnabled && len(cfg.VoiceTTSCmd) > 0 {
+			tts = &voice.Speaker{Cmd: cfg.VoiceTTSCmd}
+		}
 		toolsCfg := chat.ToolsConfig{
 			Enabled:                     cfg.ChatToolsEnabled,
 			AllowedDirsFile:             allowedDirsFile,
@@ -156,6 +160,7 @@ func main() {
 					Engine:   cfg.STTEngine,
 					Device:   cfg.STTDevice,
 				},
+				TTS: tts,
 			},
 		}
 		// Pas de contexte dérivé d'un signal ici : chat.Run gère lui-même

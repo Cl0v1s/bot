@@ -84,6 +84,16 @@ type ToolsConfig struct {
 type chatLine struct {
 	text string
 	eof  bool
+	// voice : la ligne vient de la commande vocale (voir internal/voice) ;
+	// la réponse finale est alors lue à voix haute si la synthèse est active.
+	voice bool
+}
+
+// queuedLine est un message mis en file d'attente pendant un tour, avec
+// l'origine vocale de la ligne (voir chatLine.voice).
+type queuedLine struct {
+	text  string
+	voice bool
 }
 
 // Run lance une boucle de lecture-évaluation-affichage sur la console.
@@ -336,6 +346,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		toolList := []tools.Tool{
 			&tools.ReadFileTool{Perms: perms},
 			&tools.WriteFileTool{Perms: perms, Sandboxed: sandboxReady},
+			&tools.EditFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout, Perms: perms, Sandboxed: sandboxReady},
 			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady},
 			&tools.RequestDirectoryAccessTool{Perms: perms},
@@ -427,7 +438,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// recevoir des lignes tapées (mise en file d'attente, ou réponse à une
 	// confirmation demandée par un appel d'outil de ce tour). L'appelant
 	// doit s'assurer qu'aucun autre tour n'est déjà en cours.
-	dispatchTurn := func(line string) {
+	dispatchTurn := func(line string, spoken bool) {
+		// speak lit la réponse FINALE à voix haute, seulement pour un message
+		// dicté : ni le raisonnement ni les appels d'outils n'y passent.
+		speak := func(reply string) {
+			if spoken && voiceSess != nil {
+				voiceSess.Speak(reply)
+			}
+		}
 		go func() {
 			cancelled := false
 			defer func() { doneCh <- cancelled }()
@@ -503,7 +521,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 
 			if !registry.Empty() {
-				_, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, toolsCfg.MaxConsecutiveShellFailures, true, func(e agent.Event) {
+				reply, _, err := agent.Run(reqCtx, client, conv, registry, toolsCfg.MaxSteps, toolsCfg.MaxConsecutiveShellFailures, true, func(e agent.Event) {
 					switch e.Kind {
 					case agent.EventReasoningDelta:
 						onReasoning(e.Result)
@@ -534,6 +552,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 					reqErrorLine(err)
 					return
 				}
+				speak(reply)
 				return
 			}
 
@@ -578,6 +597,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 			conv.AddAssistant(reply)
 			conv.RecordUsage(usage)
+			speak(reply)
 		}()
 	}
 
@@ -619,7 +639,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// est une, sinon lance un tour via dispatchTurn. dispatched=true signale
 	// qu'un tour a été lancé (donc que la boucle principale ne doit pas
 	// réafficher le prompt tout de suite : il faut attendre doneCh).
-	dispatchOrHandle := func(line string) (dispatched, exit bool) {
+	dispatchOrHandle := func(line string, spoken bool) (dispatched, exit bool) {
 		if line == "/compact" {
 			dispatchCompact()
 			return true, false
@@ -627,7 +647,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		if handled, ex := runCommand(line); handled {
 			return false, ex
 		}
-		dispatchTurn(line)
+		dispatchTurn(line, spoken)
 		return true, false
 	}
 
@@ -666,6 +686,13 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			voiceSess = sess
 			defer sess.Close()
 			fmt.Fprintln(out, color(ansiCyan, "[voix] active : `bot voice toggle` (raccourci global) pour parler."))
+			if tts := toolsCfg.Voice.TTS; tts != nil {
+				if _, err := exec.LookPath(tts.Cmd[0]); err != nil {
+					fmt.Fprintln(out, color(ansiYellow, fmt.Sprintf("[voix] lecture des réponses indisponible : %q introuvable dans le PATH (voir VOICE_TTS_CMD)", tts.Cmd[0])))
+				} else {
+					fmt.Fprintln(out, color(ansiCyan, "[voix] les réponses aux messages dictés sont lues à voix haute (`bot voice stop` pour couper, VOICE_TTS_ENABLED=false pour désactiver)."))
+				}
+			}
 			go func() {
 				for {
 					select {
@@ -673,7 +700,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 						fmt.Fprintln(out, color(ansiInput, "🎙 "+text))
 						if term.Dispatch(text) {
 							select {
-							case chatLinesCh <- chatLine{text: text}:
+							case chatLinesCh <- chatLine{text: text, voice: true}:
 							case <-sess.Done():
 								return
 							}
@@ -691,7 +718,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique, /compact pour compacter maintenant.")
 	showPrompt()
 
-	var queue []string
+	var queue []queuedLine
 	busy := false
 	eofPending := false
 
@@ -716,11 +743,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				continue
 			}
 			if busy {
-				queue = append(queue, line)
+				queue = append(queue, queuedLine{text: line, voice: cl.voice})
 				fmt.Fprintln(out, color(ansiCyan, "  [mis en file d'attente, traité après la réponse en cours]"))
 				continue
 			}
-			dispatched, exit := dispatchOrHandle(line)
+			dispatched, exit := dispatchOrHandle(line, cl.voice)
 			if exit {
 				return nil
 			}
@@ -739,11 +766,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				// Une commande en file (/new, /compact, /exit...) est traitée
 				// seule, à sa place : fusionner des messages de part et
 				// d'autre d'un /new, par exemple, changerait le sens.
-				if isQueueCommand(queue[0]) {
+				if isQueueCommand(queue[0].text) {
 					next := queue[0]
 					queue = queue[1:]
-					fmt.Fprintln(out, color(ansiInput, "> "+next))
-					dispatched, exit := dispatchOrHandle(next)
+					fmt.Fprintln(out, color(ansiInput, "> "+next.text))
+					dispatched, exit := dispatchOrHandle(next.text, next.voice)
 					if exit {
 						return nil
 					}
@@ -758,7 +785,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				// des précisions ajoutées au fil de l'eau pendant la réponse
 				// précédente, que le modèle doit lire ensemble.
 				n := 1
-				for n < len(queue) && !isQueueCommand(queue[n]) {
+				for n < len(queue) && !isQueueCommand(queue[n].text) {
 					n++
 				}
 				batch := queue[:n]
@@ -767,13 +794,17 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				// défilement du terminal (le tour précédent a pu produire
 				// beaucoup de sortie) : on les rappelle au moment où leur
 				// traitement démarre (même couleur que la saisie).
-				for _, l := range batch {
-					fmt.Fprintln(out, color(ansiInput, "> "+l))
+				texts := make([]string, len(batch))
+				spoken := false
+				for i, l := range batch {
+					fmt.Fprintln(out, color(ansiInput, "> "+l.text))
+					texts[i] = l.text
+					spoken = spoken || l.voice
 				}
 				if n > 1 {
 					fmt.Fprintln(out, color(ansiCyan, fmt.Sprintf("  [%d messages en attente fusionnés en un seul envoi]", n)))
 				}
-				dispatchTurn(strings.Join(batch, "\n\n"))
+				dispatchTurn(strings.Join(texts, "\n\n"), spoken)
 				busy = true
 				break
 			}

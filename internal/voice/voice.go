@@ -23,6 +23,9 @@ type Config struct {
 	SocketPath string
 	Recorder   Recorder
 	STT        STT
+	// TTS : lit à voix haute les réponses aux messages dictés (voir
+	// Session.Speak). nil = pas de synthèse vocale.
+	TTS *Speaker
 }
 
 type state int
@@ -112,6 +115,22 @@ func (s *Session) AskNotify(question string) {
 	s.notif.show("bot : confirmation demandée", question+"\n\nRéponds « oui » ou « non » (raccourci vocal ou terminal).", false, true)
 }
 
+// Speak lit text à voix haute en tâche de fond (sans effet si la synthèse
+// vocale n'est pas configurée). Un échec est signalé sur Errors().
+func (s *Session) Speak(text string) {
+	if s.cfg.TTS == nil {
+		return
+	}
+	go func() {
+		if err := s.cfg.TTS.Speak(s.ctx, text); err != nil {
+			select {
+			case s.errs <- fmt.Errorf("synthèse vocale : %w", err):
+			default:
+			}
+		}
+	}()
+}
+
 func (s *Session) handle(cmd string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,11 +151,15 @@ func (s *Session) handle(cmd string) string {
 	case "stop":
 		if s.state == stateRecording {
 			close(s.stop)
+		} else {
+			s.cfg.TTS.Stop()
 		}
 	case "cancel":
 		if s.state == stateRecording {
 			s.discard = true
 			close(s.stop)
+		} else {
+			s.cfg.TTS.Stop()
 		}
 	case "status":
 	default:
@@ -149,7 +172,9 @@ func (s *Session) startLocked() {
 	s.state = stateRecording
 	s.stop = make(chan struct{})
 	s.discard = false
-	sound("audio-volume-change")
+	// Sinon le micro enregistrerait la voix du bot.
+	s.cfg.TTS.Stop()
+	sound("audio-volume-change", 0)
 	s.notif.show("bot : écoute…", "Parle, puis rappuie sur le raccourci (ou tais-toi).", true, false)
 	go s.run(s.stop)
 }
@@ -183,7 +208,8 @@ func (s *Session) run(stop <-chan struct{}) {
 		s.notif.show("bot : rien entendu", "Aucune voix détectée (voir VOICE_SILENCE_THRESHOLD si le micro est faible).", true, false)
 		return
 	}
-	sound("complete")
+	// Son de fin atténué : joué à plein volume, il était trop fort.
+	sound("complete", -25)
 	s.notif.show("bot : transcription…", "", true, false)
 	stt := s.cfg.STT
 	stt.OnRetry = func(attempt, max int, err error) {

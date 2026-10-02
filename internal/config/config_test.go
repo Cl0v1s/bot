@@ -88,3 +88,37 @@ func TestVoiceConfigDefaultsAndOverrides(t *testing.T) {
 		t.Errorf("cmd = %v", c.VoiceRecordCmd)
 	}
 }
+
+func TestLLMMaxTokensDefaultsToContextShare(t *testing.T) {
+	for _, k := range []string{"LLM_MAX_TOKENS", "LLM_CONTEXT_TOKENS"} {
+		t.Setenv(k, "")
+		os.Unsetenv(k)
+	}
+	if c := Load(); c.LLMMaxTokens != 4096 {
+		t.Errorf("défaut (contexte 8192) = %d, attendu 4096", c.LLMMaxTokens)
+	}
+	t.Setenv("LLM_CONTEXT_TOKENS", "32768")
+	if c := Load(); c.LLMMaxTokens != 16384 {
+		t.Errorf("contexte 32768 = %d, attendu 16384", c.LLMMaxTokens)
+	}
+	t.Setenv("LLM_MAX_TOKENS", "1000")
+	if c := Load(); c.LLMMaxTokens != 1000 {
+		t.Errorf("valeur explicite ignorée : %d", c.LLMMaxTokens)
+	}
+}
+
+func TestVoiceTTSConfigDefaultsAndOverrides(t *testing.T) {
+	for _, k := range []string{"VOICE_TTS_ENABLED", "VOICE_TTS_CMD"} {
+		t.Setenv(k, "")
+	}
+	c := Load()
+	if !c.VoiceTTSEnabled || strings.Join(c.VoiceTTSCmd, " ") != "espeak-ng -v fr+robosoft8 -p 30 -s 130" {
+		t.Errorf("défauts : enabled=%v cmd=%v", c.VoiceTTSEnabled, c.VoiceTTSCmd)
+	}
+	t.Setenv("VOICE_TTS_ENABLED", "false")
+	t.Setenv("VOICE_TTS_CMD", "espeak-ng -v fr+UniversalRobot")
+	c = Load()
+	if c.VoiceTTSEnabled || strings.Join(c.VoiceTTSCmd, "|") != "espeak-ng|-v|fr+UniversalRobot" {
+		t.Errorf("surcharges : enabled=%v cmd=%v", c.VoiceTTSEnabled, c.VoiceTTSCmd)
+	}
+}

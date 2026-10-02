@@ -2,6 +2,7 @@ package voice
 
 import (
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -51,13 +52,16 @@ func (n *notifier) show(summary, body string, transient, critical bool) {
 	}
 }
 
-// sound joue un son d'événement du thème système, s'il y a de quoi.
-func sound(event string) {
+// sound joue un son d'événement du thème système, s'il y a de quoi, avec un
+// gain de volumeDB décibels (0 = volume d'origine, négatif = plus bas).
+func sound(event string, volumeDB float64) {
 	if soundBin == "" {
 		return
 	}
 	if _, err := exec.LookPath(soundBin); err != nil {
 		return
 	}
-	go func() { _ = exec.Command(soundBin, "-i", event).Run() }()
+	go func() {
+		_ = exec.Command(soundBin, "-i", event, "-V", strconv.FormatFloat(volumeDB, 'f', -1, 64)).Run()
+	}()
 }

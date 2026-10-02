@@ -94,6 +94,14 @@ func (c *console) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// writeRaw écrit s tel quel (séquence de contrôle du terminal), sans
+// toucher à la zone de saisie ni au suivi de colonne.
+func (c *console) writeRaw(s string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, _ = io.WriteString(c.out, s)
+}
+
 // beginInput affiche une nouvelle zone de saisie vide avec prompt.
 func (c *console) beginInput(prompt string) {
 	c.mu.Lock()

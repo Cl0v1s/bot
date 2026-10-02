@@ -28,7 +28,8 @@ type Config struct {
 	LLMTimeout time.Duration
 	// LLMMaxTokens : nombre maximal de tokens générés par réponse (voir
 	// llm.Client.MaxTokens). 0 = aucune limite transmise (le serveur
-	// applique la sienne).
+	// applique la sienne). Par défaut, defaultMaxTokensShare de
+	// ContextMaxTokens.
 	LLMMaxTokens int
 	// LLMMaxRetries : nombre de relances automatiques d'une requête au LLM
 	// après une erreur transitoire (connexion impossible ou coupée, flux
@@ -154,8 +155,14 @@ type Config struct {
 	VoiceMaxDuration      time.Duration
 	VoiceSilenceStop      time.Duration
 	VoiceSilenceThreshold float64
-	STTModel              string
-	STTLanguage           string
+	// VoiceTTSEnabled / VoiceTTSCmd : lecture à voix haute des réponses du
+	// bot quand le message venait de la commande vocale (jamais le
+	// raisonnement ni les appels d'outils). VoiceTTSCmd reçoit le texte sur
+	// son entrée standard ; défaut : espeak-ng avec la voix robosoft8.
+	VoiceTTSEnabled bool
+	VoiceTTSCmd     []string
+	STTModel        string
+	STTLanguage     string
 	// STTEngine / STTDevice : moteur et emplacement du modèle de dictée sur
 	// Unsloth Studio ("gguf" = whisper.cpp et "cpu" par défaut, pour laisser
 	// tout le GPU au LLM ; "" = au choix du serveur). Voir voice.STT.
@@ -340,6 +347,10 @@ func getenvBool(key string, fallback bool) bool {
 	return b
 }
 
+// defaultMaxTokensShare : part de LLM_CONTEXT_TOKENS utilisée comme
+// LLM_MAX_TOKENS quand celui-ci n'est pas défini.
+const defaultMaxTokensShare = 0.5
+
 // Load construit la configuration à partir des variables d'environnement.
 func Load() Config {
 	pollInterval, err := time.ParseDuration(getenv("POLL_INTERVAL", "60s"))
@@ -360,10 +371,13 @@ func Load() Config {
 		llmTimeout = 10 * time.Minute
 	}
 
-	// Comme LLM_TIMEOUT, 0 est une valeur valide (pas de limite).
-	llmMaxTokens, err := strconv.Atoi(getenv("LLM_MAX_TOKENS", "8192"))
+	// Comme LLM_TIMEOUT, 0 est une valeur valide (pas de limite). Le défaut
+	// suit la taille du contexte plutôt qu'une valeur fixe, qui pouvait
+	// dépasser la fenêtre entière d'un petit contexte ou brider un grand.
+	defaultMaxTokens := max(1, int(float64(contextMaxTokens)*defaultMaxTokensShare))
+	llmMaxTokens, err := strconv.Atoi(getenv("LLM_MAX_TOKENS", strconv.Itoa(defaultMaxTokens)))
 	if err != nil || llmMaxTokens < 0 {
-		llmMaxTokens = 8192
+		llmMaxTokens = defaultMaxTokens
 	}
 
 	llmMaxRetries, err := strconv.Atoi(getenv("LLM_MAX_RETRIES", "5"))
@@ -510,6 +524,8 @@ func Load() Config {
 		VoiceMaxDuration:      voiceMaxDuration,
 		VoiceSilenceStop:      voiceSilenceStop,
 		VoiceSilenceThreshold: voiceSilenceThreshold,
+		VoiceTTSEnabled:       getenvBool("VOICE_TTS_ENABLED", true),
+		VoiceTTSCmd:           strings.Fields(getenv("VOICE_TTS_CMD", "espeak-ng -v fr+robosoft8 -p 30 -s 130")),
 		STTModel:              getenv("STT_MODEL", "large-v3-turbo"),
 		STTLanguage:           getenv("STT_LANGUAGE", "fr"),
 		STTEngine:             getenvAllowEmpty("STT_ENGINE", "gguf"),
