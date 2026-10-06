@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -16,6 +17,7 @@ import (
 	"bot/internal/agent"
 	"bot/internal/convo"
 	"bot/internal/llm"
+	"bot/internal/ontology"
 	"bot/internal/sandbox"
 	"bot/internal/tools"
 	"bot/internal/voice"
@@ -72,6 +74,12 @@ type ToolsConfig struct {
 	// puisse s'authentifier sur un dépôt distant — voir
 	// config.SandboxSSHKey et sandbox.EnsureSSHKeyAccess. "" = désactivé.
 	SandboxSSHKey string
+	// Ontology : graphe de connaissances (voir internal/ontology). Non nil :
+	// le tool query_ontology est proposé (si Enabled), et, si OntologyIdle > 0,
+	// les concepts de la conversation y sont extraits après OntologyIdle sans
+	// message de l'utilisateur.
+	Ontology     *ontology.Store
+	OntologyIdle time.Duration
 	// Voice : commande vocale (voir internal/voice). Les transcriptions sont
 	// traitées exactement comme des lignes tapées au clavier.
 	Voice voice.Config
@@ -367,9 +375,15 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				toolList = append(toolList, &tools.ClaudeTool{Bin: toolsCfg.ClaudeBin, PermissionMode: toolsCfg.ClaudePermissionMode, Timeout: toolsCfg.ClaudeTimeout, MaxTimeout: toolsCfg.ClaudeMaxTimeout, Perms: perms, Confirm: confirmClaude})
 			}
 		}
+		if toolsCfg.Ontology != nil {
+			toolList = append(toolList, &tools.QueryOntologyTool{Store: toolsCfg.Ontology})
+		}
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
 			agent.AppendToolUsagePrompt(conv)
+		}
+		if registry.Has(tools.QueryOntologyToolName) {
+			agent.AppendOntologyPrompt(conv)
 		}
 	}
 
@@ -723,8 +737,78 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	busy := false
 	eofPending := false
 
+	// Extraction du graphe de connaissances en période d'inactivité :
+	// idleC se déclenche OntologyIdle après la dernière interaction (message
+	// de l'utilisateur, ou fin de la réponse du modèle — un tour long ne
+	// doit pas compter comme de l'inactivité). L'extraction tourne en tâche
+	// de fond sur une copie des nouveaux messages, et est annulée dès que
+	// l'utilisateur écrit pour ne pas retarder sa requête sur le serveur LLM.
+	var (
+		distiller     *ontology.Distiller
+		idleTimer     *time.Timer
+		idleC         <-chan time.Time
+		distilling    bool
+		distillCancel context.CancelFunc
+		dirty         bool         // interaction depuis la dernière extraction
+		lastDistilled *llm.Message // dernier message déjà analysé
+	)
+	type distillResult struct {
+		stats ontology.Stats
+		err   error
+		last  llm.Message
+	}
+	distillCh := make(chan distillResult, 1)
+	if toolsCfg.Ontology != nil && toolsCfg.OntologyIdle > 0 {
+		distiller = &ontology.Distiller{Store: toolsCfg.Ontology, Client: client}
+		idleTimer = time.NewTimer(toolsCfg.OntologyIdle)
+		idleTimer.Stop()
+		idleC = idleTimer.C
+		defer idleTimer.Stop()
+	}
+	armIdle := func() {
+		if idleTimer != nil {
+			idleTimer.Reset(toolsCfg.OntologyIdle)
+		}
+	}
+
 	for {
 		select {
+		case <-idleC:
+			if busy || distilling || !dirty {
+				continue
+			}
+			fresh := ontology.Since(conv.Messages, lastDistilled)
+			if len(fresh) == 0 {
+				dirty = false
+				continue
+			}
+			snapshot := slices.Clone(fresh)
+			tail := snapshot[len(snapshot)-1]
+			dctx, cancel := context.WithCancel(ctx)
+			distillCancel, distilling, dirty = cancel, true, false
+			go func() {
+				st, err := distiller.Run(dctx, snapshot)
+				cancel()
+				distillCh <- distillResult{stats: st, err: err, last: tail}
+			}()
+
+		case r := <-distillCh:
+			distilling = false
+			switch {
+			case errors.Is(r.err, context.Canceled):
+				// Interrompue par un message de l'utilisateur : dirty est
+				// déjà revenu à true, on réessaiera après la prochaine pause.
+			case r.err != nil:
+				dirty = true
+				fmt.Fprintln(out, color(ansiYellow, fmt.Sprintf("[ontologie: %v]", r.err)))
+			default:
+				last := r.last
+				lastDistilled = &last
+				if !r.stats.Empty() {
+					fmt.Fprintln(out, color(ansiGray, "[ontologie: "+r.stats.String()+"]"))
+				}
+			}
+
 		case cl := <-chatLinesCh:
 			if cl.eof {
 				eofPending = true
@@ -743,6 +827,13 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				}
 				continue
 			}
+			if distiller != nil {
+				dirty = true
+				if distillCancel != nil {
+					distillCancel()
+				}
+				armIdle()
+			}
 			if busy {
 				queue = append(queue, queuedLine{text: line, voice: cl.voice})
 				fmt.Fprintln(out, color(ansiCyan, "  [mis en file d'attente, traité après la réponse en cours]"))
@@ -759,6 +850,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 
 		case cancelled := <-doneCh:
 			busy = false
+			armIdle()
 			if cancelled && len(queue) > 0 {
 				queue = nil
 				fmt.Fprintln(out, color(ansiYellow, "[file d'attente vidée après annulation]"))

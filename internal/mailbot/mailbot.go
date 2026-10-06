@@ -15,6 +15,7 @@ import (
 	"bot/internal/convo"
 	"bot/internal/imapclient"
 	"bot/internal/llm"
+	"bot/internal/ontology"
 	"bot/internal/smtpclient"
 	"bot/internal/tools"
 )
@@ -56,6 +57,20 @@ type Options struct {
 	// Vit en mémoire du process : perdu au redémarrage, pas persisté sur
 	// disque, comme le reste de l'état du mode mail (et du mode chat).
 	Conversations map[string]*convo.Conversation
+
+	// Distiller : si non nil, alimente le graphe de connaissances (voir
+	// internal/ontology) avec les échanges des fils qui ont reçu une réponse
+	// pendant un cycle de poll. L'extraction a lieu à la fin du cycle, une
+	// fois tous les mails traités, pour ne pas retarder les réponses ni
+	// concurrencer leur génération sur le serveur LLM. Comme pour MemoryFile,
+	// le contenu des mails est non fiable : seuls les expéditeurs autorisés
+	// (AllowFrom) sont traités, mais un mail peut tout de même y injecter de
+	// faux "faits" — accepté à la demande explicite de l'opérateur.
+	Distiller *ontology.Distiller
+	// distilled : dernier message déjà analysé par fil ; pendingDistill : fils
+	// à analyser à la fin du cycle. Initialisés par Run ; en mémoire.
+	distilled      map[string]*llm.Message
+	pendingDistill map[string]bool
 
 	// Failures : nombre d'échecs de génération de réponse (erreur LLM/agent)
 	// par mail, indexé par mailKey. Un mail en échec reste non lu et est
@@ -184,6 +199,9 @@ func (o Options) getOrCreateConversation(senderAddr, subject string) *convo.Conv
 	conv.MemoryFile = o.MemoryFile
 	if !o.Tools.Empty() {
 		agent.AppendToolUsagePrompt(conv)
+		if o.Tools.Has(tools.QueryOntologyToolName) {
+			agent.AppendOntologyPrompt(conv)
+		}
 	}
 	o.Conversations[key] = conv
 	return conv
@@ -197,6 +215,8 @@ func Run(ctx context.Context, client *llm.Client, opts Options) error {
 	if opts.Conversations == nil {
 		opts.Conversations = make(map[string]*convo.Conversation)
 	}
+	opts.distilled = make(map[string]*llm.Message)
+	opts.pendingDistill = make(map[string]bool)
 	if opts.Failures == nil {
 		opts.Failures = make(map[string]int)
 	}
@@ -263,7 +283,43 @@ func pollOnce(ctx context.Context, client *llm.Client, opts Options) error {
 			log.Printf("mailbot: erreur sur le message #%d: %v", seq, err)
 		}
 	}
+	opts.distillPending(ctx)
 	return nil
+}
+
+// distillPending analyse les nouveaux messages des fils marqués par
+// handleMessage et les fusionne dans le graphe de connaissances. Best-effort :
+// une erreur est journalisée ; les messages concernés seront de nouveau
+// pris en compte à l'extraction suivante du fil (voir ontology.Since).
+func (o Options) distillPending(ctx context.Context) {
+	if o.Distiller == nil {
+		return
+	}
+	for key := range o.pendingDistill {
+		delete(o.pendingDistill, key)
+		if ctx.Err() != nil {
+			return
+		}
+		conv, ok := o.Conversations[key]
+		if !ok {
+			continue // fil réinitialisé après échecs
+		}
+		fresh := ontology.Since(conv.Messages, o.distilled[key])
+		if len(fresh) == 0 {
+			continue
+		}
+		fresh = append([]llm.Message(nil), fresh...)
+		st, err := o.Distiller.Run(ctx, fresh)
+		if err != nil {
+			log.Printf("mailbot: ontologie: %v", err)
+			continue
+		}
+		last := fresh[len(fresh)-1]
+		o.distilled[key] = &last
+		if !st.Empty() {
+			log.Printf("mailbot: ontologie: %s", st)
+		}
+	}
 }
 
 func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Client, opts Options, seq int) error {
@@ -346,7 +402,11 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	logBlock(fmt.Sprintf("réponse mail › à %s", senderAddr), reply)
 	// La liste des accès n'est ajoutée qu'au mail envoyé, pas à l'historique
 	// de la conversation (déjà alimenté par agent.Run avec la réponse seule).
-	return opts.sendReply(ic, seq, parsed, senderAddr, reply+accesses.format())
+	err = opts.sendReply(ic, seq, parsed, senderAddr, reply+accesses.format())
+	if err == nil && opts.Distiller != nil {
+		opts.pendingDistill[threadKey(senderAddr, parsed.Subject)] = true
+	}
+	return err
 }
 
 // handleLLMFailure comptabilise un échec de génération pour ce mail. Tant

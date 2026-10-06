@@ -43,6 +43,17 @@ func AppendToolUsagePrompt(conv *convo.Conversation) {
 	conv.SystemPrompt = strings.TrimSpace(conv.SystemPrompt + "\n\n" + ToolUsagePrompt)
 }
 
+// OntologyPrompt explique au modèle qu'il dispose d'une base de
+// connaissances (voir internal/ontology) à consulter pendant sa réflexion.
+// Ajouté, comme ToolUsagePrompt, seulement quand le tool est proposé.
+const OntologyPrompt = `Tu disposes d'une base de connaissances (ontologie) : un graphe de concepts (personnes, projets, outils, méthodes, préférences...) et de liens entre eux, extrait automatiquement de tes conversations passées. Pendant ta réflexion, quand la demande mentionne ou suppose un élément du contexte de l'utilisateur (un projet, une équipe, un outil, une personne, un terme de son domaine), interroge-la avec query_ontology AVANT de répondre ou de poser une question dont la réponse s'y trouve peut-être : c'est plus rapide que de relire l'historique. Une absence de résultat ne prouve rien (la base est incomplète) ; en cas de doute entre la base et ce que l'utilisateur vient de dire, c'est l'utilisateur qui a raison.`
+
+// AppendOntologyPrompt ajoute OntologyPrompt au system prompt de conv. À
+// appeler une fois, quand le registre contient query_ontology.
+func AppendOntologyPrompt(conv *convo.Conversation) {
+	conv.SystemPrompt = strings.TrimSpace(conv.SystemPrompt + "\n\n" + OntologyPrompt)
+}
+
 // ReflectionPrompt pousse le modèle à décomposer une demande non triviale en
 // sous-questions et à chercher activement à les vérifier (via un outil s'il
 // y en a un de pertinent, sinon par un raisonnement explicite) avant de

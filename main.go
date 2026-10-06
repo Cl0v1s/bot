@@ -18,6 +18,7 @@ import (
 	"bot/internal/convo"
 	"bot/internal/llm"
 	"bot/internal/mailbot"
+	"bot/internal/ontology"
 	"bot/internal/sandbox"
 	"bot/internal/skills"
 	"bot/internal/smtpclient"
@@ -115,6 +116,19 @@ func main() {
 	allowedDirsFile := filepath.Join(cfg.WorkspaceDir, tools.DefaultAllowedDirsFile)
 	whitelistFile := filepath.Join(cfg.WorkspaceDir, tools.DefaultWhitelistedCommandsFile)
 
+	// Graphe de connaissances (voir internal/ontology) : indisponible =
+	// simple avertissement, le reste du programme fonctionne sans.
+	var ontoStore *ontology.Store
+	if cfg.OntologyEnabled && (os.Args[1] == "chat" || os.Args[1] == "mail") {
+		st, err := ontology.Open(cfg.OntologyFile())
+		if err != nil {
+			log.Printf("ontologie désactivée: %v", err)
+		} else {
+			ontoStore = st
+			defer st.Close()
+		}
+	}
+
 	switch os.Args[1] {
 	case "chat":
 		conv := convo.New(systemPrompt, cfg.ContextMaxTokens, cfg.ContextCompactAt, cfg.ContextKeepLastMsg)
@@ -144,6 +158,8 @@ func main() {
 			RealUserWindow:              cfg.AgentRealUserWindow,
 			WorkspaceDir:                cfg.WorkspaceDir,
 			SandboxSSHKey:               cfg.SandboxSSHKey,
+			Ontology:                    ontoStore,
+			OntologyIdle:                cfg.OntologyIdle,
 			Voice: voice.Config{
 				Enabled: cfg.VoiceEnabled,
 				Recorder: voice.Recorder{
@@ -221,8 +237,8 @@ func main() {
 			// spoofing de l'en-tête From) — exposer run_shell (et run_claude
 			// hors sandbox) ici est un vecteur d'exécution de code par
 			// injection de prompt, accepté en connaissance de cause à la
-			// demande explicite de l'opérateur de ce bot. write_file n'est
-			// jamais proposé en mode mail.
+			// demande explicite de l'opérateur de ce bot. write_file l'est
+			// aussi, pour la même raison.
 			perms := tools.NewDirPermissions(nil)
 			if err := perms.WithPersistence(allowedDirsFile); err != nil {
 				log.Printf("mode mail: lecture des répertoires autorisés: %v", err)
@@ -248,6 +264,9 @@ func main() {
 				&tools.ListDirTool{},
 				// math : calcul pur, aucun effet de bord ni accès externe.
 				&tools.MathTool{},
+			}
+			if ontoStore != nil {
+				toolList = append(toolList, &tools.QueryOntologyTool{Store: ontoStore})
 			}
 
 			// run_shell en mode mail : jamais de repli silencieux vers une
@@ -304,6 +323,9 @@ func main() {
 				// pas de sens (0 = notifications désactivées).
 				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, Whitelist: whitelist})
 			}
+			// write_file en mode mail, à la demande explicite de l'opérateur :
+			// mêmes contrôles de permissions/sandbox qu'en mode chat.
+			toolList = append(toolList, &tools.WriteFileTool{Perms: perms, Sandboxed: sandboxReady})
 			// run_claude tourne toujours sous l'identité réelle (voir
 			// tools.ClaudeTool) : jamais proposé si le sandbox est requis,
 			// pour la même raison que run_shell ci-dessus — et pas de
@@ -318,6 +340,9 @@ func main() {
 
 			opts.Tools = tools.NewRegistry(toolList...)
 			opts.ToolsPerms = perms
+		}
+		if ontoStore != nil && cfg.OntologyIdle > 0 {
+			opts.Distiller = &ontology.Distiller{Store: ontoStore, Client: client}
 		}
 		if err := mailbot.Run(ctx, client, opts); err != nil {
 			log.Fatalf("mode mail: %v", err)

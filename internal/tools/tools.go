@@ -50,6 +50,15 @@ func (r *Registry) Empty() bool {
 	return r == nil || len(r.tools) == 0
 }
 
+// Has indique si un outil de ce nom est enregistré.
+func (r *Registry) Has(name string) bool {
+	if r == nil {
+		return false
+	}
+	_, ok := r.tools[name]
+	return ok
+}
+
 // Specs retourne les descriptions des tools au format attendu par l'API
 // (champ "tools" de la requête chat completions).
 func (r *Registry) Specs() []llm.Tool {

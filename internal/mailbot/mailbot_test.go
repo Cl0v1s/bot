@@ -2,10 +2,16 @@ package mailbot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"bot/internal/convo"
+	"bot/internal/llm"
+	"bot/internal/ontology"
 )
 
 func TestNormalizeSubjectStripsReplyAndForwardPrefixes(t *testing.T) {
@@ -108,5 +114,48 @@ func TestHandleLLMFailureRetriesBeforeGivingUp(t *testing.T) {
 	}
 	if n := opts.Failures["<abc@example.com>"]; n != 1 {
 		t.Fatalf("compteur d'échecs = %d, attendu 1", n)
+	}
+}
+
+func TestDistillPendingFeedsOntology(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		content, _ := json.Marshal(`{"entities":[{"name":"Synapse","type":"Projet"}],"relations":[]}`)
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":` + string(content) + `}}]}`))
+	}))
+	defer srv.Close()
+
+	store, err := ontology.Open(filepath.Join(t.TempDir(), "o.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	conv := convo.New("sys", 1000, 0.9, 2)
+	conv.AddUser("Le projet Synapse avance")
+	conv.AddAssistant("Bien noté")
+	opts := Options{
+		Distiller:      &ontology.Distiller{Store: store, Client: llm.New(srv.URL, "k", "m")},
+		Conversations:  map[string]*convo.Conversation{"fil": conv},
+		distilled:      map[string]*llm.Message{},
+		pendingDistill: map[string]bool{"fil": true, "disparu": true},
+	}
+	opts.distillPending(context.Background())
+	if calls != 1 {
+		t.Fatalf("appels LLM = %d, attendu 1 (fil réinitialisé ignoré)", calls)
+	}
+	if n, _, _ := store.Counts(context.Background()); n != 1 {
+		t.Fatalf("concepts = %d", n)
+	}
+	if len(opts.pendingDistill) != 0 {
+		t.Fatal("pendingDistill devrait être vidé")
+	}
+
+	// Rien de nouveau : pas de second appel.
+	opts.pendingDistill["fil"] = true
+	opts.distillPending(context.Background())
+	if calls != 1 {
+		t.Fatalf("appels LLM = %d après un fil sans nouveau message", calls)
 	}
 }

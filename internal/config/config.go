@@ -146,6 +146,15 @@ type Config struct {
 	// personnel de l'utilisateur courant.
 	WorkspaceDir string
 
+	// OntologyEnabled : active le graphe de connaissances (voir
+	// internal/ontology) : tool query_ontology, et en mode chat extraction
+	// automatique des concepts après OntologyIdle sans message utilisateur.
+	OntologyEnabled bool
+	// OntologyIdle : durée d'inactivité de l'utilisateur déclenchant
+	// l'extraction. 0 = pas d'extraction automatique (la base reste
+	// interrogeable).
+	OntologyIdle time.Duration
+
 	// Voice* / STT* : commande vocale du mode chat (voir internal/voice).
 	// VoiceRecordCmd : commande de capture qui écrit du PCM s16 mono 16 kHz
 	// brut sur sa sortie standard ; vide = pw-record. La transcription passe
@@ -191,6 +200,12 @@ func (c Config) ScratchpadDir() string {
 // cours.
 func (c Config) MemoryFile() string {
 	return filepath.Join(c.WorkspaceDir, "MEMORY.md")
+}
+
+// OntologyFile retourne le chemin de la base du graphe de connaissances
+// (ontology.db), à la racine du workspace.
+func (c Config) OntologyFile() string {
+	return filepath.Join(c.WorkspaceDir, "ontology.db")
 }
 
 // defaultWorkspaceDir retourne "<home>/bot-workspace", ou "bot-workspace"
@@ -385,6 +400,11 @@ func Load() Config {
 		llmMaxRetries = 5
 	}
 
+	ontologyIdle, err := time.ParseDuration(getenv("ONTOLOGY_IDLE", "5m"))
+	if err != nil || ontologyIdle < 0 {
+		ontologyIdle = 5 * time.Minute
+	}
+
 	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.95"), 64)
 	if err != nil || contextCompactAt <= 0 || contextCompactAt > 1 {
 		contextCompactAt = 0.95
@@ -518,6 +538,9 @@ func Load() Config {
 		AgentRealUserWindow:              agentRealUserWindow,
 
 		WorkspaceDir: getenv("WORKSPACE_DIR", defaultWorkspaceDir()),
+
+		OntologyEnabled: getenvBool("ONTOLOGY_ENABLED", true),
+		OntologyIdle:    ontologyIdle,
 
 		VoiceEnabled:          getenvBool("VOICE_ENABLED", false),
 		VoiceRecordCmd:        strings.Fields(getenv("VOICE_RECORD_CMD", "")),
