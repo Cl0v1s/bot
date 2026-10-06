@@ -106,6 +106,7 @@ func main() {
 	client := llm.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
 	client.HTTPClient.Timeout = cfg.LLMTimeout
 	client.ContextTokens = cfg.ContextMaxTokens
+	client.Parallel = cfg.LLMParallel
 	client.MaxTokens = cfg.LLMMaxTokens
 	client.MaxRetries = cfg.LLMMaxRetries
 
@@ -221,6 +222,7 @@ func main() {
 
 			AllowFrom:    cfg.MailAllowFrom,
 			MaxBodyChars: cfg.MailMaxBodyChars,
+			RequireDKIM:  cfg.MailRequireDKIM,
 
 			AgentMaxSteps:                    cfg.AgentMaxSteps,
 			AgentMaxConsecutiveShellFailures: cfg.AgentMaxConsecutiveShellFailures,

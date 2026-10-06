@@ -85,6 +85,11 @@ type Options struct {
 	AllowFrom    []string
 	MaxBodyChars int
 
+	// RequireDKIM : si vrai, un mail sans signature DKIM valide et alignée
+	// sur le domaine du From est ignoré (marqué lu, jamais répondu). Protège
+	// AllowFrom du spoofing de l'en-tête From.
+	RequireDKIM bool
+
 	// Tools : registre d'outils optionnel (nil/vide = pas de tool calling).
 	// ATTENTION : le corps du mail est un contenu non fiable — inclure
 	// run_shell/write_file ici est un vecteur d'exécution de code arbitraire
@@ -335,6 +340,17 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	log.Printf("mailbot: traitement du mail de %s — %q", parsed.From, parsed.Subject)
 
 	senderAddr := extractAddress(parsed.From)
+	if opts.RequireDKIM {
+		domain, err := verifyDKIM(raw, parsed.From)
+		if err != nil {
+			log.Printf("mailbot: DKIM refusé pour %s (%v), mail ignoré", senderAddr, err)
+			if err := ic.MarkSeen(seq); err != nil {
+				return fmt.Errorf("marquage lu: %w", err)
+			}
+			return nil
+		}
+		log.Printf("mailbot: DKIM valide (d=%s)", domain)
+	}
 	if !opts.isAllowed(senderAddr) {
 		log.Printf("mailbot: expéditeur %s non autorisé (allowFrom), mail ignoré", senderAddr)
 		if err := ic.MarkSeen(seq); err != nil {

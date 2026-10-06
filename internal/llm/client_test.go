@@ -41,6 +41,7 @@ func TestChatCompletionAutoLoadsModelOnNoModelLoadedError(t *testing.T) {
 
 	client := New(srv.URL+"/v1", "", "org/modele:UD-Q4_K_XL")
 	client.ContextTokens = 65000
+	client.Parallel = 1
 
 	msg, _, err := client.ChatCompletion(context.Background(), []Message{{Role: "user", Content: "salut"}}, nil)
 	if err != nil {
@@ -60,6 +61,9 @@ func TestChatCompletionAutoLoadsModelOnNoModelLoadedError(t *testing.T) {
 	}
 	if gotLoadBody["gguf_variant"] != "UD-Q4_K_XL" {
 		t.Fatalf("gguf_variant envoyé à /load = %v, attendu %q", gotLoadBody["gguf_variant"], "UD-Q4_K_XL")
+	}
+	if gotLoadBody["n_parallel"] != float64(1) {
+		t.Fatalf("n_parallel envoyé à /load = %v, attendu 1 (Parallel)", gotLoadBody["n_parallel"])
 	}
 	if gotLoadBody["max_seq_length"] != float64(65000) {
 		t.Fatalf("max_seq_length envoyé à /load = %v, attendu 65000 (ContextTokens)", gotLoadBody["max_seq_length"])

@@ -86,6 +86,13 @@ type Client struct {
 	// voulu plutôt qu'une valeur arbitraire choisie par le serveur.
 	ContextTokens int
 
+	// Parallel : nombre de slots de décodage parallèles demandé lors d'un
+	// chargement automatique (champ "n_parallel" de /load). 0 = non transmis :
+	// le serveur applique alors son propre défaut (vu sur Unsloth Studio : 4
+	// slots, qui se partagent le contexte), et non le réglage fait dans son
+	// interface, qui n'est pas conservé d'un chargement à l'autre.
+	Parallel int
+
 	// MaxTokens : nombre maximal de tokens générés par réponse (champ
 	// "max_tokens" de la requête, raisonnement compris sur les serveurs qui
 	// le comptent — llama.cpp notamment). 0 = non transmis : le serveur
@@ -185,10 +192,12 @@ func (c *Client) tryLoadModel(ctx context.Context) error {
 		ModelPath    string `json:"model_path"`
 		GGUFVariant  string `json:"gguf_variant,omitempty"`
 		MaxSeqLength int    `json:"max_seq_length,omitempty"`
+		NParallel    int    `json:"n_parallel,omitempty"`
 	}{
 		ModelPath:    modelPath,
 		GGUFVariant:  variant,
 		MaxSeqLength: c.ContextTokens,
+		NParallel:    c.Parallel,
 	})
 	if err != nil {
 		return err

@@ -37,6 +37,8 @@ Les réponses du modèle sont **streamées** en mode chat, y compris quand des o
 
 `LLM_MAX_RETRIES` (5 par défaut ; 0 = désactivé) : en cas d'erreur transitoire — serveur injoignable ou redémarré, connexion réinitialisée, flux coupé en pleine réponse (`unexpected EOF`), status 502/503/504 —, la requête en cours est automatiquement rejouée avec un délai croissant (1 s, 2 s, 4 s…, plafonné à 30 s), avec un avertissement à chaque reprise. La génération interrompue ne pouvant pas être poursuivie là où elle s'était arrêtée, la réponse partielle déjà affichée est abandonnée et la réponse repart de zéro. Un dépassement de `LLM_TIMEOUT` n'est pas relancé.
 
+`LLM_PARALLEL` (1 par défaut ; 0 = ne rien transmettre) : nombre de slots parallèles demandés au serveur quand le bot recharge automatiquement le modèle (`n_parallel` de `/load`, Unsloth Studio). Le réglage de l'interface d'Unsloth n'est pas conservé d'un chargement à l'autre : sans ce paramètre, le serveur recharge avec son défaut (4 slots partageant le contexte).
+
 ## Gestion du contexte
 
 La taille du contexte est estimée grossièrement (~4 caractères/token). Quand elle atteint la fraction `CONTEXT_COMPACT_AT` (0.95 par défaut) de `LLM_CONTEXT_TOKENS`, les messages les plus anciens sont résumés en un seul message via un appel au LLM (avec un vrai résumé structuré — voir plus bas pourquoi le format de cet appel est particulier), en conservant tels quels les `CONTEXT_KEEP_LAST` derniers messages. Cet appel de résumé ne propose aucun outil au modèle (il ne doit produire que du texte) : une réponse vide ou invalide (ex: un appel d'outil échappé en texte) fait échouer la compaction plutôt que de remplacer l'historique par un résumé creux — elle sera retentée au tour suivant (une seule fois par tour), sans jamais bloquer la réponse.
@@ -56,6 +58,7 @@ Ce fichier est aussi consultable et modifiable directement par le modèle via `r
 ## Mode mail — sécurité
 
 - `MAIL_ALLOW_FROM` : liste blanche d'expéditeurs (adresses séparées par des virgules) autorisés à déclencher une réponse automatique. Un mail d'un expéditeur non listé est marqué comme lu mais jamais répondu. Vide = tout le monde autorisé.
+- `MAIL_REQUIRE_DKIM` (défaut `true`) : vérifie la signature DKIM de chaque mail entrant ; sans signature valide et alignée sur le domaine du `From`, le mail est marqué lu et ignoré (protège `MAIL_ALLOW_FROM` du spoofing du `From`). Nécessite que le serveur IMAP conserve les en-têtes `DKIM-Signature` d'origine ; la clé publique est récupérée par DNS.
 - `MAIL_MAX_BODY_CHARS` : troncature du corps du mail transmis au LLM (protection contre les mails abusivement longs).
 
 ## Tool calling

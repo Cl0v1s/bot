@@ -36,6 +36,10 @@ type Config struct {
 	// interrompu, status 502/503/504 — voir llm.Client.MaxRetries). 0 =
 	// aucune relance.
 	LLMMaxRetries int
+	// LLMParallel : nombre de slots parallèles demandés au serveur lors d'un
+	// rechargement automatique du modèle (voir llm.Client.Parallel). 0 = non
+	// transmis (défaut du serveur).
+	LLMParallel int
 
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
@@ -63,7 +67,8 @@ type Config struct {
 	// MailAllowFrom : liste blanche d'adresses autorisées à déclencher une
 	// réponse automatique (vide = toutes les adresses sont autorisées).
 	MailAllowFrom    []string
-	MailMaxBodyChars int // troncature du corps du mail transmis au LLM
+	MailMaxBodyChars int  // troncature du corps du mail transmis au LLM
+	MailRequireDKIM  bool // ignorer les mails sans signature DKIM valide alignée sur le From
 
 	// Tools (function calling)
 	ChatToolsEnabled bool // mode chat : shell + fichiers + http (supervisé par un humain)
@@ -395,6 +400,11 @@ func Load() Config {
 		llmMaxTokens = defaultMaxTokens
 	}
 
+	llmParallel, err := strconv.Atoi(getenv("LLM_PARALLEL", "1"))
+	if err != nil || llmParallel < 0 {
+		llmParallel = 1
+	}
+
 	llmMaxRetries, err := strconv.Atoi(getenv("LLM_MAX_RETRIES", "5"))
 	if err != nil || llmMaxRetries < 0 {
 		llmMaxRetries = 5
@@ -493,6 +503,7 @@ func Load() Config {
 		LLMTimeout:    llmTimeout,
 		LLMMaxTokens:  llmMaxTokens,
 		LLMMaxRetries: llmMaxRetries,
+		LLMParallel:   llmParallel,
 
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,
@@ -516,6 +527,7 @@ func Load() Config {
 
 		MailAllowFrom:    mailAllowFrom,
 		MailMaxBodyChars: mailMaxBodyChars,
+		MailRequireDKIM:  getenvBool("MAIL_REQUIRE_DKIM", true),
 
 		ChatToolsEnabled: getenvBool("CHAT_TOOLS_ENABLED", true),
 		MailToolsEnabled: getenvBool("MAIL_TOOLS_ENABLED", false),
