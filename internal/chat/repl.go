@@ -351,6 +351,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady},
 			&tools.RequestDirectoryAccessTool{Perms: perms},
 			&tools.ListDirTool{},
+			&tools.MathTool{},
 		}
 		if shellAvailable {
 			whitelist, err := tools.NewCommandWhitelist(toolsCfg.WhitelistedCommandsFile)

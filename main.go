@@ -246,6 +246,8 @@ func main() {
 				// non fiable (voir l'avertissement MAIL_TOOLS_ENABLED
 				// ci-dessus).
 				&tools.ListDirTool{},
+				// math : calcul pur, aucun effet de bord ni accès externe.
+				&tools.MathTool{},
 			}
 
 			// run_shell en mode mail : jamais de repli silencieux vers une

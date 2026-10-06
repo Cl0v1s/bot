@@ -309,10 +309,12 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 	conv.AddUser(userMessage)
 
 	var reply string
+	var accesses accessLog
 	if !opts.Tools.Empty() {
 		// Les appels d'outils et leurs résultats sont journalisés à part,
 		// nettement séparés du texte de la réponse envoyée par mail.
 		reply, _, err = agent.Run(ctx, client, conv, opts.Tools, opts.AgentMaxSteps, opts.AgentMaxConsecutiveShellFailures, false, func(e agent.Event) {
+			accesses.handle(e)
 			log.Print(strings.TrimRight(e.Format(), "\n"))
 		})
 		if err != nil {
@@ -342,7 +344,9 @@ func handleMessage(ctx context.Context, client *llm.Client, ic *imapclient.Clien
 
 	delete(opts.Failures, mailKey(parsed.MessageID, seq))
 	logBlock(fmt.Sprintf("réponse mail › à %s", senderAddr), reply)
-	return opts.sendReply(ic, seq, parsed, senderAddr, reply)
+	// La liste des accès n'est ajoutée qu'au mail envoyé, pas à l'historique
+	// de la conversation (déjà alimenté par agent.Run avec la réponse seule).
+	return opts.sendReply(ic, seq, parsed, senderAddr, reply+accesses.format())
 }
 
 // handleLLMFailure comptabilise un échec de génération pour ce mail. Tant
