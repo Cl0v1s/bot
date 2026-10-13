@@ -93,6 +93,11 @@ type Client struct {
 	// interface, qui n'est pas conservé d'un chargement à l'autre.
 	Parallel int
 
+	// DisableVision : charge le modèle sans son projecteur multimodal (champ
+	// "disable_vision" de /load) — le bot n'envoie jamais d'image, et le
+	// projecteur (mmproj) occupe de la mémoire pour rien.
+	DisableVision bool
+
 	// MaxTokens : nombre maximal de tokens générés par réponse (champ
 	// "max_tokens" de la requête, raisonnement compris sur les serveurs qui
 	// le comptent — llama.cpp notamment). 0 = non transmis : le serveur
@@ -189,15 +194,17 @@ func (c *Client) tryLoadModel(ctx context.Context) error {
 	modelPath, variant, _ := strings.Cut(c.Model, ":")
 
 	reqBody, err := json.Marshal(struct {
-		ModelPath    string `json:"model_path"`
-		GGUFVariant  string `json:"gguf_variant,omitempty"`
-		MaxSeqLength int    `json:"max_seq_length,omitempty"`
-		NParallel    int    `json:"n_parallel,omitempty"`
+		ModelPath     string `json:"model_path"`
+		GGUFVariant   string `json:"gguf_variant,omitempty"`
+		MaxSeqLength  int    `json:"max_seq_length,omitempty"`
+		NParallel     int    `json:"n_parallel,omitempty"`
+		DisableVision bool   `json:"disable_vision,omitempty"`
 	}{
-		ModelPath:    modelPath,
-		GGUFVariant:  variant,
-		MaxSeqLength: c.ContextTokens,
-		NParallel:    c.Parallel,
+		ModelPath:     modelPath,
+		GGUFVariant:   variant,
+		MaxSeqLength:  c.ContextTokens,
+		NParallel:     c.Parallel,
+		DisableVision: c.DisableVision,
 	})
 	if err != nil {
 		return err
@@ -292,7 +299,7 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 		return Message{}, Usage{}, fmt.Errorf("réponse LLM invalide (status %d): %s", resp.StatusCode, string(body))
 	}
 	if parsed.Error != nil {
-		return Message{}, Usage{}, fmt.Errorf("erreur LLM: %s", parsed.Error.Message)
+		return Message{}, Usage{}, &serverError{message: parsed.Error.Message}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return Message{}, Usage{}, &statusError{status: resp.StatusCode, body: string(body)}
@@ -443,7 +450,7 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 			continue // fragment ignoré, ne casse pas le stream
 		}
 		if chunk.Error != nil {
-			return Message{}, usage, fmt.Errorf("erreur LLM: %s", chunk.Error.Message)
+			return Message{}, usage, &serverError{message: chunk.Error.Message}
 		}
 		if chunk.Usage != nil {
 			usage = *chunk.Usage

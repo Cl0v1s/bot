@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"bot/internal/convo"
 	"bot/internal/llm"
+	"bot/internal/ontology"
 )
 
 // fakeStreamingServer répond en streaming SSE avec "ack:" puis le contenu du
@@ -284,5 +286,80 @@ func TestIsYes(t *testing.T) {
 		if isYes(s) {
 			t.Errorf("isYes(%q) = true", s)
 		}
+	}
+}
+
+// /ontology clean ne modifie rien ; /ontology clean apply fusionne les
+// doublons évidents sans toucher au modèle quand il n'y a pas de candidat.
+func TestRun_OntologyCleanCommand(t *testing.T) {
+	store, err := ontology.Open(filepath.Join(t.TempDir(), "o.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Apply(context.Background(), ontology.Extraction{Entities: []ontology.Entity{
+		{Name: "Base de données"}, {Name: "Bases de donnees"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	server := fakeMixedServer(t, "", "")
+	defer server.Close()
+	client := llm.New(server.URL, "", "test-model")
+	conv := convo.New("sys", 100000, 0.9, 0)
+
+	in := strings.NewReader("/ontology\n/ontology clean\n/ontology clean apply\n/ontology\n/exit\n")
+	var out bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() { runErr <- Run(context.Background(), client, conv, ToolsConfig{Ontology: store}, in, &out) }()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run n'a pas terminé à temps (deadlock ?)")
+	}
+
+	got := out.String()
+	for _, want := range []string{"ontologie : 2 concepts", "rien n'a été modifié", "Nettoyage fait", "ontologie : 1 concepts"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("sortie sans %q :\n%s", want, got)
+		}
+	}
+	if len(conv.Messages) != 0 {
+		t.Errorf("/ontology ne doit pas entrer dans la conversation : %+v", conv.Messages)
+	}
+}
+
+func TestRun_OntologyExploreWritesSVG(t *testing.T) {
+	store, err := ontology.Open(filepath.Join(t.TempDir(), "o.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Apply(context.Background(), ontology.Extraction{Relations: []ontology.Relation{{Source: "A", Relation: "utilise", Target: "B"}}}); err != nil {
+		t.Fatal(err)
+	}
+	server := fakeMixedServer(t, "", "")
+	defer server.Close()
+	ws := t.TempDir()
+
+	in := strings.NewReader("/ontology explore\n/exit\n")
+	var out bytes.Buffer
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- Run(context.Background(), llm.New(server.URL, "", "m"), convo.New("sys", 100000, 0.9, 0), ToolsConfig{Ontology: store, WorkspaceDir: ws}, in, &out)
+	}()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run n'a pas terminé à temps")
+	}
+	files, _ := filepath.Glob(filepath.Join(ws, "scratchpad", "ontologie-*.svg"))
+	if len(files) != 1 || !strings.Contains(out.String(), files[0]) {
+		t.Fatalf("SVG attendu dans le scratchpad, trouvé %v ; sortie : %s", files, out.String())
 	}
 }

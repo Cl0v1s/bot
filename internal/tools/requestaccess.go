@@ -7,7 +7,7 @@ import (
 )
 
 // RequestDirectoryAccessTool est l'unique moyen pour le modèle d'obtenir
-// l'accès à un répertoire pour read_file/write_file : par défaut ces deux
+// l'accès à un répertoire pour read_file/edit_file : par défaut ces deux
 // tools n'ont accès à rien, et RequestAccess (verrou appliqué dans le code,
 // pas seulement demandé dans le prompt) refuse tout chemin non couvert par
 // un répertoire déjà autorisé.
@@ -18,7 +18,7 @@ type RequestDirectoryAccessTool struct {
 func (t *RequestDirectoryAccessTool) Name() string { return "request_directory_access" }
 
 func (t *RequestDirectoryAccessTool) Description() string {
-	return "Demande à l'utilisateur la permission d'accéder (lecture/écriture) à un répertoire local. Obligatoire avant tout read_file/write_file sur un répertoire pas encore autorisé : ces outils échoueront sinon. Sur un répertoire déjà autorisé, réapplique sans nouvelle confirmation les droits de lecture/écriture sur tout son contenu : à rappeler si un fichier de ce répertoire est refusé alors que le répertoire est autorisé."
+	return "Demande à l'utilisateur la permission d'accéder (lecture/écriture) à un répertoire local. Obligatoire avant tout read_file/edit_file sur un répertoire pas encore autorisé : ces outils échoueront sinon. Sur un répertoire déjà autorisé, réapplique sans nouvelle confirmation les droits de lecture/écriture sur tout son contenu : à rappeler si un fichier de ce répertoire est refusé alors que le répertoire est autorisé."
 }
 
 func (t *RequestDirectoryAccessTool) ParametersSchema() json.RawMessage {

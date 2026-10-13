@@ -26,6 +26,9 @@ type Config struct {
 	// TTS : lit à voix haute les réponses aux messages dictés (voir
 	// Session.Speak). nil = pas de synthèse vocale.
 	TTS *Speaker
+	// Correct : fait corriger chaque transcription par le LLM, avec le contexte
+	// récent de la conversation (voir Correct), avant de la traiter.
+	Correct bool
 }
 
 type state int

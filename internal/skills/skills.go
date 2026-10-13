@@ -84,7 +84,7 @@ Règles :
   correctement qu'une skill qui montre. Exemple ci-dessous.
 
 Pour créer une nouvelle skill, écris un fichier à ce format dans ce
-répertoire avec write_file (déjà accessible sans permission particulière,
+répertoire avec create_file (déjà accessible sans permission particulière,
 c'est le workspace du bot). Une nouvelle skill n'apparaît dans la liste des
 skills disponibles qu'après redémarrage du bot : le chargement se fait une
 seule fois, au démarrage.

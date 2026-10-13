@@ -14,10 +14,10 @@ import (
 const maxSavedFetchBytes = 10 << 20 // 10 Mio
 
 // saveToDescription : description commune du paramètre "save_to".
-const saveToDescription = "Optionnel : chemin ABSOLU d'un fichier (dans un répertoire autorisé, voir request_directory_access) où enregistrer le contenu COMPLET, sans troncature. Le contenu n'est alors PAS renvoyé dans la réponse (seulement le chemin, la taille et un court aperçu) : à utiliser dès que le contenu est volumineux ou doit être conservé/traité ensuite (read_file par plages de lignes, run_shell avec grep...), plutôt que de le récupérer puis le recopier avec write_file — ce qui échouerait de toute façon sur un contenu tronqué."
+const saveToDescription = "Optionnel : chemin ABSOLU d'un fichier (dans un répertoire autorisé, voir request_directory_access) où enregistrer le contenu COMPLET, sans troncature. Le contenu n'est alors PAS renvoyé dans la réponse (seulement le chemin, la taille et un court aperçu) : à utiliser dès que le contenu est volumineux ou doit être conservé/traité ensuite (read_file par plages de lignes, run_shell avec grep...), plutôt que de le récupérer puis le recopier avec edit_file — ce qui échouerait de toute façon sur un contenu tronqué."
 
 // saveFetchedContent écrit content (intégral, jamais tronqué) dans path,
-// avec les mêmes vérifications que write_file (répertoire autorisé,
+// avec les mêmes vérifications que edit_file (répertoire autorisé,
 // resynchronisation sandbox), et retourne un court récapitulatif à renvoyer
 // au modèle à la place du contenu lui-même. perms nil = enregistrement
 // indisponible (ex: mode mail, qui ne propose jamais d'écriture de fichier).
@@ -36,7 +36,7 @@ func saveFetchedContent(perms *DirPermissions, sandboxed bool, path string, cont
 		return "", err
 	}
 
-	// Même séquence que write_file, voir writesync.go.
+	// Même séquence que edit_file, voir writesync.go.
 	if err := syncBeforeWrite(sandboxed, resolved, "save_to"); err != nil {
 		return "", err
 	}

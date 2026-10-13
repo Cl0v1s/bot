@@ -40,6 +40,9 @@ type Config struct {
 	// rechargement automatique du modèle (voir llm.Client.Parallel). 0 = non
 	// transmis (défaut du serveur).
 	LLMParallel int
+	// LLMDisableVision : demande de charger le modèle sans projecteur vision
+	// (voir llm.Client.DisableVision).
+	LLMDisableVision bool
 
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
@@ -159,6 +162,12 @@ type Config struct {
 	// l'extraction. 0 = pas d'extraction automatique (la base reste
 	// interrogeable).
 	OntologyIdle time.Duration
+	// OntologyCleanOnStart : nettoie l'ontologie au démarrage (fusion des
+	// doublons évidents, relations normalisées, orphelins périmés purgés), après
+	// sauvegarde de la base. OntologyOrphanDays : âge à partir duquel un
+	// concept isolé et cité une seule fois est purgé (0 = jamais).
+	OntologyCleanOnStart bool
+	OntologyOrphanDays   int
 
 	// Voice* / STT* : commande vocale du mode chat (voir internal/voice).
 	// VoiceRecordCmd : commande de capture qui écrit du PCM s16 mono 16 kHz
@@ -174,9 +183,12 @@ type Config struct {
 	// raisonnement ni les appels d'outils). VoiceTTSCmd reçoit le texte sur
 	// son entrée standard ; défaut : espeak-ng avec la voix robosoft8.
 	VoiceTTSEnabled bool
-	VoiceTTSCmd     []string
-	STTModel        string
-	STTLanguage     string
+	// VoiceCorrect : fait corriger chaque transcription par le LLM, avec le
+	// contexte récent de la conversation, avant de la traiter.
+	VoiceCorrect bool
+	VoiceTTSCmd  []string
+	STTModel     string
+	STTLanguage  string
 	// STTEngine / STTDevice : moteur et emplacement du modèle de dictée sur
 	// Unsloth Studio ("gguf" = whisper.cpp et "cpu" par défaut, pour laisser
 	// tout le GPU au LLM ; "" = au choix du serveur). Voir voice.STT.
@@ -415,6 +427,11 @@ func Load() Config {
 		ontologyIdle = 5 * time.Minute
 	}
 
+	ontologyOrphanDays, err := strconv.Atoi(getenv("ONTOLOGY_ORPHAN_DAYS", "90"))
+	if err != nil || ontologyOrphanDays < 0 {
+		ontologyOrphanDays = 90
+	}
+
 	contextCompactAt, err := strconv.ParseFloat(getenv("CONTEXT_COMPACT_AT", "0.95"), 64)
 	if err != nil || contextCompactAt <= 0 || contextCompactAt > 1 {
 		contextCompactAt = 0.95
@@ -496,14 +513,15 @@ func Load() Config {
 	}
 
 	return Config{
-		LLMBaseURL:    getenv("LLM_BASE_URL", "http://localhost:8080/v1"),
-		LLMAPIKey:     getenvAllowEmpty("LLM_API_KEY", "sk-local"),
-		LLMModel:      getenv("LLM_MODEL", "local-model"),
-		SystemPrompt:  getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
-		LLMTimeout:    llmTimeout,
-		LLMMaxTokens:  llmMaxTokens,
-		LLMMaxRetries: llmMaxRetries,
-		LLMParallel:   llmParallel,
+		LLMBaseURL:       getenv("LLM_BASE_URL", "http://localhost:8080/v1"),
+		LLMAPIKey:        getenvAllowEmpty("LLM_API_KEY", "sk-local"),
+		LLMModel:         getenv("LLM_MODEL", "local-model"),
+		SystemPrompt:     getenv("SYSTEM_PROMPT", "Tu es un assistant utile et concis."),
+		LLMTimeout:       llmTimeout,
+		LLMMaxTokens:     llmMaxTokens,
+		LLMMaxRetries:    llmMaxRetries,
+		LLMParallel:      llmParallel,
+		LLMDisableVision: getenvBool("LLM_DISABLE_VISION", true),
 
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,
@@ -554,12 +572,16 @@ func Load() Config {
 		OntologyEnabled: getenvBool("ONTOLOGY_ENABLED", true),
 		OntologyIdle:    ontologyIdle,
 
+		OntologyCleanOnStart: getenvBool("ONTOLOGY_CLEAN_ON_START", true),
+		OntologyOrphanDays:   ontologyOrphanDays,
+
 		VoiceEnabled:          getenvBool("VOICE_ENABLED", false),
 		VoiceRecordCmd:        strings.Fields(getenv("VOICE_RECORD_CMD", "")),
 		VoiceMaxDuration:      voiceMaxDuration,
 		VoiceSilenceStop:      voiceSilenceStop,
 		VoiceSilenceThreshold: voiceSilenceThreshold,
 		VoiceTTSEnabled:       getenvBool("VOICE_TTS_ENABLED", true),
+		VoiceCorrect:          getenvBool("VOICE_CORRECT", true),
 		VoiceTTSCmd:           strings.Fields(getenv("VOICE_TTS_CMD", "espeak-ng -v fr+robosoft8 -p 30 -s 130")),
 		STTModel:              getenv("STT_MODEL", "large-v3-turbo"),
 		STTLanguage:           getenv("STT_LANGUAGE", "fr"),

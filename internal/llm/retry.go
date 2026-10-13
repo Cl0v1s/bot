@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -43,6 +44,23 @@ func (e *statusError) Error() string {
 	return fmt.Sprintf("LLM a répondu avec le status %d: %s", e.status, e.body)
 }
 
+// serverError : erreur renvoyée par le serveur dans le corps de la réponse
+// (champ "error"), quel que soit le status HTTP.
+type serverError struct{ message string }
+
+func (e *serverError) Error() string { return "erreur LLM: " + e.message }
+
+// transientServerMessages : messages d'erreur serveur (en minuscules) qui
+// signalent une défaillance passagère du serveur de modèle — plantage ou
+// rechargement du moteur (« Lost connection to the model server »), erreur
+// interne générique (« An internal error occurred », vue sur Unsloth Studio)
+// — et justifient une relance. Les autres erreurs du champ "error" (requête
+// invalide, contexte dépassé...) sont déterministes et ne sont pas rejouées.
+var transientServerMessages = []string{
+	"internal error",
+	"lost connection to the model server",
+}
+
 func isUnavailableStatus(status int) bool {
 	return status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
 }
@@ -59,6 +77,16 @@ func isTransient(err error) bool {
 	var se *statusError
 	if errors.As(err, &se) {
 		return isUnavailableStatus(se.status)
+	}
+	var srv *serverError
+	if errors.As(err, &srv) {
+		msg := strings.ToLower(srv.message)
+		for _, m := range transientServerMessages {
+			if strings.Contains(msg, m) {
+				return true
+			}
+		}
+		return false
 	}
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {

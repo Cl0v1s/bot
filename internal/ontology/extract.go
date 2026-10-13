@@ -15,6 +15,9 @@ const (
 	maxTranscriptChars = 24000
 	maxMessageChars    = 2000
 	knownNamesInPrompt = 80
+	// maxExtractionTokens : plafond de génération d'une extraction (raisonnement
+	// compris sur les serveurs qui le comptent).
+	maxExtractionTokens = 8192
 )
 
 const extractionSystemPrompt = `Tu es un module d'extraction de connaissances. À partir d'un extrait de conversation entre un utilisateur et un assistant, tu identifies les CONCEPTS durables et les LIENS entre eux, pour alimenter un graphe de connaissances.
@@ -115,7 +118,15 @@ func (d *Distiller) Run(ctx context.Context, messages []llm.Message) (Stats, err
 		{Role: "system", Content: extractionSystemPrompt},
 		{Role: "user", Content: known + "Extrait de conversation :\n\n" + text + "\n\n--- fin de l'extrait ---\n\nProduis l'objet JSON."},
 	}
-	msg, _, err := d.Client.ChatCompletion(ctx, req, nil)
+	// La sortie attendue est un petit objet JSON : borner max_tokens évite
+	// qu'une limite réglée sur toute la fenêtre de contexte (LLM_MAX_TOKENS)
+	// n'excède celle-ci une fois le prompt d'extraction compté, et qu'un
+	// modèle qui divague ne monopolise le serveur.
+	client := *d.Client
+	if client.MaxTokens == 0 || client.MaxTokens > maxExtractionTokens {
+		client.MaxTokens = maxExtractionTokens
+	}
+	msg, _, err := client.ChatCompletion(ctx, req, nil)
 	if err != nil {
 		return Stats{}, fmt.Errorf("extraction: %w", err)
 	}

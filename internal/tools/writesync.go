@@ -91,3 +91,20 @@ func dirOwnedByOther(dir string) bool {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	return ok && int(st.Uid) != os.Geteuid()
 }
+
+// isLikelyBinaryContent applique la même heuristique que
+// isProbablyBinary (readfile.go, octet NUL dans les premiers octets) mais
+// sur un contenu déjà entièrement lu en mémoire plutôt qu'un *os.File.
+func isLikelyBinaryContent(data []byte) bool {
+	const sniffLen = 8000
+	n := len(data)
+	if n > sniffLen {
+		n = sniffLen
+	}
+	for _, b := range data[:n] {
+		if b == 0 {
+			return true
+		}
+	}
+	return false
+}

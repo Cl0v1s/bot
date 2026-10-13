@@ -9,8 +9,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -80,6 +82,9 @@ type ToolsConfig struct {
 	// message de l'utilisateur.
 	Ontology     *ontology.Store
 	OntologyIdle time.Duration
+	// OntologyOrphanAge : âge de purge des concepts orphelins par
+	// /ontology clean (0 = pas de purge).
+	OntologyOrphanAge time.Duration
 	// Voice : commande vocale (voir internal/voice). Les transcriptions sont
 	// traitées exactement comme des lignes tapées au clavier.
 	Voice voice.Config
@@ -105,7 +110,7 @@ type queuedLine struct {
 }
 
 // Run lance une boucle de lecture-évaluation-affichage sur la console.
-// Commandes spéciales : /exit, /reset, /stats, /compact.
+// Commandes spéciales : /exit, /reset, /stats, /compact, /ontology.
 //
 // Si toolsCfg.Enabled, chaque tour passe par la boucle agentique
 // (internal/agent) : les appels d'outils et leurs résultats sont affichés
@@ -353,7 +358,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 
 		toolList := []tools.Tool{
 			&tools.ReadFileTool{Perms: perms},
-			&tools.WriteFileTool{Perms: perms, Sandboxed: sandboxReady},
+			&tools.CreateFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.EditFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout, Perms: perms, Sandboxed: sandboxReady},
 			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady},
@@ -650,6 +655,27 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}()
 	}
 
+	// dispatchOntology exécute /ontology [clean [apply]] en tâche de fond
+	// (l'arbitrage des doublons est un appel LLM), comme dispatchCompact.
+	dispatchOntology := func(args []string) {
+		scratchDir := "" // vide : répertoire temporaire du système
+		if toolsCfg.WorkspaceDir != "" {
+			scratchDir = filepath.Join(toolsCfg.WorkspaceDir, "scratchpad")
+		}
+		go func() {
+			cancelled := false
+			defer func() { doneCh <- cancelled }()
+
+			reqCtx, endReq := interrupt.begin(ctx)
+			defer endReq()
+
+			if err := runOntologyCommand(reqCtx, out, toolsCfg.Ontology, &ontology.Distiller{Store: toolsCfg.Ontology, Client: client}, args, toolsCfg.OntologyOrphanAge, scratchDir); err != nil {
+				cancelled = errors.Is(err, context.Canceled)
+				reqErrorLine(err)
+			}
+		}()
+	}
+
 	// dispatchOrHandle traite line comme une commande spéciale si elle en
 	// est une, sinon lance un tour via dispatchTurn. dispatched=true signale
 	// qu'un tour a été lancé (donc que la boucle principale ne doit pas
@@ -657,6 +683,10 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	dispatchOrHandle := func(line string, spoken bool) (dispatched, exit bool) {
 		if line == "/compact" {
 			dispatchCompact()
+			return true, false
+		}
+		if isOntologyCommand(line) {
+			dispatchOntology(strings.Fields(line)[1:])
 			return true, false
 		}
 		if handled, ex := runCommand(line); handled {
@@ -690,6 +720,17 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}()
 
+	// voiceCtx : extrait récent de la conversation pour la correction des
+	// transcriptions. conv n'est lue que par la boucle principale (sans
+	// verrou) : celle-ci en publie une copie texte à chaque fin de tour.
+	var voiceCtx atomic.Value
+	voiceCtx.Store("")
+	refreshVoiceCtx := func() {
+		if toolsCfg.Voice.Correct {
+			voiceCtx.Store(voice.RecentContext(conv.Messages, 6, 400))
+		}
+	}
+
 	// Commande vocale : chaque transcription suit le même chemin qu'une
 	// ligne tapée (réponse à une confirmation en attente, sinon message de
 	// chat ou commande, mis en file si un tour est en cours).
@@ -712,6 +753,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				for {
 					select {
 					case text := <-sess.Transcripts():
+						// Une confirmation (« oui ») n'a rien à corriger et doit
+						// rester immédiate.
+						if toolsCfg.Voice.Correct && !isYes(text) {
+							if fixed := voice.Correct(ctx, client, voiceCtx.Load().(string), text); fixed != text {
+								fmt.Fprintln(out, color(ansiCyan, "  [transcription corrigée : « "+text+" »]"))
+								text = fixed
+							}
+						}
 						fmt.Fprintln(out, color(ansiInput, "🎙 "+text))
 						if term.Dispatch(text) {
 							select {
@@ -845,11 +894,13 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 			busy = dispatched
 			if !dispatched {
+				refreshVoiceCtx()
 				showPrompt()
 			}
 
 		case cancelled := <-doneCh:
 			busy = false
+			refreshVoiceCtx()
 			armIdle()
 			if cancelled && len(queue) > 0 {
 				queue = nil
@@ -936,5 +987,5 @@ func isQueueCommand(line string) bool {
 	case "/exit", "/quit", "/new", "/reset", "/stats", "/compact":
 		return true
 	}
-	return false
+	return isOntologyCommand(line)
 }

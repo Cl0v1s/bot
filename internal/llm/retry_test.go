@@ -147,3 +147,15 @@ func TestChatCompletionDoesNotRetryClientError(t *testing.T) {
 		t.Fatalf("appels = %d, attendu 1", calls)
 	}
 }
+
+func TestIsTransientServerError(t *testing.T) {
+	for msg, want := range map[string]bool{
+		"An internal error occurred":                                        true,
+		"Lost connection to the model server. It may have crashed -- try x": true,
+		"request exceeds the available context size":                        false,
+	} {
+		if got := isTransient(&serverError{message: msg}); got != want {
+			t.Errorf("isTransient(%q) = %v, want %v", msg, got, want)
+		}
+	}
+}

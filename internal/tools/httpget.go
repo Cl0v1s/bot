@@ -26,7 +26,7 @@ type HTTPGetTool struct {
 	// saveFetchedContent), soumis aux mêmes permissions que write_file. nil
 	// = paramètre absent du schéma (ex: mode mail).
 	Perms *DirPermissions
-	// Sandboxed : voir WriteFileTool.Sandboxed, pour "save_to".
+	// Sandboxed : voir EditFileTool.Sandboxed, pour "save_to".
 	Sandboxed bool
 }
 

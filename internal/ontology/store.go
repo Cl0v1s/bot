@@ -202,9 +202,13 @@ func (s *Store) findByKey(ctx context.Context, key string) (*graph.Node, error) 
 		return nil, err
 	}
 	if res.Len() == 0 {
-		return nil, nil
+		return s.findByAlias(ctx, key)
 	}
-	return res.Nodes()[0], nil
+	// Match ne charge pas les labels, or UpdateNode les réécrit depuis
+	// Node.Labels : sans ce rechargement, la mise à jour d'un concept
+	// effacerait son label (donc le rendrait introuvable au prochain Match,
+	// et la mention suivante créerait un doublon).
+	return s.g.GetNode(ctx, res.Nodes()[0].ID)
 }
 
 // upsertEntity crée ou met à jour le nœud de name, et retourne son id.
@@ -316,7 +320,7 @@ func (s *Store) Apply(ctx context.Context, ext Extraction) (Stats, error) {
 		if i >= maxRelationsPerApply {
 			break
 		}
-		typ := cleanRelation(r.Relation)
+		typ := canonicalRelation(cleanRelation(r.Relation))
 		if typ == "" || entityKey(r.Source) == "" || entityKey(r.Target) == "" {
 			continue
 		}

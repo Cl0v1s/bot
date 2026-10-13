@@ -12,7 +12,7 @@ import (
 // passage exact par un autre, sans avoir à relire ni à renvoyer le fichier
 // entier (contrairement à write_file) : bien plus économe en contexte pour
 // un changement ponctuel. Mêmes permissions et même resynchronisation
-// sandbox que WriteFileTool — voir ses commentaires.
+// sandbox que les autres outils d'écriture — voir writesync.go.
 type EditFileTool struct {
 	Perms *DirPermissions
 	// MaxBytes : taille maximale du fichier édité (défaut 2 Mo) — le fichier
@@ -24,8 +24,8 @@ type EditFileTool struct {
 func (t *EditFileTool) Name() string { return "edit_file" }
 
 func (t *EditFileTool) Description() string {
-	return "Modifie un fichier texte existant en remplaçant un passage exact (\"old_string\") par un autre (\"new_string\"), sans relire ni réécrire le reste du fichier : à préférer à write_file pour tout changement ponctuel, bien plus économe en contexte. " +
-		"\"old_string\" doit correspondre EXACTEMENT au texte du fichier (espaces et indentation compris) et être unique dans le fichier : ajoute quelques lignes de contexte autour si besoin, ou utilise \"replace_all\" pour remplacer toutes les occurrences. Si tu ne connais pas le texte exact, repère-le d'abord avec read_file (\"search\")."
+	return "Modifie un fichier texte existant en remplaçant un passage exact (\"old_string\") par un autre (\"new_string\"), sans relire ni réécrire le reste du fichier : économe en contexte. " +
+		"\"old_string\" doit correspondre EXACTEMENT au texte du fichier (espaces et indentation compris) et être unique dans le fichier : ajoute quelques lignes de contexte autour si besoin, ou utilise \"replace_all\" pour remplacer toutes les occurrences. Si tu ne connais pas le texte exact, repère-le d'abord avec read_file (\"search\"). Pour ajouter du texte à la FIN du fichier sans le relire (mémoire, journal), utilise \"append\": true avec \"new_string\" (\"old_string\" est alors ignoré)."
 }
 
 func (t *EditFileTool) ParametersSchema() json.RawMessage {
@@ -35,9 +35,10 @@ func (t *EditFileTool) ParametersSchema() json.RawMessage {
 			"path": {"type": "string", "description": "Chemin ABSOLU du fichier existant à modifier, dans un répertoire déjà autorisé. Un chemin relatif est refusé."},
 			"old_string": {"type": "string", "description": "Texte exact à remplacer (espaces, indentation et sauts de ligne compris). Doit être unique dans le fichier, sauf avec \"replace_all\"."},
 			"new_string": {"type": "string", "description": "Texte de remplacement (peut être vide pour supprimer le passage)."},
+			"append": {"type": "boolean", "description": "Si vrai, ajoute \"new_string\" à la fin du fichier existant ; \"old_string\" est ignoré (défaut false)."},
 			"replace_all": {"type": "boolean", "description": "Remplace toutes les occurrences de \"old_string\" au lieu d'exiger qu'elle soit unique (défaut false)."}
 		},
-		"required": ["path", "old_string", "new_string"],
+		"required": ["path", "new_string"],
 		"additionalProperties": false
 	}`)
 }
@@ -47,6 +48,7 @@ type editFileArgs struct {
 	OldString  string `json:"old_string"`
 	NewString  string `json:"new_string"`
 	ReplaceAll bool   `json:"replace_all"`
+	Append     bool   `json:"append"`
 }
 
 func (t *EditFileTool) Call(ctx context.Context, argsJSON string) (string, error) {
@@ -60,10 +62,13 @@ func (t *EditFileTool) Call(ctx context.Context, argsJSON string) (string, error
 	if err := requireAbsolutePath("path", args.Path); err != nil {
 		return "", err
 	}
-	if args.OldString == "" {
-		return "", fmt.Errorf(`paramètre "old_string" requis et non vide (pour créer un fichier ou en ajouter la fin, utilise write_file)`)
-	}
-	if args.OldString == args.NewString {
+	if args.Append {
+		if args.NewString == "" {
+			return "", fmt.Errorf(`paramètre "new_string" requis et non vide avec "append"`)
+		}
+	} else if args.OldString == "" {
+		return "", fmt.Errorf(`paramètre "old_string" requis et non vide (ou "append": true pour ajouter en fin de fichier ; create_file pour créer un fichier)`)
+	} else if args.OldString == args.NewString {
 		return "", fmt.Errorf(`"old_string" et "new_string" sont identiques : rien à modifier`)
 	}
 
@@ -75,7 +80,7 @@ func (t *EditFileTool) Call(ctx context.Context, argsJSON string) (string, error
 	info, err := os.Stat(resolved)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("%q n'existe pas : edit_file ne modifie qu'un fichier existant (utilise write_file pour le créer)", args.Path)
+			return "", fmt.Errorf("%q n'existe pas : edit_file ne modifie qu'un fichier existant (utilise create_file pour le créer)", args.Path)
 		}
 		return "", fmt.Errorf("lecture de %q: %w", args.Path, err)
 	}
@@ -106,6 +111,12 @@ func (t *EditFileTool) Call(ctx context.Context, argsJSON string) (string, error
 	}
 
 	content := string(data)
+	if args.Append {
+		if err := writeAndSync(t.Sandboxed, resolved, append(data, args.NewString...), "edit_file"); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%d octets ajoutés à la fin de %q", len(args.NewString), args.Path), nil
+	}
 	count := strings.Count(content, args.OldString)
 	switch {
 	case count == 0:

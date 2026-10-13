@@ -53,7 +53,7 @@ func describeAccess(tool, argsJSON string) string {
 	}
 	var target string
 	switch tool {
-	case "read_file", "write_file", "edit_file", "list_dir":
+	case "read_file", "create_file", "edit_file", "list_dir":
 		target = str("path")
 	case "http_get", "browser_fetch":
 		target = str("url")

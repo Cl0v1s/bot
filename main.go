@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"bot/internal/agent"
 	"bot/internal/chat"
@@ -107,6 +108,7 @@ func main() {
 	client.HTTPClient.Timeout = cfg.LLMTimeout
 	client.ContextTokens = cfg.ContextMaxTokens
 	client.Parallel = cfg.LLMParallel
+	client.DisableVision = cfg.LLMDisableVision
 	client.MaxTokens = cfg.LLMMaxTokens
 	client.MaxRetries = cfg.LLMMaxRetries
 
@@ -127,6 +129,18 @@ func main() {
 		} else {
 			ontoStore = st
 			defer st.Close()
+			if cfg.OntologyCleanOnStart {
+				rep, err := st.Clean(context.Background(), ontology.CleanOptions{
+					Apply:        true,
+					OrphanMaxAge: time.Duration(cfg.OntologyOrphanDays) * 24 * time.Hour,
+				})
+				switch {
+				case err != nil:
+					log.Printf("ontologie: nettoyage au démarrage échoué: %v", err)
+				case rep.Applied:
+					log.Printf("ontologie: nettoyage au démarrage : %s (sauvegarde : %s)", rep.Summary(), rep.BackupPath)
+				}
+			}
 		}
 	}
 
@@ -161,6 +175,7 @@ func main() {
 			SandboxSSHKey:               cfg.SandboxSSHKey,
 			Ontology:                    ontoStore,
 			OntologyIdle:                cfg.OntologyIdle,
+			OntologyOrphanAge:           time.Duration(cfg.OntologyOrphanDays) * 24 * time.Hour,
 			Voice: voice.Config{
 				Enabled: cfg.VoiceEnabled,
 				Recorder: voice.Recorder{
@@ -177,7 +192,8 @@ func main() {
 					Engine:   cfg.STTEngine,
 					Device:   cfg.STTDevice,
 				},
-				TTS: tts,
+				TTS:     tts,
+				Correct: cfg.VoiceCorrect,
 			},
 		}
 		// Pas de contexte dérivé d'un signal ici : chat.Run gère lui-même
@@ -239,8 +255,7 @@ func main() {
 			// spoofing de l'en-tête From) — exposer run_shell (et run_claude
 			// hors sandbox) ici est un vecteur d'exécution de code par
 			// injection de prompt, accepté en connaissance de cause à la
-			// demande explicite de l'opérateur de ce bot. write_file l'est
-			// aussi, pour la même raison.
+			// demande explicite de l'opérateur de ce bot.
 			perms := tools.NewDirPermissions(nil)
 			if err := perms.WithPersistence(allowedDirsFile); err != nil {
 				log.Printf("mode mail: lecture des répertoires autorisés: %v", err)
@@ -325,9 +340,12 @@ func main() {
 				// pas de sens (0 = notifications désactivées).
 				toolList = append(toolList, &tools.ShellTool{Timeout: cfg.ToolsShellTimeout, MaxTimeout: cfg.ToolsShellMaxTimeout, Sandboxed: sandboxReady, Perms: perms, GitConfigPath: gitConfigPath, HomeDir: homeDir, Whitelist: whitelist})
 			}
-			// write_file en mode mail, à la demande explicite de l'opérateur :
-			// mêmes contrôles de permissions/sandbox qu'en mode chat.
-			toolList = append(toolList, &tools.WriteFileTool{Perms: perms, Sandboxed: sandboxReady})
+			// create_file/edit_file en mode mail, à la demande explicite de
+			// l'opérateur : mêmes contrôles de permissions/sandbox qu'en mode chat.
+			toolList = append(toolList,
+				&tools.CreateFileTool{Perms: perms, Sandboxed: sandboxReady},
+				&tools.EditFileTool{Perms: perms, Sandboxed: sandboxReady},
+			)
 			// run_claude tourne toujours sous l'identité réelle (voir
 			// tools.ClaudeTool) : jamais proposé si le sandbox est requis,
 			// pour la même raison que run_shell ci-dessus — et pas de
