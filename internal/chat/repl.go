@@ -110,7 +110,8 @@ type queuedLine struct {
 }
 
 // Run lance une boucle de lecture-évaluation-affichage sur la console.
-// Commandes spéciales : /exit, /reset, /stats, /compact, /ontology.
+// Commandes spéciales : /exit, /reset, /stats, /compact, /ontology, et les
+// commandes directes "!cmd" (voir direct.go : exécutées sans appel LLM).
 //
 // Si toolsCfg.Enabled, chaque tour passe par la boucle agentique
 // (internal/agent) : les appels d'outils et leurs résultats sont affichés
@@ -676,11 +677,43 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}()
 	}
 
+	// dispatchDirect exécute une commande directe ("!cmd") en tâche de fond
+	// (peut être longue, ou demander une confirmation), sans aucun appel
+	// LLM : la sortie est affichée puis ajoutée à la conversation comme
+	// message utilisateur, pour que le modèle la connaisse au tour suivant.
+	dispatchDirect := func(line string) {
+		go func() {
+			cancelled := false
+			defer func() { doneCh <- cancelled }()
+
+			reqCtx, endReq := interrupt.begin(ctx)
+			defer endReq()
+
+			output, err := runDirectCommand(reqCtx, line)
+			if err != nil {
+				cancelled = errors.Is(err, context.Canceled)
+				errorLine("[commande directe: %v]", err)
+			}
+			if strings.TrimSpace(output) != "" {
+				fmt.Fprintln(out, color(ansiGreen, strings.TrimRight(output, "\n")))
+			}
+			if cancelled {
+				return
+			}
+			conv.AddUser(formatDirectContext(line, output, err))
+			fmt.Fprintln(out, color(ansiGray, "[sortie ajoutée au contexte]"))
+		}()
+	}
+
 	// dispatchOrHandle traite line comme une commande spéciale si elle en
 	// est une, sinon lance un tour via dispatchTurn. dispatched=true signale
 	// qu'un tour a été lancé (donc que la boucle principale ne doit pas
 	// réafficher le prompt tout de suite : il faut attendre doneCh).
 	dispatchOrHandle := func(line string, spoken bool) (dispatched, exit bool) {
+		if isDirectCommand(line) {
+			dispatchDirect(line)
+			return true, false
+		}
 		if line == "/compact" {
 			dispatchCompact()
 			return true, false
@@ -779,7 +812,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}
 
-	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique, /compact pour compacter maintenant.")
+	fmt.Fprintln(out, "Harnais LLM — mode interactif. Tapez /exit pour quitter, /new (ou /reset) pour vider l'historique, /compact pour compacter maintenant, !cmd pour exécuter une commande sans le modèle (!help).")
 	showPrompt()
 
 	var queue []queuedLine
@@ -983,6 +1016,9 @@ func isYes(line string) bool {
 // qu'un message pour le modèle — utilisé pour ne jamais la fusionner avec
 // des messages en file d'attente. À tenir à jour avec runCommand.
 func isQueueCommand(line string) bool {
+	if isDirectCommand(line) {
+		return true
+	}
 	switch line {
 	case "/exit", "/quit", "/new", "/reset", "/stats", "/compact":
 		return true
