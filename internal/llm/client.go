@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -606,4 +607,43 @@ func (c *Client) templateKwargs() map[string]any {
 		return nil
 	}
 	return map[string]any{"enable_thinking": *c.EnableThinking}
+}
+
+// TryUnloadModel demande au serveur d'inférence de décharger le modèle, via
+// l'endpoint propriétaire POST {BaseURL}/unload (vu sur Unsloth Studio — non
+// standardisé OpenAI). Retourne une erreur si le serveur ne supporte pas ce
+// mécanisme ou si la requête échoue. Sur un serveur qui charge les modèles
+// au démarrage (llama.cpp/vLLM sans Unsloth), cette méthode est généralement
+// ignorée : aucun modèle n'est déchargé, mais non plus d'erreur retournée.
+func (c *Client) TryUnloadModel(ctx context.Context) error {
+	reqBody, err := json.Marshal(struct {
+		ModelPath string `json:"model_path"`
+	}{
+		ModelPath: c.Model,
+	})
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/unload", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("déchargement du modèle %q: %w", c.Model, err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("déchargement du modèle %q refusé (status %d): %s", c.Model, resp.StatusCode, string(body))
+	}
+	fmt.Fprintln(os.Stderr, "[modèle déchargé]")
+	return nil
 }

@@ -443,6 +443,13 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 			fmt.Fprintf(out, "[messages=%d tokens~=%d/%d (%s)]\n", len(conv.Messages), conv.EstimateTokens(), conv.MaxContextTokens, basis)
 			return true, false
+		case "/unload":
+			if err := client.TryUnloadModel(ctx); err != nil {
+				errorLine("[déchargement modèle: %v]", err)
+			} else {
+				fmt.Fprintln(out, color(ansiGreen, "[modèle déchargé avec succès]"))
+			}
+			return true, false
 		}
 		return false, false
 	}
