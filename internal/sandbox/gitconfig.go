@@ -49,7 +49,7 @@ func GitConfigPath(dir string) string {
 //     du premier contact avec un hôte donné, mais refuse toujours une clé qui
 //     changerait ensuite pour un hôte déjà connu. Si sshKeyPath est non vide,
 //     y ajoute "-i sshKeyPath -o IdentitiesOnly=yes" pour que git s'authentifie
-//     avec cette clé (celle de l'utilisateur réel, voir EnsureSSHKeyAccess,
+//     avec cette clé (la clé dédiée du bot par défaut, voir ResolveSSHKey et EnsureSSHKeyAccess,
 //     à appeler séparément pour que User puisse effectivement la lire) plutôt
 //     que d'échouer faute d'identité (User n'a pas de ~/.ssh à lui).
 //
@@ -114,9 +114,11 @@ func EnsureGitConfig(dir string, sshKeyPath string) error {
 		} else if err != nil {
 			return fmt.Errorf("vérification de %q: %w", knownHosts, err)
 		}
-		sshCommand := fmt.Sprintf("ssh -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new", knownHosts)
+		sshCommand := fmt.Sprintf("ssh -F /dev/null -o UserKnownHostsFile=%s -o StrictHostKeyChecking=accept-new", knownHosts)
 		if sshKeyPath != "" {
-			sshCommand += fmt.Sprintf(" -i %s -o IdentitiesOnly=yes", sshKeyPath)
+			// IdentityAgent=none + IdentitiesOnly : jamais l'agent SSH
+			// ni une clé par défaut, uniquement la clé dédiée.
+			sshCommand += fmt.Sprintf(" -i %s -o IdentitiesOnly=yes -o IdentityAgent=none", sshKeyPath)
 		}
 		if err := exec.Command("git", "config", "--file", path, "core.sshCommand", sshCommand).Run(); err != nil {
 			return fmt.Errorf("écriture de core.sshCommand dans %q: %w", path, err)

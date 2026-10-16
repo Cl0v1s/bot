@@ -154,15 +154,6 @@ func fetchWithChromeCDP(ctx context.Context, bin, target string, maxMediaBytes i
 	cmd := exec.CommandContext(ctx, bin,
 		"--headless=new",
 		"--disable-gpu",
-		// Le sandbox interne de Chrome nécessite des primitives noyau (user
-		// namespaces...) pas toujours disponibles selon l'environnement dans
-		// lequel le harnais tourne : sans ce drapeau, Chrome refuse purement
-		// et simplement de démarrer dans un tel environnement. Compromis
-		// assumé, cohérent avec l'absence de protection SSRF déjà documentée
-		// pour ce tool : le risque visé (JS d'une page web arbitraire) est
-		// le même que dans un navigateur normal, pas un contenu local
-		// sensible.
-		"--no-sandbox",
 		"--disable-dev-shm-usage",
 		"--user-agent="+chromeUserAgent,
 		fmt.Sprintf("--remote-debugging-port=%d", port),
@@ -180,7 +171,7 @@ func fetchWithChromeCDP(ctx context.Context, bin, target string, maxMediaBytes i
 	// le seul PID de tête évite ça.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
-		return browserFetchResult{}, fmt.Errorf("démarrage de %s: %w", bin, err)
+		return browserFetchResult{}, fmt.Errorf("démarrage de %s: %w (le sandbox Chrome est actif : il requiert les user namespaces et un utilisateur non-root ; lancer le bot sous le compte « llm » ou dans un conteneur autorisant les user namespaces)", bin, err)
 	}
 	defer func() {
 		if cmd.Process != nil {
@@ -192,7 +183,7 @@ func fetchWithChromeCDP(ctx context.Context, bin, target string, maxMediaBytes i
 	httpClient := &http.Client{}
 	base := fmt.Sprintf("http://127.0.0.1:%d", port)
 	if err := waitForChromeDebugPort(ctx, httpClient, base); err != nil {
-		return browserFetchResult{}, fmt.Errorf("port de debug Chrome (%s) indisponible: %w", base, err)
+		return browserFetchResult{}, fmt.Errorf("port de debug Chrome (%s) indisponible: %w (si Chrome a quitté au démarrage : son sandbox est actif et requiert les user namespaces et un utilisateur non-root ; lancer le bot sous le compte « llm » ou dans un conteneur les autorisant)", base, err)
 	}
 
 	targetID, wsURL, err := chromePageTarget(ctx, httpClient, base)

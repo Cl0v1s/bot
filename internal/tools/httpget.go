@@ -15,9 +15,8 @@ import (
 
 // HTTPGetTool effectue une requête HTTP GET simple.
 //
-// Avertissement : aucune protection SSRF n'est implémentée (pas de filtrage
-// des adresses privées/locales). À activer en connaissance de cause si le
-// LLM traite des entrées non fiables (voir README).
+// Protection SSRF : le dialer refuse toute connexion vers une adresse privée,
+// loopback ou link-local (voir ssrfControl), y compris après redirection.
 type HTTPGetTool struct {
 	Timeout      time.Duration
 	MaxBodyBytes int
@@ -86,7 +85,7 @@ func (t *HTTPGetTool) Call(ctx context.Context, argsJSON string) (string, error)
 	// user-agent identifiable, ce qui prive le modèle de tout contenu réel.
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; bot-harness/1.0)")
 
-	client := &http.Client{Timeout: timeout}
+	client := newSSRFSafeClient(timeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("requête HTTP: %w", err)

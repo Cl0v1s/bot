@@ -107,6 +107,10 @@ type Client struct {
 	// dizaines de minutes avant de rendre la main.
 	MaxTokens int
 
+	// EnableThinking : si non nil, envoie chat_template_kwargs.enable_thinking
+	// (Qwen3.x ne raisonne pas sans). nil = comportement par défaut du serveur.
+	EnableThinking *bool
+
 	// MaxRetries / RetryBackoff : relances automatiques d'une requête après
 	// une erreur transitoire — connexion au serveur impossible ou coupée,
 	// flux interrompu en cours de génération (EOF inattendu), status
@@ -147,6 +151,9 @@ type chatRequest struct {
 	StreamOptions *streamOptions `json:"stream_options,omitempty"`
 	Tools         []Tool         `json:"tools,omitempty"`
 	MaxTokens     int            `json:"max_tokens,omitempty"`
+	// ChatTemplateKwargs : enable_thinking pour les Qwen3.x (llama.cpp /
+	// Unsloth). Omis quand Client.EnableThinking est nil (défaut serveur).
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatResponse struct {
@@ -266,6 +273,8 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 		Stream:    false,
 		Tools:     tools,
 		MaxTokens: c.MaxTokens,
+
+		ChatTemplateKwargs: c.templateKwargs(),
 	})
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -385,6 +394,8 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		StreamOptions: &streamOptions{IncludeUsage: true},
 		Tools:         tools,
 		MaxTokens:     c.MaxTokens,
+
+		ChatTemplateKwargs: c.templateKwargs(),
 	})
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -412,6 +423,7 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 	}
 
 	var content, reasoning strings.Builder
+	var tags thinkSplitter
 	var toolCalls []ToolCall
 	var finishReason string
 	var usage Usage
@@ -437,6 +449,7 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 				Delta struct {
 					Content          string                `json:"content"`
 					ReasoningContent string                `json:"reasoning_content"`
+					Reasoning        string                `json:"reasoning"` // alias (Ollama, llama.cpp/vLLM récents)
 					ToolCalls        []streamToolCallDelta `json:"tool_calls"`
 				} `json:"delta"`
 				FinishReason string `json:"finish_reason"`
@@ -462,18 +475,29 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		if choice.FinishReason != "" {
 			finishReason = choice.FinishReason
 		}
-		if d := choice.Delta.ReasoningContent; d != "" {
+		emitReasoning := func(d string) {
+			if d == "" {
+				return
+			}
 			reasoning.WriteString(d)
 			if cb.OnReasoning != nil {
 				cb.OnReasoning(d)
 			}
 		}
-		if d := choice.Delta.Content; d != "" {
+		emitContent := func(d string) {
+			if d == "" {
+				return
+			}
 			content.WriteString(d)
 			if cb.OnContent != nil {
 				cb.OnContent(d)
 			}
 		}
+		emitReasoning(choice.Delta.ReasoningContent)
+		emitReasoning(choice.Delta.Reasoning)
+		// Qwen & co. : raisonnement parfois inline dans content, entre
+		// <think>…</think> (serveur sans reasoning parser).
+		tags.feed(choice.Delta.Content, emitReasoning, emitContent)
 		for _, tc := range choice.Delta.ToolCalls {
 			if tc.Index < 0 {
 				continue
@@ -493,6 +517,17 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		}
 	}
 
+	tags.flush(func(d string) {
+		reasoning.WriteString(d)
+		if cb.OnReasoning != nil {
+			cb.OnReasoning(d)
+		}
+	}, func(d string) {
+		content.WriteString(d)
+		if cb.OnContent != nil {
+			cb.OnContent(d)
+		}
+	})
 	msg := Message{
 		Role:             "assistant",
 		Content:          content.String(),
@@ -507,4 +542,68 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		return msg, usage, errStreamTruncated
 	}
 	return msg, usage, nil
+}
+
+// thinkSplitter sépare un flux de texte en raisonnement (<think>…</think>) et
+// réponse. Les balises peuvent être coupées entre deux fragments : un suffixe
+// pouvant être le début d'une balise est retenu jusqu'au fragment suivant.
+type thinkSplitter struct {
+	inThink bool
+	pending string
+}
+
+func (t *thinkSplitter) feed(chunk string, reason, content func(string)) {
+	if chunk == "" {
+		return
+	}
+	buf := t.pending + chunk
+	t.pending = ""
+	for buf != "" {
+		tag := "<think>"
+		if t.inThink {
+			tag = "</think>"
+		}
+		if i := strings.Index(buf, tag); i >= 0 {
+			t.out(buf[:i], reason, content)
+			buf = buf[i+len(tag):]
+			t.inThink = !t.inThink
+			continue
+		}
+		// retient le plus long suffixe qui est un préfixe de la balise
+		keep := 0
+		for n := min(len(tag)-1, len(buf)); n > 0; n-- {
+			if strings.HasSuffix(buf, tag[:n]) {
+				keep = n
+				break
+			}
+		}
+		t.out(buf[:len(buf)-keep], reason, content)
+		t.pending = buf[len(buf)-keep:]
+		return
+	}
+}
+
+func (t *thinkSplitter) out(d string, reason, content func(string)) {
+	if d == "" {
+		return
+	}
+	if t.inThink {
+		reason(d)
+	} else {
+		content(d)
+	}
+}
+
+func (t *thinkSplitter) flush(reason, content func(string)) {
+	if t.pending != "" {
+		t.out(t.pending, reason, content)
+		t.pending = ""
+	}
+}
+
+func (c *Client) templateKwargs() map[string]any {
+	if c.EnableThinking == nil {
+		return nil
+	}
+	return map[string]any{"enable_thinking": *c.EnableThinking}
 }

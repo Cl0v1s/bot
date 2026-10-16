@@ -6,6 +6,7 @@ package imapclient
 import (
 	"bufio"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -21,18 +22,18 @@ type Client struct {
 	timeout time.Duration
 }
 
-// Dial se connecte au serveur IMAP. useTLS=true utilise TLS implicite
-// (port 993 typiquement).
-func Dial(addr string, useTLS bool) (*Client, error) {
-	var conn net.Conn
-	var err error
+// ErrTLSRequired : toute connexion IMAP non chiffrée est refusée.
+var ErrTLSRequired = errors.New("IMAP: TLS obligatoire (IMAP_TLS=false refusé)")
 
-	dialer := &net.Dialer{Timeout: 15 * time.Second}
-	if useTLS {
-		conn, err = tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: hostOnly(addr)})
-	} else {
-		conn, err = dialer.Dial("tcp", addr)
+// Dial se connecte au serveur IMAP en TLS implicite (port 993 typiquement),
+// certificat vérifié. useTLS=false est refusé : aucun identifiant ne doit
+// transiter en clair.
+func Dial(addr string, useTLS bool) (*Client, error) {
+	if !useTLS {
+		return nil, ErrTLSRequired
 	}
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: hostOnly(addr), MinVersion: tls.VersionTLS12})
 	if err != nil {
 		return nil, fmt.Errorf("connexion IMAP: %w", err)
 	}

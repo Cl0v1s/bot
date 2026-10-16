@@ -35,9 +35,9 @@ import (
 // cdp.go). Échoue explicitement si aucun des deux n'est installé, plutôt
 // que de proposer un outil qui ne marchera jamais.
 //
-// Avertissement : mêmes limites que HTTPGetTool — aucune protection SSRF
-// (pas de filtrage des adresses privées/locales), à activer en connaissance
-// de cause si le LLM traite des entrées non fiables (voir README). Ne
+// Protection SSRF : l'hôte de l'URL est résolu et refusé s'il pointe vers
+// une adresse privée/loopback/link-local (voir checkPublicHost) ; les
+// redirections et le DNS rebinding côté navigateur ne sont pas couverts. Ne
 // s'exécute PAS sous le compte sandbox (contrairement à run_shell) : comme
 // http_get, l'URL est un simple argument de commande, jamais interprétée
 // par un shell, donc sans le risque d'injection propre à run_shell.
@@ -148,6 +148,9 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return "", fmt.Errorf("schéma %q non autorisé (http/https uniquement)", parsed.Scheme)
+	}
+	if err := checkPublicHost(ctx, parsed.Hostname()); err != nil {
+		return "", err
 	}
 	if args.Format != "" && args.Format != "text" && args.Format != "html" {
 		return "", fmt.Errorf(`paramètre "format" invalide (%q) : "text" ou "html" uniquement`, args.Format)

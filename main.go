@@ -110,6 +110,7 @@ func main() {
 	client.Parallel = cfg.LLMParallel
 	client.DisableVision = cfg.LLMDisableVision
 	client.MaxTokens = cfg.LLMMaxTokens
+	client.EnableThinking = cfg.LLMEnableThinking
 	client.MaxRetries = cfg.LLMMaxRetries
 
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
@@ -306,12 +307,13 @@ func main() {
 			gitConfigPath := ""
 			homeDir := ""
 			if sandboxReady {
-				if cfg.SandboxSSHKey != "" {
-					if err := sandbox.EnsureSSHKeyAccess(cfg.SandboxSSHKey); err != nil {
-						log.Printf("mode mail: échec de l'octroi d'accès à la clé SSH (%s) : %v", cfg.SandboxSSHKey, err)
-					}
+				sshKey, err := sandbox.ResolveSSHKey(cfg.WorkspaceDir, cfg.SandboxSSHKey)
+				if err != nil {
+					log.Printf("mode mail: échec de la préparation de la clé SSH dédiée : %v", err)
+				} else if err := sandbox.EnsureSSHKeyAccess(sshKey); err != nil {
+					log.Printf("mode mail: échec de l'octroi d'accès à la clé SSH (%s) : %v", sshKey, err)
 				}
-				if err := sandbox.EnsureGitConfig(cfg.WorkspaceDir, cfg.SandboxSSHKey); err != nil {
+				if err := sandbox.EnsureGitConfig(cfg.WorkspaceDir, sshKey); err != nil {
 					log.Printf("mode mail: échec de la préparation de la config git (%s) : %v", cfg.WorkspaceDir, err)
 				}
 				// Doit être créé AVANT GrantDirectory : voir le commentaire

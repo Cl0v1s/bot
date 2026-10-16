@@ -332,12 +332,13 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			// (/var/folders/..., privé à l'utilisateur), pas /tmp.
 			perms.AlwaysAllow(toolsCfg.WorkspaceDir, "/tmp", os.TempDir())
 			if sandboxReady {
-				if toolsCfg.SandboxSSHKey != "" {
-					if err := sandbox.EnsureSSHKeyAccess(toolsCfg.SandboxSSHKey); err != nil {
-						fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de l'octroi d'accès à la clé SSH (%s) : %v", toolsCfg.SandboxSSHKey, err)))
-					}
+				sshKey, err := sandbox.ResolveSSHKey(toolsCfg.WorkspaceDir, toolsCfg.SandboxSSHKey)
+				if err != nil {
+					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de la préparation de la clé SSH dédiée : %v", err)))
+				} else if err := sandbox.EnsureSSHKeyAccess(sshKey); err != nil {
+					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de l'octroi d'accès à la clé SSH (%s) : %v", sshKey, err)))
 				}
-				if err := sandbox.EnsureGitConfig(toolsCfg.WorkspaceDir, toolsCfg.SandboxSSHKey); err != nil {
+				if err := sandbox.EnsureGitConfig(toolsCfg.WorkspaceDir, sshKey); err != nil {
 					fmt.Fprintln(out, color(ansiRed, fmt.Sprintf("[sandbox] échec de la préparation de la config git (%s) : %v", toolsCfg.WorkspaceDir, err)))
 				}
 				// Doit être créé AVANT GrantDirectory : c'est ce dernier qui

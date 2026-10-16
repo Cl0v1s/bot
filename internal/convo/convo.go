@@ -88,6 +88,32 @@ func (c *Conversation) Full() []llm.Message {
 	if c.SystemPrompt != "" {
 		full = append(full, llm.Message{Role: "system", Content: c.SystemPrompt})
 	}
+	hasUser := false
+	for _, m := range c.Messages {
+		// Un "user" au contenu vide est sérialisé sans "content"
+		// (omitempty) : le gabarit Jinja ne le reconnaît pas comme requête.
+		if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
+			hasUser = true
+			break
+		}
+	}
+	if !hasUser && len(c.Messages) > 0 {
+		// Compaction/troncature ont pu supprimer tous les messages "user"
+		// (ex. longue boucle d'outils sur un document) : certains gabarits
+		// Jinja de llama-server lèvent alors "No user query found in
+		// messages." (HTTP 500). On insère une requête utilisateur factice
+		// en tête de l'historique conservé.
+		// Les messages "system" de tête (ex. résumé de compaction) restent
+		// devant, suivis du message utilisateur factice, puis les autres messages.
+		i := 0
+		for i < len(c.Messages) && c.Messages[i].Role == "system" {
+			i++
+		}
+		full = append(full, c.Messages[:i]...)
+		full = append(full, llm.Message{Role: "user", Content: "[Continuation of conversation - please continue the current task.]"})
+		full = append(full, c.Messages[i:]...)
+		return full
+	}
 	full = append(full, c.Messages...)
 	return full
 }

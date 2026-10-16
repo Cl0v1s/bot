@@ -44,6 +44,9 @@ type Config struct {
 	// (voir llm.Client.DisableVision).
 	LLMDisableVision bool
 
+	// LLMEnableThinking : LLM_ENABLE_THINKING (true/false) ; nil si non défini.
+	LLMEnableThinking *bool
+
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
 	ContextCompactAt   float64 // fraction du contexte (0-1) déclenchant la compaction
@@ -63,7 +66,7 @@ type Config struct {
 	SMTPUser     string
 	SMTPPassword string
 	SMTPFrom     string
-	SMTPTLSMode  string // "starttls" | "tls" | "none"
+	SMTPTLSMode  string // "starttls" | "tls"
 
 	PollInterval time.Duration
 
@@ -88,13 +91,10 @@ type Config struct {
 	// lancement et effectuée si besoin, avec confirmation explicite.
 	SandboxUserEnabled bool
 
-	// SandboxSSHKey : chemin d'une clé privée SSH de l'utilisateur courant,
-	// à laquelle le compte sandbox "llm" reçoit un accès en lecture seule
-	// (voir internal/sandbox.EnsureSSHKeyAccess) pour que les commandes git
-	// exécutées via run_shell (clone/push/pull sur un dépôt distant en SSH)
-	// puissent s'authentifier avec la véritable identité de l'utilisateur.
-	// Affaiblit délibérément l'isolation du sandbox pour ce cas précis : "" =
-	// désactivé (défaut si aucune clé usuelle n'est trouvée). Sans effet si
+	// SandboxSSHKey : chemin optionnel d'une clé privée SSH explicite pour le
+	// compte sandbox "llm" (voir internal/sandbox.ResolveSSHKey). Vide (défaut)
+	// = clé dédiée au bot, générée dans le workspace (deploy key) : jamais les
+	// clés personnelles de l'utilisateur ni son agent SSH. Sans effet si
 	// SandboxUserEnabled est faux.
 	SandboxSSHKey string
 
@@ -274,24 +274,6 @@ func EnsureConfigFile(path string, defaultContent []byte) error {
 		return fmt.Errorf("création de %q: %w", path, err)
 	}
 	return nil
-}
-
-// defaultSandboxSSHKey retourne le premier fichier de clé privée SSH usuel
-// trouvé dans ~/.ssh (ordre de préférence : ed25519, ecdsa, rsa), ou "" si
-// aucun n'existe — auquel cas SandboxSSHKey reste désactivé par défaut
-// (aucun changement de comportement pour qui ne s'en sert pas).
-func defaultSandboxSSHKey() string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ""
-	}
-	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
-		path := filepath.Join(home, ".ssh", name)
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return path
-		}
-	}
-	return ""
 }
 
 // LoadDotEnv lit un fichier .env (KEY=VALUE par ligne) s'il existe et
@@ -522,6 +504,13 @@ func Load() Config {
 		LLMMaxRetries:    llmMaxRetries,
 		LLMParallel:      llmParallel,
 		LLMDisableVision: getenvBool("LLM_DISABLE_VISION", true),
+		LLMEnableThinking: func() *bool {
+			if os.Getenv("LLM_ENABLE_THINKING") == "" {
+				return nil
+			}
+			v := getenvBool("LLM_ENABLE_THINKING", true)
+			return &v
+		}(),
 
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,
@@ -551,7 +540,7 @@ func Load() Config {
 		MailToolsEnabled: getenvBool("MAIL_TOOLS_ENABLED", false),
 
 		SandboxUserEnabled: getenvBool("SANDBOX_USER_ENABLED", true),
-		SandboxSSHKey:      getenv("SANDBOX_SSH_KEY", defaultSandboxSSHKey()),
+		SandboxSSHKey:      getenv("SANDBOX_SSH_KEY", ""),
 
 		ToolsShellTimeout:                toolsShellTimeout,
 		ToolsShellMaxTimeout:             toolsShellMaxTimeout,
@@ -616,6 +605,14 @@ func (c Config) RequireMail() error {
 	}
 	if len(missing) > 0 {
 		return fmt.Errorf("variables d'environnement manquantes pour le mode mail: %s", strings.Join(missing, ", "))
+	}
+	if !c.IMAPTLS {
+		return fmt.Errorf("IMAP_TLS=false refusé : TLS obligatoire pour IMAP")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.SMTPTLSMode)) {
+	case "", "starttls", "tls":
+	default:
+		return fmt.Errorf("SMTP_TLS_MODE=%q refusé : TLS obligatoire (\"starttls\" ou \"tls\")", c.SMTPTLSMode)
 	}
 	return nil
 }

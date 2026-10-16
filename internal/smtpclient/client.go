@@ -1,6 +1,6 @@
 // Package smtpclient envoie des mails via SMTP en utilisant uniquement la
-// stdlib (net/smtp), avec support STARTTLS, TLS implicite, ou aucune
-// sécurité (réseau local de confiance).
+// stdlib (net/smtp), avec STARTTLS ou TLS implicite obligatoires (le mode
+// sans chiffrement est refusé).
 package smtpclient
 
 import (
@@ -21,7 +21,7 @@ type Client struct {
 	User     string
 	Password string
 	From     string
-	TLSMode  string // "starttls" | "tls" | "none"
+	TLSMode  string // "starttls" | "tls"
 }
 
 type Mail struct {
@@ -36,18 +36,35 @@ func (c *Client) addr() string {
 	return net.JoinHostPort(c.Host, c.Port)
 }
 
-// Send envoie un mail texte simple.
+// Send envoie un mail texte simple. Le transport est toujours chiffré et le
+// certificat du serveur vérifié : aucun identifiant ne transite en clair.
 func (c *Client) Send(m Mail) error {
 	msg := buildMessage(c.From, m)
 
-	switch strings.ToLower(c.TLSMode) {
-	case "tls":
-		return c.sendImplicitTLS(m.To, msg)
-	case "none":
-		return c.sendPlain(m.To, msg)
-	default: // "starttls"
-		return c.sendStartTLS(m.To, msg)
+	mode, err := NormalizeTLSMode(c.TLSMode)
+	if err != nil {
+		return err
 	}
+	return c.send(mode, m.To, msg)
+}
+
+// NormalizeTLSMode valide un mode TLS SMTP ("starttls" par défaut, ou "tls").
+// "none" et toute autre valeur sont refusés.
+func NormalizeTLSMode(mode string) (string, error) {
+	switch m := strings.ToLower(strings.TrimSpace(mode)); m {
+	case "", "starttls":
+		return "starttls", nil
+	case "tls":
+		return "tls", nil
+	case "none":
+		return "", fmt.Errorf("SMTP_TLS_MODE=none refusé : TLS obligatoire (utiliser \"starttls\" ou \"tls\")")
+	default:
+		return "", fmt.Errorf("SMTP_TLS_MODE invalide %q (attendu \"starttls\" ou \"tls\")", mode)
+	}
+}
+
+func (c *Client) tlsConfig() *tls.Config {
+	return &tls.Config{ServerName: c.Host, MinVersion: tls.VersionTLS12}
 }
 
 func (c *Client) auth() smtp.Auth {
@@ -57,38 +74,41 @@ func (c *Client) auth() smtp.Auth {
 	return smtp.PlainAuth("", c.User, c.Password, c.Host)
 }
 
-// sendStartTLS s'appuie sur smtp.SendMail, qui négocie STARTTLS automatiquement
-// si le serveur l'annonce (cas standard pour le port 587).
-func (c *Client) sendStartTLS(to string, msg []byte) error {
-	err := smtp.SendMail(c.addr(), c.auth(), c.From, []string{to}, msg)
-	if err != nil {
-		return fmt.Errorf("envoi SMTP (starttls): %w", err)
-	}
-	return nil
-}
+// send ouvre la connexion (TLS implicite, ou STARTTLS obligatoire) et
+// n'authentifie qu'une fois le canal chiffré et vérifié.
+func (c *Client) send(mode, to string, msg []byte) error {
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
 
-func (c *Client) sendPlain(to string, msg []byte) error {
-	err := smtp.SendMail(c.addr(), c.auth(), c.From, []string{to}, msg)
-	if err != nil {
-		return fmt.Errorf("envoi SMTP: %w", err)
+	var conn net.Conn
+	var err error
+	if mode == "tls" {
+		conn, err = tls.DialWithDialer(dialer, "tcp", c.addr(), c.tlsConfig())
+	} else {
+		conn, err = dialer.Dial("tcp", c.addr())
 	}
-	return nil
-}
-
-// sendImplicitTLS gère le cas port 465 (TLS dès la connexion, avant tout
-// échange SMTP en clair), non couvert par smtp.SendMail.
-func (c *Client) sendImplicitTLS(to string, msg []byte) error {
-	conn, err := tls.Dial("tcp", c.addr(), &tls.Config{ServerName: c.Host})
 	if err != nil {
-		return fmt.Errorf("connexion TLS SMTP: %w", err)
+		return fmt.Errorf("connexion SMTP: %w", err)
 	}
 	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
 	client, err := smtp.NewClient(conn, c.Host)
 	if err != nil {
 		return fmt.Errorf("client SMTP: %w", err)
 	}
 	defer client.Close()
+
+	if mode == "starttls" {
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return fmt.Errorf("le serveur SMTP n'annonce pas STARTTLS : envoi refusé (pas de transport en clair)")
+		}
+		if err := client.StartTLS(c.tlsConfig()); err != nil {
+			return fmt.Errorf("STARTTLS SMTP: %w", err)
+		}
+		if _, secure := client.TLSConnectionState(); !secure {
+			return fmt.Errorf("STARTTLS SMTP: connexion non chiffrée après négociation, envoi refusé")
+		}
+	}
 
 	if auth := c.auth(); auth != nil {
 		if err := client.Auth(auth); err != nil {
