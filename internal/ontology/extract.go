@@ -126,7 +126,10 @@ func (d *Distiller) Run(ctx context.Context, messages []llm.Message) (Stats, err
 	if client.MaxTokens == 0 || client.MaxTokens > maxExtractionTokens {
 		client.MaxTokens = maxExtractionTokens
 	}
-	msg, _, err := client.ChatCompletion(ctx, req, nil)
+	// En streaming : le serveur ne remarque l'annulation (nouveau message de
+	// l'utilisateur) qu'à l'écriture du token suivant ; une requête non
+	// streamée continue de générer et retarde la requête de l'utilisateur.
+	msg, _, err := client.ChatCompletionStream(ctx, req, nil, llm.StreamCallbacks{})
 	if err != nil {
 		return Stats{}, fmt.Errorf("extraction: %w", err)
 	}

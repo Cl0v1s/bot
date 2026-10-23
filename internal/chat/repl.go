@@ -82,6 +82,9 @@ type ToolsConfig struct {
 	// message de l'utilisateur.
 	Ontology     *ontology.Store
 	OntologyIdle time.Duration
+	// CompactIdle : inactivité de l'utilisateur après laquelle le contexte
+	// est compacté automatiquement (comme /compact). 0 = désactivé.
+	CompactIdle time.Duration
 	// OntologyOrphanAge : âge de purge des concepts orphelins par
 	// /ontology clean (0 = pas de purge).
 	OntologyOrphanAge time.Duration
@@ -427,6 +430,10 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// N'est appelée que quand aucun tour n'est en cours (conv accédée sans
 	// verrou dédié, voir le commentaire de Run).
 	runCommand := func(line string) (handled, exit bool) {
+		if isThinkCommand(line) {
+			runThinkCommand(out, client, strings.Fields(line)[1:])
+			return true, false
+		}
 		switch line {
 		case "/exit", "/quit":
 			return true, true
@@ -630,6 +637,8 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}()
 	}
 
+	var ontologyCancel context.CancelFunc // non nil pendant /ontology
+
 	// dispatchCompact force une compaction (résumé + extraction mémoire, en
 	// parallèle — voir convo.Conversation.Compact) comme si le seuil venait
 	// d'être atteint, puis le filet de sécurité de dernier recours (voir
@@ -637,7 +646,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// ne doit donc pas bloquer la boucle principale. Contrairement à
 	// dispatchTurn, ne touche jamais conv.Messages via AddUser : "/compact"
 	// n'est pas un message envoyé au modèle.
-	dispatchCompact := func() {
+	dispatchCompact := func(auto bool) {
 		go func() {
 			cancelled := false
 			defer func() { doneCh <- cancelled }()
@@ -651,9 +660,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				reqErrorLine(err)
 				return
 			}
-			if compacted {
+			switch {
+			case compacted && auto:
+				fmt.Fprintln(out, color(ansiGray, "[contexte compacté après inactivité]"))
+			case compacted:
 				fmt.Fprintln(out, "[contexte compacté manuellement]")
-			} else {
+			case !auto:
 				fmt.Fprintln(out, "[rien à compacter : historique trop court, ou tout fait partie d'un même groupe d'appel d'outil]")
 			}
 			// Même filet de sécurité qu'après une compaction automatique :
@@ -666,19 +678,29 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 
 	// dispatchOntology exécute /ontology [clean [apply]] en tâche de fond
 	// (l'arbitrage des doublons est un appel LLM), comme dispatchCompact.
+	// Si l'utilisateur envoie un nouveau message pendant ce temps, l'analyse
+	// est abandonnée (ontologyCancel) sans être relancée.
 	dispatchOntology := func(args []string) {
 		scratchDir := "" // vide : répertoire temporaire du système
 		if toolsCfg.WorkspaceDir != "" {
 			scratchDir = filepath.Join(toolsCfg.WorkspaceDir, "scratchpad")
 		}
+		ictx, endReq := interrupt.begin(ctx)
+		reqCtx, cancelOnto := context.WithCancel(ictx)
+		ontologyCancel = cancelOnto
 		go func() {
 			cancelled := false
 			defer func() { doneCh <- cancelled }()
-
-			reqCtx, endReq := interrupt.begin(ctx)
 			defer endReq()
+			defer cancelOnto()
 
 			if err := runOntologyCommand(reqCtx, out, toolsCfg.Ontology, &ontology.Distiller{Store: toolsCfg.Ontology, Client: client}, args, toolsCfg.OntologyOrphanAge, scratchDir); err != nil {
+				if errors.Is(err, context.Canceled) && ictx.Err() == nil {
+					// Abandon demandé par un nouveau message : pas une
+					// annulation par Ctrl+C, la file d'attente est conservée.
+					fmt.Fprintln(out, color(ansiYellow, "[analyse ontologique abandonnée : nouvelle demande]"))
+					return
+				}
 				cancelled = errors.Is(err, context.Canceled)
 				reqErrorLine(err)
 			}
@@ -723,7 +745,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			return true, false
 		}
 		if line == "/compact" {
-			dispatchCompact()
+			dispatchCompact(false)
 			return true, false
 		}
 		if isOntologyCommand(line) {
@@ -861,8 +883,42 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 	}
 
+	// Compaction automatique après CompactIdle d'inactivité (mêmes règles
+	// que l'extraction ontologique : un tour long ne compte pas). Une seule
+	// fois par période d'inactivité (compactTimer n'est réarmé que par une
+	// interaction). Si l'extraction ontologique est en cours, on diffère :
+	// la compaction supprimerait les messages qu'elle analyse.
+	var (
+		compactTimer   *time.Timer
+		compactC       <-chan time.Time
+		idleCompacting bool
+	)
+	if toolsCfg.CompactIdle > 0 {
+		compactTimer = time.NewTimer(toolsCfg.CompactIdle)
+		compactTimer.Stop()
+		compactC = compactTimer.C
+		defer compactTimer.Stop()
+	}
+	armCompact := func() {
+		if compactTimer != nil {
+			compactTimer.Reset(toolsCfg.CompactIdle)
+		}
+	}
+
 	for {
 		select {
+		case <-compactC:
+			switch {
+			case busy:
+				// Une tâche (re)arme le timer à sa fin : rien à faire.
+			case distilling:
+				compactTimer.Reset(30 * time.Second)
+			default:
+				idleCompacting = true
+				busy = true
+				dispatchCompact(true)
+			}
+
 		case <-idleC:
 			if busy || distilling || !dirty {
 				continue
@@ -924,6 +980,10 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				}
 				armIdle()
 			}
+			armCompact()
+			if ontologyCancel != nil && !isQueueCommand(line) {
+				ontologyCancel()
+			}
 			if busy {
 				queue = append(queue, queuedLine{text: line, voice: cl.voice})
 				fmt.Fprintln(out, color(ansiCyan, "  [mis en file d'attente, traité après la réponse en cours]"))
@@ -941,8 +1001,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 
 		case cancelled := <-doneCh:
 			busy = false
+			ontologyCancel = nil
 			refreshVoiceCtx()
 			armIdle()
+			if idleCompacting {
+				idleCompacting = false // pas de nouvelle compaction sans interaction
+			} else {
+				armCompact()
+			}
 			if cancelled && len(queue) > 0 {
 				queue = nil
 				fmt.Fprintln(out, color(ansiYellow, "[file d'attente vidée après annulation]"))
@@ -1031,5 +1097,5 @@ func isQueueCommand(line string) bool {
 	case "/exit", "/quit", "/new", "/reset", "/stats", "/compact":
 		return true
 	}
-	return isOntologyCommand(line)
+	return isOntologyCommand(line) || isThinkCommand(line)
 }

@@ -122,7 +122,8 @@ func TestDistillPendingFeedsOntology(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		content, _ := json.Marshal(`{"entities":[{"name":"Synapse","type":"Projet"}],"relations":[]}`)
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":` + string(content) + `}}]}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":` + string(content) + `},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"))
 	}))
 	defer srv.Close()
 

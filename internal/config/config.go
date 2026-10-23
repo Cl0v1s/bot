@@ -3,6 +3,7 @@
 package config
 
 import (
+	"bot/internal/llm"
 	"bufio"
 	"bytes"
 	"fmt"
@@ -46,6 +47,8 @@ type Config struct {
 
 	// LLMEnableThinking : LLM_ENABLE_THINKING (true/false) ; nil si non défini.
 	LLMEnableThinking *bool
+	// LLMReasoningEffort : LLM_REASONING_EFFORT (low/medium/high) ; "" = non envoyé.
+	LLMReasoningEffort string
 
 	// Gestion du contexte de conversation
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
@@ -162,6 +165,9 @@ type Config struct {
 	// l'extraction. 0 = pas d'extraction automatique (la base reste
 	// interrogeable).
 	OntologyIdle time.Duration
+	// CompactIdle : inactivité de l'utilisateur (mode chat) après laquelle le
+	// contexte est compacté automatiquement. 0 = jamais.
+	CompactIdle time.Duration
 	// OntologyCleanOnStart : nettoie l'ontologie au démarrage (fusion des
 	// doublons évidents, relations normalisées, orphelins périmés purgés), après
 	// sauvegarde de la base. OntologyOrphanDays : âge à partir duquel un
@@ -409,6 +415,16 @@ func Load() Config {
 		ontologyIdle = 5 * time.Minute
 	}
 
+	reasoningEffort, ok := llm.ParseReasoningEffort(os.Getenv("LLM_REASONING_EFFORT"))
+	if !ok {
+		reasoningEffort = ""
+	}
+
+	compactIdle, err := time.ParseDuration(getenv("CONTEXT_COMPACT_IDLE", "10m"))
+	if err != nil || compactIdle < 0 {
+		compactIdle = 10 * time.Minute
+	}
+
 	ontologyOrphanDays, err := strconv.Atoi(getenv("ONTOLOGY_ORPHAN_DAYS", "90"))
 	if err != nil || ontologyOrphanDays < 0 {
 		ontologyOrphanDays = 90
@@ -512,6 +528,8 @@ func Load() Config {
 			return &v
 		}(),
 
+		LLMReasoningEffort: reasoningEffort,
+
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,
 		ContextKeepLastMsg: contextKeepLast,
@@ -560,6 +578,7 @@ func Load() Config {
 
 		OntologyEnabled: getenvBool("ONTOLOGY_ENABLED", true),
 		OntologyIdle:    ontologyIdle,
+		CompactIdle:     compactIdle,
 
 		OntologyCleanOnStart: getenvBool("ONTOLOGY_CLEAN_ON_START", true),
 		OntologyOrphanDays:   ontologyOrphanDays,

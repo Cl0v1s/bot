@@ -111,6 +111,7 @@ func main() {
 	client.DisableVision = cfg.LLMDisableVision
 	client.MaxTokens = cfg.LLMMaxTokens
 	client.EnableThinking = cfg.LLMEnableThinking
+	client.ReasoningEffort = cfg.LLMReasoningEffort
 	client.MaxRetries = cfg.LLMMaxRetries
 
 	// Dans le workspace, pas relatif au répertoire depuis lequel ./bot est
@@ -176,6 +177,7 @@ func main() {
 			SandboxSSHKey:               cfg.SandboxSSHKey,
 			Ontology:                    ontoStore,
 			OntologyIdle:                cfg.OntologyIdle,
+			CompactIdle:                 cfg.CompactIdle,
 			OntologyOrphanAge:           time.Duration(cfg.OntologyOrphanDays) * 24 * time.Hour,
 			Voice: voice.Config{
 				Enabled: cfg.VoiceEnabled,

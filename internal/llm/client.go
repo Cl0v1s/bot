@@ -112,6 +112,13 @@ type Client struct {
 	// (Qwen3.x ne raisonne pas sans). nil = comportement par défaut du serveur.
 	EnableThinking *bool
 
+	// ReasoningEffort : "low", "medium" ou "high" — envoyé en
+	// reasoning_effort (API OpenAI) et chat_template_kwargs.reasoning_effort
+	// (gpt-oss et templates à niveaux). Les Qwen3.x n'ont PAS de niveaux
+	// (seulement enable_thinking) : le champ y est ignoré par le template.
+	// "" = non envoyé.
+	ReasoningEffort string
+
 	// MaxRetries / RetryBackoff : relances automatiques d'une requête après
 	// une erreur transitoire — connexion au serveur impossible ou coupée,
 	// flux interrompu en cours de génération (EOF inattendu), status
@@ -155,6 +162,7 @@ type chatRequest struct {
 	// ChatTemplateKwargs : enable_thinking pour les Qwen3.x (llama.cpp /
 	// Unsloth). Omis quand Client.EnableThinking est nil (défaut serveur).
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+	ReasoningEffort    string         `json:"reasoning_effort,omitempty"`
 }
 
 type chatResponse struct {
@@ -276,6 +284,7 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 		MaxTokens: c.MaxTokens,
 
 		ChatTemplateKwargs: c.templateKwargs(),
+		ReasoningEffort:    c.ReasoningEffort,
 	})
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -397,6 +406,7 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		MaxTokens:     c.MaxTokens,
 
 		ChatTemplateKwargs: c.templateKwargs(),
+		ReasoningEffort:    c.ReasoningEffort,
 	})
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -603,10 +613,29 @@ func (t *thinkSplitter) flush(reason, content func(string)) {
 }
 
 func (c *Client) templateKwargs() map[string]any {
-	if c.EnableThinking == nil {
+	kw := map[string]any{}
+	if c.EnableThinking != nil {
+		kw["enable_thinking"] = *c.EnableThinking
+	}
+	if c.ReasoningEffort != "" {
+		kw["reasoning_effort"] = c.ReasoningEffort
+	}
+	if len(kw) == 0 {
 		return nil
 	}
-	return map[string]any{"enable_thinking": *c.EnableThinking}
+	return kw
+}
+
+// ParseReasoningEffort normalise un niveau de réflexion ("low", "medium",
+// "high" ; "" ou "auto" = aucun).
+func ParseReasoningEffort(s string) (string, bool) {
+	switch v := strings.ToLower(strings.TrimSpace(s)); v {
+	case "", "auto":
+		return "", true
+	case "low", "medium", "high":
+		return v, true
+	}
+	return "", false
 }
 
 // TryUnloadModel demande au serveur d'inférence de décharger le modèle, via

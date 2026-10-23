@@ -18,7 +18,8 @@ func TestDistillerRun(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		sawPrompt = string(body)
 		content, _ := json.Marshal(`{"entities":[{"name":"Synapse","type":"Projet","description":"d"}],"relations":[{"source":"Synapse","relation":"appartient à","target":"Medicine"}]}`)
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":` + string(content) + `}}]}`))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"choices":[{"delta":{"content":` + string(content) + `},"finish_reason":"stop"}]}` + "\n\ndata: [DONE]\n\n"))
 	}))
 	defer srv.Close()
 
