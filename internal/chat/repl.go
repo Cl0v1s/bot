@@ -158,14 +158,17 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// cours affichée en bas, sous la sortie, voir console.go), syncWriter
 	// sinon.
 	var editor *lineEditor
+	var con *console
 	if f, ok := in.(*os.File); ok && isTerminalFile(f) {
-		con := newConsole(out, terminalWidth(f))
+		con = newConsole(out, terminalWidth(f))
 		if liveCursor {
 			con.promptColor, con.inputColor = ansiInput, ansiInput
 		}
 		if ed, err := newLineEditor(f, con); err == nil {
 			editor = ed
 			out = con
+		} else {
+			con = nil
 		}
 		// Si stty échoue (terminal exotique), on retombe silencieusement
 		// sur bufio.Scanner ci-dessous : pas d'historique/édition avancée,
@@ -221,8 +224,19 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// la commande vocale est active (voiceSess) : on peut alors parler au bot
 	// sans regarder le terminal, où s'affiche le détail complet.
 	var voiceSess *voice.Session
+	confirmBanner := func() {
+		fmt.Fprintln(out, color(ansiBold+ansiMagenta, "\n━━━━ ⚠  CONFIRMATION REQUISE ━━━━"))
+	}
 	askYesNo := func(ctx context.Context, detail, prompt string) bool {
-		fmt.Fprint(out, color(ansiMagenta, prompt))
+		if con != nil {
+			// Zone de saisie : prompt et texte tapé en magenta gras, pour que
+			// la réponse ne passe pas pour un message de chat ordinaire.
+			style := ansiBold + ansiMagenta
+			fmt.Fprintln(out, color(style, strings.TrimRight(prompt, " ")))
+			defer con.restyle("⚠ [o/N] ", style, style)()
+		} else {
+			fmt.Fprint(out, color(ansiBold+ansiMagenta, prompt))
+		}
 		ch := term.Ask()
 		if voiceSess != nil {
 			voiceSess.AskNotify(detail)
@@ -260,15 +274,18 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		if time.Now().Before(realUserGrantedUntil) {
 			return true, nil
 		}
-		fmt.Fprintln(out, color(ansiMagenta, "\n[run_shell] le modèle demande à exécuter cette commande sous l'identité réelle (hors sandbox, accès complet) :"))
+		confirmBanner()
+		fmt.Fprintln(out, color(ansiMagenta, "[run_shell] le modèle demande à exécuter cette commande sous l'identité réelle (hors sandbox, accès complet) :"))
 		fmt.Fprintln(out, color(ansiMagenta, "  "+command))
-		if whiteList {
-			fmt.Fprintln(out, color(ansiMagenta, "  (liste blanche demandée : une fois autorisée, CETTE commande exacte ne redemandera plus jamais, y compris aux prochains lancements)"))
-		}
-		if window {
-			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  (fenêtre demandée : une fois autorisé, valable %s pour les commandes suivantes sous l'identité réelle, sans redemander)", realUserGrantWindow)))
-		} else {
-			fmt.Fprintln(out, color(ansiMagenta, "  (autorisation ponctuelle : uniquement pour cette commande)"))
+		// Un seul message de portée, pour ne pas afficher "liste blanche" et
+		// "ponctuelle" en même temps (white_list n'implique pas window).
+		switch {
+		case whiteList:
+			fmt.Fprintln(out, color(ansiMagenta, "  ➜ PERMANENT (liste blanche) : répondre « o » autorise définitivement CETTE commande exacte, même aux prochains lancements, sans jamais redemander."))
+		case window:
+			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  ➜ FENÊTRE %s : répondre « o » autorise toute commande sous l'identité réelle pendant ce délai, sans redemander.", realUserGrantWindow)))
+		default:
+			fmt.Fprintln(out, color(ansiMagenta, "  ➜ PONCTUEL : répondre « o » autorise uniquement cette exécution."))
 		}
 		if !askYesNo(ctx, "Commande sous l'identité réelle : "+command, "  autoriser ? [o/N] ") {
 			return false, nil
@@ -282,11 +299,25 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// confirmClaude : voir tools.ClaudeTool.Confirm — demandé à chaque
 	// appel, Claude Code tournant hors sandbox sous l'identité réelle.
 	confirmClaude := func(ctx context.Context, prompt, workDir string) (bool, error) {
-		fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("\n[run_claude] le modèle demande à lancer Claude Code (hors sandbox, identité réelle) dans %s avec la tâche :", workDir)))
+		confirmBanner()
+		fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("[run_claude] le modèle demande à lancer Claude Code (hors sandbox, identité réelle) dans %s avec la tâche :", workDir)))
 		for _, line := range strings.Split(prompt, "\n") {
 			fmt.Fprintln(out, color(ansiMagenta, "  "+line))
 		}
 		return askYesNo(ctx, fmt.Sprintf("Lancer Claude Code dans %s : %s", workDir, prompt), "  autoriser ? [o/N] "), nil
+	}
+
+	// confirmBrowserChallenge : voir tools.BrowserFetchTool.WaitForUser — met
+	// la requête en pause (même mécanisme et notification que les autres
+	// confirmations) le temps que l'utilisateur résolve le défi anti-bot dans
+	// son propre Chrome.
+	confirmBrowserChallenge := func(ctx context.Context, host, command string) (bool, error) {
+		confirmBanner()
+		fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("[browser_fetch] %s est protégé par une vérification anti-bot. Requête en pause, pour la débloquer :", host)))
+		fmt.Fprintln(out, color(ansiMagenta, "  1. ouvre Chrome sur le profil du bot :"))
+		fmt.Fprintln(out, color(ansiMagenta, "       "+command))
+		fmt.Fprintln(out, color(ansiMagenta, "  2. résous la vérification, vérifie que la page s'affiche, puis FERME la fenêtre"))
+		return askYesNo(ctx, "Résoudre la vérification anti-bot de "+host+" dans Chrome, puis confirmer", "  c'est fait ? (fenêtre fermée) [o/N] "), nil
 	}
 
 	var registry *tools.Registry
@@ -307,7 +338,8 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		}
 
 		perms := tools.NewDirPermissions(func(ctx context.Context, dir, reason string) (bool, error) {
-			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("\n[permission] le modèle demande l'accès au répertoire : %s", dir)))
+			confirmBanner()
+			fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("[permission] le modèle demande l'accès au répertoire : %s", dir)))
 			if reason != "" {
 				fmt.Fprintln(out, color(ansiMagenta, fmt.Sprintf("  raison : %s", reason)))
 			}
@@ -366,7 +398,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.CreateFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.EditFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout, Perms: perms, Sandboxed: sandboxReady},
-			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady},
+			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady, WaitForUser: confirmBrowserChallenge},
 			&tools.RequestDirectoryAccessTool{Perms: perms},
 			&tools.ListDirTool{},
 			&tools.MathTool{},
@@ -391,6 +423,9 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
 			agent.AppendToolUsagePrompt(conv)
+			if wd, err := os.Getwd(); err == nil {
+				agent.AppendWorkingDirPrompt(conv, wd)
+			}
 		}
 		if registry.Has(tools.QueryOntologyToolName) {
 			agent.AppendOntologyPrompt(conv)
@@ -645,17 +680,28 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// EnsureFitsContext), en tâche de fond comme dispatchTurn : un appel LLM,
 	// ne doit donc pas bloquer la boucle principale. Contrairement à
 	// dispatchTurn, ne touche jamais conv.Messages via AddUser : "/compact"
-	// n'est pas un message envoyé au modèle.
+	// n'est pas un message envoyé au modèle. Une compaction automatique
+	// (auto) est abandonnée si l'utilisateur écrit pendant ce temps
+	// (ontologyCancel), pour ne pas retarder sa requête ; son message est
+	// alors traité à la fin, la file d'attente étant conservée.
 	dispatchCompact := func(auto bool) {
+		ictx, endReq := interrupt.begin(ctx)
+		reqCtx, cancelCompact := context.WithCancel(ictx)
+		if auto {
+			ontologyCancel = cancelCompact
+		}
 		go func() {
 			cancelled := false
 			defer func() { doneCh <- cancelled }()
-
-			reqCtx, endReq := interrupt.begin(ctx)
 			defer endReq()
+			defer cancelCompact()
 
 			compacted, err := conv.Compact(reqCtx, client)
 			if err != nil {
+				if auto && errors.Is(err, context.Canceled) && ictx.Err() == nil {
+					fmt.Fprintln(out, color(ansiYellow, "[compaction automatique abandonnée : nouvelle demande]"))
+					return
+				}
 				cancelled = errors.Is(err, context.Canceled)
 				reqErrorLine(err)
 				return

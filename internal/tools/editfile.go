@@ -25,7 +25,7 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 
 func (t *EditFileTool) Description() string {
 	return "Modifie un fichier texte existant en remplaçant un passage exact (\"old_string\") par un autre (\"new_string\"), sans relire ni réécrire le reste du fichier : économe en contexte. " +
-		"\"old_string\" doit correspondre EXACTEMENT au texte du fichier (espaces et indentation compris) et être unique dans le fichier : ajoute quelques lignes de contexte autour si besoin, ou utilise \"replace_all\" pour remplacer toutes les occurrences. Si tu ne connais pas le texte exact, repère-le d'abord avec read_file (\"search\"). Pour ajouter du texte à la FIN du fichier sans le relire (mémoire, journal), utilise \"append\": true avec \"new_string\" (\"old_string\" est alors ignoré)."
+		"\"old_string\" doit correspondre EXACTEMENT au texte du fichier (espaces et indentation compris) et être unique dans le fichier : ajoute quelques lignes de contexte autour si besoin, ou utilise \"replace_all\" pour remplacer toutes les occurrences. Ne suppose ni le chemin ni le texte : vérifie que le fichier existe (list_dir) et lis le passage exact avec read_file (\"search\") AVANT d'appeler cet outil. Pour ajouter du texte à la FIN du fichier sans le relire (mémoire, journal), utilise \"append\": true avec \"new_string\" (\"old_string\" est alors ignoré)."
 }
 
 func (t *EditFileTool) ParametersSchema() json.RawMessage {

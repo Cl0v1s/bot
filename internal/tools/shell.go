@@ -116,7 +116,7 @@ func (t *ShellTool) effectiveRealUserWindow() time.Duration {
 }
 
 func (t *ShellTool) Description() string {
-	base := "Exécute une commande shell locale (via `sh -c`) et retourne sa sortie standard et d'erreur combinées."
+	base := "Exécute une commande shell locale (via `sh -c`) et retourne sa sortie standard et d'erreur combinées. N'invente jamais d'options ni de chemins : vérifie d'abord (command -v, <cmd> --help, man, ls/find, lecture du script) avant d'appeler une commande dont tu n'es pas certain de la syntaxe."
 	if t.Sandboxed {
 		base += fmt.Sprintf(" Exécutée sous le compte système restreint %q, pas sous celui de l'utilisateur.", sandbox.User)
 		if t.ConfirmRealUser != nil {

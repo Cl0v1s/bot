@@ -9,7 +9,15 @@ import (
 func TestMain(m *testing.M) {
 	// Les autres tests utilisent des serveurs httptest sur 127.0.0.1.
 	allowPrivateDestinations = true
-	os.Exit(m.Run())
+	// Profil Chrome isolé : les tests ne touchent jamais au vrai profil du bot.
+	dir, err := os.MkdirTemp("", "bot-test-profile-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("TOOLS_BROWSER_PROFILE_DIR", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
 func TestIsBlockedIP(t *testing.T) {

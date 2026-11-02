@@ -36,11 +36,34 @@ const (
 // request_directory_access).
 const ToolUsagePrompt = `Des outils sont disponibles. Quand une demande peut être satisfaite par un outil (lire un fichier, exécuter une commande, faire une requête HTTP...), appelle-le directement au lieu de décrire ce que tu ferais ou de demander la permission toi-même : l'outil indiquera explicitement s'il manque une autorisation, auquel cas l'utilisateur sera sollicité automatiquement. Ne devine jamais si tu as accès à quelque chose : essaie l'outil, et adapte ta réponse au résultat réel qu'il retourne. Le contexte est limité : pour lire un fichier, préfère read_file avec "search" ou "offset"/"length" à une lecture complète, et pour le modifier, utilise edit_file (remplacement ciblé), et create_file pour créer un fichier.`
 
-// AppendToolUsagePrompt ajoute ToolUsagePrompt au system prompt de conv. À
-// appeler une fois, quand le registre d'outils de la session/du message
-// n'est pas vide.
+// VerificationPrompt impose de valider ses hypothèses AVANT d'agir plutôt
+// que de les découvrir par l'échec : chaque appel d'outil ou de commande
+// externe doit reposer sur des faits observés (existence d'un fichier,
+// options réellement supportées), pas sur la mémoire du modèle, qui invente
+// volontiers des chemins, des flags ou des signatures de scripts.
+const VerificationPrompt = `Règle de vérification préalable : ne fais AUCUNE supposition sur l'état du système ou sur l'interface d'une commande — vérifie-la avant d'agir.
+- Fichiers : avant de modifier un fichier (edit_file), vérifie qu'il existe à ce chemin exact (list_dir, ou run_shell avec find/ls) et lis le passage concerné (read_file avec "search"/"offset") pour copier le texte exact. Ne devine jamais un chemin : cherche-le d'abord (find, grep -rn). Avant create_file, vérifie que le fichier n'existe pas déjà et que le répertoire parent existe.
+- Commandes : avant d'utiliser une commande dont tu n'es pas absolument certain de la syntaxe ou des options dans CET environnement, vérifie qu'elle existe (command -v <cmd>) puis lis son aide (<cmd> --help, <cmd> -h, man <cmd> | head -n 80, ou <cmd> <sous-commande> --help). N'invente jamais un flag, une sous-commande ou un ordre d'arguments.
+- Scripts et programmes du projet : avant de lancer un script (Makefile, package.json, *.sh, CLI maison...), lis-le (ou son --help / la section d'usage) pour connaître les options, arguments et variables d'environnement qu'il accepte réellement.
+- Ressources : avant d'agir sur un dépôt, une branche, un service, un conteneur, un paquet ou une version, vérifie son état réel (git status/branch, ls, docker ps, --version...).
+- Si une vérification contredit ton hypothèse, abandonne l'hypothèse et suis la réalité observée. Si une commande échoue (option inconnue, fichier introuvable, usage affiché), ne retente PAS une variante au hasard : lis l'aide ou cherche la cause réelle d'abord.
+- Regroupe ces vérifications en commandes courtes et peu coûteuses (une seule ligne shell peut vérifier plusieurs choses), et ne vérifie pas ce que tu viens déjà d'observer dans cette conversation.`
+
+// AppendToolUsagePrompt ajoute ToolUsagePrompt et VerificationPrompt au
+// system prompt de conv. À appeler une fois, quand le registre d'outils de
+// la session/du message n'est pas vide.
 func AppendToolUsagePrompt(conv *convo.Conversation) {
-	conv.SystemPrompt = strings.TrimSpace(conv.SystemPrompt + "\n\n" + ToolUsagePrompt)
+	conv.SystemPrompt = strings.TrimSpace(conv.SystemPrompt + "\n\n" + ToolUsagePrompt + "\n\n" + VerificationPrompt)
+}
+
+// AppendWorkingDirPrompt indique au modèle le répertoire courant du
+// processus au lancement de la session : c'est là que run_shell, run_claude
+// et les chemins relatifs s'exécutent par défaut.
+func AppendWorkingDirPrompt(conv *convo.Conversation, dir string) {
+	if dir == "" {
+		return
+	}
+	conv.SystemPrompt = strings.TrimSpace(conv.SystemPrompt + "\n\nRépertoire courant au lancement de la session : " + dir + " (répertoire de travail par défaut des commandes shell et de run_claude).")
 }
 
 // OntologyPrompt explique au modèle qu'il dispose d'une base de
@@ -215,6 +238,35 @@ func shellCallFailed(result string, callErr error) bool {
 		strings.Contains(result, "[commande interrompue après")
 }
 
+// usageErrorMarkers : fragments (en minuscules) de sortie typiques d'une
+// commande appelée avec une option, une sous-commande ou un fichier qui
+// n'existent pas — la preuve qu'une supposition n'a pas été vérifiée.
+var usageErrorMarkers = []string{
+	"unknown option", "unrecognized option", "invalid option", "illegal option",
+	"unknown flag", "unknown shorthand flag", "unknown command", "unknown subcommand",
+	"no such file or directory", "command not found", "not found in path",
+	"usage:", "try '--help'", "try --help", "for more information, try", "no such option",
+	"no such command", "invalid choice", "unexpected argument", "unknown argument",
+}
+
+// verificationHint est ajouté au résultat d'un run_shell raté pour
+// une raison qui ressemble à une supposition non vérifiée (voir
+// looksLikeUnverifiedAssumption) : redirige le modèle vers l'aide/une
+// recherche plutôt qu'une nouvelle variante tentée au hasard.
+const verificationHint = "\n[harnais] Cet échec ressemble à une supposition non vérifiée (option, sous-commande, chemin ou outil inexistant). Avant de réessayer : vérifie l'existence du fichier/de la commande (ls, find, command -v) et lis l'aide réelle (<commande> --help, man, ou le source du script) au lieu de tenter une autre variante au hasard."
+
+// looksLikeUnverifiedAssumption indique si le résultat d'un run_shell raté
+// contient les marqueurs d'une option/commande/fichier inexistant.
+func looksLikeUnverifiedAssumption(result string) bool {
+	low := strings.ToLower(result)
+	for _, m := range usageErrorMarkers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // RetryWarning : texte d'avertissement affiché avant une relance
 // automatique de la requête au LLM après une erreur transitoire (voir
 // llm.WithRetryNotifier) — partagé avec le mode chat sans outils.
@@ -228,6 +280,15 @@ func RetryWarning(attempt, max int, err error) string {
 // casserait l'alternance user/assistant exigée par certains gabarits de chat
 // au tour suivant.
 const truncatedPlaceholder = "[réponse interrompue : limite de tokens de sortie atteinte]"
+
+// maxTruncationRecoveries : nombre de fois, par appel à Run, où une réponse
+// coupée par max_tokens est suivie d'une relance automatique (voir
+// truncationNudge) plutôt que de terminer le tour.
+const maxTruncationRecoveries = 2
+
+// truncationNudge est injecté après une réponse coupée par max_tokens, pour
+// que le tour continue au lieu de s'arrêter sur une réponse inexploitable.
+const truncationNudge = "[harnais] Ta réponse précédente a été coupée par la limite de tokens de sortie avant d'aboutir (raisonnement trop long ou répétitif). Ne répète pas ta réflexion : reprends directement la tâche, avec un raisonnement très bref, et appelle l'outil suivant ou donne ta réponse."
 
 // Run exécute la boucle agentique sur la conversation conv, jusqu'à une
 // réponse finale sans tool_calls. onEvent (optionnel) est appelé pour
@@ -275,6 +336,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 	// un compteur cumulatif sur toute la durée de Run, seulement "combien
 	// d'affilée en ce moment".
 	consecutiveShellFailures := 0
+	truncationRecoveries := 0
 	for step := 0; step < maxSteps; step++ {
 		// Un échec de compaction ne doit JAMAIS faire échouer le tour : la
 		// compaction est une optimisation de contexte, pas un prérequis pour
@@ -334,7 +396,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// et le tour s'arrête sur ce qui a été produit, avec un
 		// avertissement explicite plutôt qu'une réponse silencieusement
 		// tronquée.
+		unusableTruncation := false
 		if msg.FinishReason == llm.FinishReasonLength {
+			// Rien d'exploitable (tool_calls perdus ou aucun texte) : au lieu
+			// d'arrêter le tour, on relance le modèle (borné).
+			unusableTruncation = len(msg.ToolCalls) > 0 || strings.TrimSpace(msg.Content) == ""
 			msg.ToolCalls = nil
 			if strings.TrimSpace(msg.Content) == "" {
 				msg.Content = truncatedPlaceholder
@@ -359,6 +425,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// plus vite.
 		conv.AppendRaw(msg)
 		conv.RecordUsage(usage)
+
+		if msg.FinishReason == llm.FinishReasonLength && unusableTruncation && truncationRecoveries < maxTruncationRecoveries && step+1 < maxSteps {
+			truncationRecoveries++
+			conv.AddUser(truncationNudge)
+			continue
+		}
 
 		if len(msg.ToolCalls) == 0 {
 			return msg.Content, usage, nil

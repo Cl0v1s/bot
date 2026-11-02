@@ -65,7 +65,21 @@ type BrowserFetchTool struct {
 	// Perms, Sandboxed : voir HTTPGetTool (paramètre "save_to").
 	Perms     *DirPermissions
 	Sandboxed bool
+
+	// WaitForUser : si non nil, appelé quand une vérification anti-bot bloque
+	// la page, avec l'hôte et la commande qui ouvre Chrome sur le profil du
+	// bot (voir botChallengeCommand). Doit bloquer jusqu'à ce que l'utilisateur
+	// ait résolu le défi à la main et confirmé (true), ou refusé (false) ; la
+	// requête est alors réessayée (voir maxChallengeRounds). Nil (mode mail :
+	// personne pour répondre) = échec immédiat avec les instructions
+	// (botChallengeHelp).
+	WaitForUser func(ctx context.Context, host, command string) (bool, error)
 }
+
+// maxChallengeRounds : nombre max de résolutions manuelles successives
+// proposées pour un même appel avant d'abandonner — évite de harceler
+// l'utilisateur si le site re-défie malgré le cookie.
+const maxChallengeRounds = 2
 
 func (t *BrowserFetchTool) Name() string { return "browser_fetch" }
 
@@ -101,12 +115,6 @@ type browserFetchArgs struct {
 // fetchWithFirefox (pause réelle, pas d'équivalent WebDriver classique).
 const browserRenderBudget = 8 * time.Second
 
-// chromeUserAgent : voir le commentaire sur l'option --user-agent de
-// fetchWithChrome — aussi réutilisé pour downloadDetectedMedia (voir plus
-// bas), pour présenter au serveur le même user-agent que le navigateur qui
-// vient de réussir à atteindre l'URL, plutôt qu'un client HTTP nu.
-const chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
 // botChallengeMarkers : sous-chaînes (en minuscules) trahissant une page de
 // vérification anti-bot (Cloudflare et consorts) plutôt que le contenu réel
 // demandé — un navigateur headless se fait couramment détecter et bloquer
@@ -122,6 +130,9 @@ var botChallengeMarkers = []string{
 	"attention required! | cloudflare",
 	"enable javascript and cookies to continue",
 	"ddos protection by cloudflare",
+	// DataDome (leboncoin.fr, seloger.com...) : page de défi servie à la
+	// place du contenu, avec un iframe captcha-delivery.com.
+	"captcha-delivery.com",
 }
 
 func looksLikeBotChallenge(html string) bool {
@@ -160,38 +171,65 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 	if timeout <= 0 {
 		timeout = 45 * time.Second // démarrage d'un navigateur (et de geckodriver) compris, plus lent qu'un simple http_get
 	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	result, err := t.fetch(cctx, args.URL)
-	if err != nil {
-		return "", err
+	// Le délai ne couvre qu'UNE tentative : l'attente de l'utilisateur lors
+	// d'un blocage anti-bot (voir WaitForUser) n'y est jamais comptée.
+	attempt := func() (browserFetchResult, error) {
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return t.fetch(cctx, args.URL)
 	}
 
-	// Décidé UNIQUEMENT à partir du Content-Type réel de la réponse réseau
-	// que le navigateur a lui-même reçue en naviguant (voir
-	// fetchWithChromeCDP) — jamais deviné ni redemandé séparément : les
-	// octets renvoyés ici (result.mediaBody) SONT déjà ceux que le
-	// navigateur a obtenus, aucune requête HTTP supplémentaire n'est faite.
-	if result.mediaBody != nil {
-		mediaPath, err := saveMediaBytes(parsed, result.mediaBody, result.mediaContentType)
+	var html string
+	for round := 0; ; round++ {
+		result, err := attempt()
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf(
-			"L'URL pointe directement vers un fichier média (%s), pas une page HTML : enregistré tel quel plutôt que rendu en texte.\nFichier local : %s",
-			result.mediaContentType, mediaPath,
-		), nil
-	}
 
-	html := result.html
-	if looksLikeBotChallenge(html) {
+		// Décidé UNIQUEMENT à partir du Content-Type réel de la réponse réseau
+		// que le navigateur a lui-même reçue en naviguant (voir
+		// fetchWithChromeCDP) — jamais deviné ni redemandé séparément : les
+		// octets renvoyés ici (result.mediaBody) SONT déjà ceux que le
+		// navigateur a obtenus, aucune requête HTTP supplémentaire n'est faite.
+		if result.mediaBody != nil {
+			mediaPath, err := saveMediaBytes(parsed, result.mediaBody, result.mediaContentType)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf(
+				"L'URL pointe directement vers un fichier média (%s), pas une page HTML : enregistré tel quel plutôt que rendu en texte.\nFichier local : %s",
+				result.mediaContentType, mediaPath,
+			), nil
+		}
+
+		if !looksLikeBotChallenge(result.html) {
+			html = result.html
+			break
+		}
+
 		// Sans ce contrôle, le texte de la page de vérification (qui se lit
 		// comme un contenu normal : "Vérification en cours...") serait
 		// renvoyé tel quel au modèle, qui pourrait le prendre pour de
 		// l'information réelle sur la page demandée plutôt que pour un
 		// blocage — mieux vaut échouer explicitement.
-		return "", fmt.Errorf("la page semble protégée par une vérification anti-bot (Cloudflare ou similaire) qui n'a pas pu être contournée : un navigateur headless est souvent détecté et bloqué par ce type de protection, même après avoir attendu la fin du chargement")
+		const blocked = "la page semble protégée par une vérification anti-bot (Cloudflare, DataDome ou similaire) qui n'a pas pu être contournée : un navigateur headless est souvent détecté et bloqué par ce type de protection, même après avoir attendu la fin du chargement"
+		if t.WaitForUser == nil {
+			return "", fmt.Errorf("%s.\n\n%s", blocked, botChallengeHelp(parsed))
+		}
+		if round >= maxChallengeRounds {
+			return "", fmt.Errorf("%s, même après %d résolution(s) manuelle(s) par l'utilisateur", blocked, maxChallengeRounds)
+		}
+
+		// Requête mise en pause le temps que l'utilisateur résolve le défi
+		// dans son propre Chrome (profil du bot), puis réessayée telle quelle.
+		go notifyOS("browser_fetch : vérification anti-bot", "Ouvre Chrome et résous la vérification pour "+parsed.Hostname())
+		ok, err := t.WaitForUser(ctx, parsed.Hostname(), botChallengeCommand(parsed))
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("%s, et l'utilisateur n'a pas confirmé l'avoir résolue : abandon", blocked)
+		}
 	}
 
 	content := htmlToText(html)
@@ -679,4 +717,30 @@ func saveMediaBytes(target *url.URL, body []byte, contentType string) (string, e
 		return "", fmt.Errorf("écriture de %q: %w", dest, err)
 	}
 	return dest, nil
+}
+
+// botChallengeHelp construit les instructions à relayer TELLES QUELLES à
+// l'utilisateur quand une vérification anti-bot bloque la page : ouvrir
+// Chrome avec interface sur le profil persistant du bot (voir
+// browserProfileDir), résoudre le défi à la main, fermer la fenêtre, puis
+// redemander — le cookie obtenu reste dans le profil, aucun redémarrage du
+// bot requis (chaque appel relance son propre Chrome sur ce profil).
+func botChallengeHelp(target *url.URL) string {
+	return fmt.Sprintf(
+		"Dis à l'utilisateur d'ouvrir une session Chrome sur le profil du bot et de résoudre lui-même la vérification, avec cette commande (à copier telle quelle) :\n"+
+			"   %s\n"+
+			"Puis : résoudre la vérification dans la fenêtre, vérifier que la page s'affiche, FERMER la fenêtre (le profil ne peut servir qu'à un Chrome à la fois), et te dire « c'est fait ». "+
+			"Dès qu'il confirme, réessaie la même URL avec browser_fetch : aucun redémarrage du bot n'est nécessaire.",
+		botChallengeCommand(target),
+	)
+}
+
+// botChallengeCommand : commande shell qui ouvre Chrome avec interface sur
+// le profil persistant du bot (voir browserProfileDir), à l'URL du site.
+func botChallengeCommand(target *url.URL) string {
+	bin := findChromeBinary()
+	if bin == "" {
+		bin = "chromium"
+	}
+	return fmt.Sprintf("%q --user-data-dir=%q %q", bin, browserProfileDir(), target.Scheme+"://"+target.Host+"/")
 }

@@ -113,6 +113,32 @@ func (c *console) beginInput(prompt string) {
 	_, _ = c.out.Write(b.Bytes())
 }
 
+// restyle remplace le prompt et les couleurs de la saisie en cours (et la
+// redessine), et retourne une fonction qui rétablit les précédents. Sert à
+// distinguer une réponse à une confirmation d'un message de chat.
+func (c *console) restyle(prompt, promptColor, inputColor string) (restore func()) {
+	c.mu.Lock()
+	oldP, oldPC, oldIC := c.prompt, c.promptColor, c.inputColor
+	c.prompt, c.promptColor, c.inputColor = prompt, promptColor, inputColor
+	c.redrawLocked()
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.prompt, c.promptColor, c.inputColor = oldP, oldPC, oldIC
+		c.redrawLocked()
+	}
+}
+
+func (c *console) redrawLocked() {
+	var b bytes.Buffer
+	c.hide(&b)
+	if c.active {
+		c.draw(&b)
+	}
+	_, _ = c.out.Write(b.Bytes())
+}
+
 // setInput met à jour le texte saisi et la position du curseur, et
 // redessine la zone de saisie.
 func (c *console) setInput(buf []rune, pos int) {

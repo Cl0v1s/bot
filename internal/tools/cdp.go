@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -102,6 +104,20 @@ type browserFetchResult struct {
 	mediaContentType string
 }
 
+// chromeProfileMu sérialise les lancements de Chrome sur le profil
+// persistant (voir browserProfileDir).
+var chromeProfileMu sync.Mutex
+
+// browserProfileDir : profil Chrome du bot — $TOOLS_BROWSER_PROFILE_DIR, à
+// défaut ~/.cache/bot-chrome-profile.
+func browserProfileDir() string {
+	if dir := os.Getenv("TOOLS_BROWSER_PROFILE_DIR"); dir != "" {
+		return dir
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "bot-chrome-profile")
+}
+
 // cdpTarget représente une entrée de la liste JSON exposée par le port de
 // debug HTTP de Chrome (voir chromeDebugTargets).
 type cdpTarget struct {
@@ -145,17 +161,26 @@ func fetchWithChromeCDP(ctx context.Context, bin, target string, maxMediaBytes i
 	// sécurité — un profil existant pourrait être partagé avec une session
 	// utilisateur réelle), et évite au passage tout conflit avec une autre
 	// invocation concurrente de ce même tool.
-	userDataDir, err := os.MkdirTemp("", "bot-chrome-profile-")
-	if err != nil {
-		return browserFetchResult{}, fmt.Errorf("création du profil Chrome temporaire: %w", err)
+	//
+	// Profil persistant par défaut (voir browserProfileDir), jamais supprimé :
+	// garde cookies et sessions entre appels — ex: un captcha résolu à la
+	// main dans ce même profil ouvert avec interface (voir botChallengeHelp),
+	// pris en compte dès l'appel suivant, sans relancer le bot. Un seul Chrome
+	// à la fois peut l'utiliser (verrou SingletonLock) : appels sérialisés par
+	// chromeProfileMu, et la fenêtre visible doit être fermée avant.
+	userDataDir := browserProfileDir()
+	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
+		return browserFetchResult{}, fmt.Errorf("création du profil Chrome %q: %w", userDataDir, err)
 	}
-	defer os.RemoveAll(userDataDir)
+	chromeProfileMu.Lock()
+	defer chromeProfileMu.Unlock()
 
 	cmd := exec.CommandContext(ctx, bin,
 		"--headless=new",
 		"--disable-gpu",
 		"--disable-dev-shm-usage",
-		"--user-agent="+chromeUserAgent,
+		// navigator.webdriver = false (au lieu de true en mode automatisé).
+		"--disable-blink-features=AutomationControlled",
 		fmt.Sprintf("--remote-debugging-port=%d", port),
 		"--user-data-dir="+userDataDir,
 		"about:blank",
@@ -208,7 +233,61 @@ func fetchWithChromeCDP(ctx context.Context, bin, target string, maxMediaBytes i
 		return browserFetchResult{}, err
 	}
 
-	return driveChromeNavigation(newCDPSession(ws), targetID, target, maxMediaBytes)
+	sess := newCDPSession(ws)
+	if err := overrideHeadlessUserAgent(ctx, httpClient, base, sess); err != nil {
+		return browserFetchResult{}, err
+	}
+	return driveChromeNavigation(sess, targetID, target, maxMediaBytes)
+}
+
+// overrideHeadlessUserAgent remplace le user-agent "HeadlessChrome/<v>" que
+// Chrome headless annonce par défaut par celui du même Chrome avec interface,
+// plateforme Linux comprise (Client Hints sec-ch-ua* inclus) — dérivé de la
+// version réellement lancée plutôt que codé en dur : un UA figé (ex: Windows,
+// version 131) incohérent avec le navigateur et la machine réels se détecte.
+func overrideHeadlessUserAgent(ctx context.Context, client *http.Client, base string, sess *cdpSession) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/json/version", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("version de Chrome: %w", err)
+	}
+	defer resp.Body.Close()
+	var v struct {
+		Browser string `json:"Browser"` // "HeadlessChrome/131.0.6778.33"
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return fmt.Errorf("réponse /json/version invalide: %w", err)
+	}
+	_, full, _ := strings.Cut(v.Browser, "/")
+	major, _, _ := strings.Cut(full, ".")
+	if major == "" {
+		return nil // version illisible : UA par défaut plutôt qu'un échec
+	}
+
+	_, err = sess.call("Emulation.setUserAgentOverride", map[string]any{
+		"userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + full + " Safari/537.36",
+		"platform":  "Linux x86_64",
+		"userAgentMetadata": map[string]any{
+			"brands": []map[string]string{
+				{"brand": "Chromium", "version": major},
+				{"brand": "Google Chrome", "version": major},
+				{"brand": "Not_A Brand", "version": "24"},
+			},
+			"fullVersion":     full,
+			"platform":        "Linux",
+			"platformVersion": "",
+			"architecture":    "x86",
+			"model":           "",
+			"mobile":          false,
+		},
+	}, func(cdpMessage) {})
+	if err != nil {
+		return fmt.Errorf("Emulation.setUserAgentOverride: %w", err)
+	}
+	return nil
 }
 
 // waitForChromeDebugPort patiente jusqu'à ce que le port de debug distant de

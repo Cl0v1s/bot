@@ -333,6 +333,57 @@ func TestBrowserFetchFailsExplicitlyOnBotChallenge(t *testing.T) {
 	}
 }
 
+// Avec WaitForUser : la requête est mise en pause sur le défi anti-bot,
+// l'utilisateur est sollicité (avec la commande d'ouverture de Chrome), et la
+// requête est réessayée après sa confirmation.
+func TestBrowserFetchWaitsForUserOnBotChallenge(t *testing.T) {
+	realChromeBinaryOrSkip(t)
+
+	solved := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !solved {
+			fmt.Fprint(w, `<html><body>Checking your browser before accessing the site.</body></html>`)
+			return
+		}
+		fmt.Fprint(w, `<html><body>Contenu réel de la page</body></html>`)
+	}))
+	defer server.Close()
+
+	calls := 0
+	tool := &BrowserFetchTool{WaitForUser: func(ctx context.Context, host, command string) (bool, error) {
+		calls++
+		if !strings.Contains(command, "--user-data-dir=") {
+			t.Errorf("command = %q, attendu une commande avec --user-data-dir", command)
+		}
+		solved = true
+		return true, nil
+	}}
+	out, err := tool.Call(context.Background(), fmt.Sprintf(`{"url":%q}`, server.URL))
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("WaitForUser appelé %d fois, attendu 1", calls)
+	}
+	if !strings.Contains(out, "Contenu réel de la page") {
+		t.Fatalf("sortie = %q, attendu le contenu réel après résolution", out)
+	}
+
+	// Refus de l'utilisateur : échec explicite, sans réessai.
+	solved = false
+	calls = 0
+	tool.WaitForUser = func(ctx context.Context, host, command string) (bool, error) {
+		calls++
+		return false, nil
+	}
+	if _, err := tool.Call(context.Background(), fmt.Sprintf(`{"url":%q}`, server.URL)); err == nil || !strings.Contains(err.Error(), "anti-bot") {
+		t.Fatalf("erreur = %v, attendu un échec anti-bot après refus", err)
+	}
+	if calls != 1 {
+		t.Fatalf("WaitForUser appelé %d fois après refus, attendu 1", calls)
+	}
+}
+
 func TestIsMediaContentType(t *testing.T) {
 	cases := []struct {
 		ct   string

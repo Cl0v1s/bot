@@ -346,8 +346,9 @@ func TestRunRetriesAfterContextOverflowByDroppingOldest(t *testing.T) {
 }
 
 // Une réponse coupée par max_tokens ne doit jamais faire exécuter ses
-// tool_calls (arguments probablement tronqués) : le tour s'arrête avec un
-// avertissement, et l'historique garde un message assistant non vide.
+// tool_calls (arguments probablement tronqués) : le modèle est relancé
+// (maxTruncationRecoveries fois) puis, si cela échoue toujours, le tour
+// s'arrête avec un avertissement et un message assistant non vide.
 func TestRunDoesNotExecuteToolCallsOfTruncatedResponse(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -384,17 +385,36 @@ func TestRunDoesNotExecuteToolCallsOfTruncatedResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if n := atomic.LoadInt32(&calls); n != 1 {
-		t.Errorf("appels LLM = %d, attendu 1 (pas de nouvelle étape après troncature)", n)
+	if n := atomic.LoadInt32(&calls); n != 1+maxTruncationRecoveries {
+		t.Errorf("appels LLM = %d, attendu %d (relances bornées après troncature)", n, 1+maxTruncationRecoveries)
 	}
 	if reply != truncatedPlaceholder {
 		t.Errorf("reply = %q, attendu %q", reply, truncatedPlaceholder)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "max_tokens=50") {
+	if len(warnings) != 1+maxTruncationRecoveries || !strings.Contains(warnings[0], "max_tokens=50") {
 		t.Errorf("avertissements = %v", warnings)
 	}
 	last := conv.Messages[len(conv.Messages)-1]
 	if last.Role != "assistant" || len(last.ToolCalls) != 0 || last.Content == "" {
 		t.Errorf("dernier message = %+v", last)
+	}
+}
+
+func TestLooksLikeUnverifiedAssumption(t *testing.T) {
+	for _, s := range []string{"ls: unrecognized option '--foo'", "sh: 1: foo: command not found", "cat: x: No such file or directory", "error: unknown flag: --bar"} {
+		if !looksLikeUnverifiedAssumption(s) {
+			t.Errorf("%q devrait être détecté", s)
+		}
+	}
+	if looksLikeUnverifiedAssumption("tests failed: 3 assertions") {
+		t.Error("faux positif")
+	}
+}
+
+func TestAppendToolUsagePromptIncludesVerification(t *testing.T) {
+	conv := &convo.Conversation{}
+	AppendToolUsagePrompt(conv)
+	if !strings.Contains(conv.SystemPrompt, "--help") || !strings.Contains(conv.SystemPrompt, "edit_file") {
+		t.Error("VerificationPrompt absent du system prompt")
 	}
 }
