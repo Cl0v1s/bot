@@ -146,6 +146,26 @@ Le bot utilise **sa propre identité SSH**, jamais vos clés personnelles ni vot
 
 Ce fichier n'est jamais réécrit une fois créé (y compris s'il a été édité à la main) : pour appliquer `SANDBOX_SSH_KEY` sur un workspace déjà initialisé sans cette option, supprimez `<workspace>/.sandbox-gitconfig` pour le faire régénérer.
 
+## Serveurs MCP
+
+Des serveurs [MCP](https://modelcontextprotocol.io) se déclarent dans `WORKSPACE_DIR/.bot_mcp.json` (même format que `mcpServers` de Claude Desktop/Code). Leurs outils sont proposés au modèle sous le nom `mcp_<serveur>_<outil>`, en modes chat et mail (ce dernier seulement si `MAIL_TOOLS_ENABLED`).
+
+```json
+{
+  "mcpServers": {
+    "fichiers": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/moi/docs"]},
+    "distant":  {"url": "https://exemple.org/mcp", "headers": {"Authorization": "Bearer ..."}, "timeout": "2m"}
+  }
+}
+```
+
+- Transports : `command`/`args`/`env`/`cwd` (stdio) ou `url`/`headers` (Streamable HTTP). `disabled: true` ignore un serveur. Seuls les outils sont supportés (pas de ressources, prompts ni sampling).
+- Chargé une seule fois au démarrage ; un serveur en échec est signalé par un avertissement et ignoré (connexion abandonnée après 30 s).
+- Fichier **protégé** comme `.env` : doit appartenir à l'utilisateur réel, pas de lien symbolique, inaccessible aux outils fichiers du modèle et au compte sandbox — les commandes déclarées s'exécutent sous votre identité, sans confirmation à chaque appel.
+- La skill par défaut `configure-mcp` guide le modèle, qui écrit le fichier via `run_shell` en `as_real_user` (vous confirmez la commande).
+- **OAuth 2.1 (code + PKCE)** pour les serveurs `url` : `"oauth": {}` (découverte + enregistrement dynamique) ou client pré-enregistré `"oauth": {"clientId": "...", "clientSecret": "...", "scopes": ["..."], "callbackPort": 3118}` (URL de redirection `http://localhost:<port>/callback` à déclarer chez le fournisseur ; `authorizationUrl`+`tokenUrl` si la découverte échoue). Au premier `./bot chat`, une URL s'affiche et le navigateur s'ouvre ; les jetons sont stockés et rafraîchis dans `.bot_mcp_tokens.json` (protégé, 0600). Le mode mail n'utilise que des jetons déjà obtenus.
+- Au démarrage du chat, l'état de chaque serveur est affiché ; en mode mail, il est écrit dans les logs.
+
 ## Ontologie (graphe de connaissances)
 
 Le bot maintient un graphe de **concepts** (personnes, projets, outils, méthodes, préférences...) et de **liens** entre eux (« appartient à », « utilise », « est une sous-catégorie de »...), stocké dans `ontology.db` à la racine du workspace via [go-sqlite-graph](https://github.com/justintout/go-sqlite-graph) (SQLite pur Go, sans CGO).

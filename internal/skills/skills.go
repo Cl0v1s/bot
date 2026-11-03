@@ -134,14 +134,26 @@ revient avec « motif dangereux détecté », propose une alternative plutôt qu
 de la reformuler pour contourner le filtre.
 `
 
-// EnsureDefaults crée, si absent, le sous-répertoire de la skill
-// "creer-une-skill" dans dir (voir defaultSkillContent) : le dossier
+// EnsureDefaults crée, si absents, les sous-répertoires des skills par
+// défaut ("creer-une-skill", "configure-mcp") dans dir (voir defaultSkillContent) : le dossier
 // "skills/" du workspace contient toujours d'office cette meta-skill
 // expliquant comment en déclarer de nouvelles. N'écrase jamais un fichier
 // SKILL.md déjà présent à ce chemin (y compris modifié ou vidé par
 // l'utilisateur) : seule son absence déclenche la (re)création.
 func EnsureDefaults(dir string) error {
-	skillDir := filepath.Join(dir, defaultSkillDir)
+	for _, d := range []struct{ name, content string }{
+		{defaultSkillDir, defaultSkillContent},
+		{configureMCPSkillDir, configureMCPSkillContent},
+	} {
+		if err := ensureSkill(dir, d.name, d.content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureSkill(dir, name, content string) error {
+	skillDir := filepath.Join(dir, name)
 	path := filepath.Join(skillDir, "SKILL.md")
 	if _, err := os.Stat(path); err == nil {
 		return nil
@@ -151,7 +163,7 @@ func EnsureDefaults(dir string) error {
 	if err := os.MkdirAll(skillDir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(defaultSkillContent), 0o644)
+	return os.WriteFile(path, []byte(content), 0o644)
 }
 
 // Load scans dir à la recherche de skills : chaque sous-répertoire immédiat

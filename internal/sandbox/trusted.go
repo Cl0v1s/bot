@@ -24,6 +24,12 @@ const (
 	ConfigFileName              = ".env"
 	AllowedDirsFileName         = ".bot_allowed_dirs.json"
 	WhitelistedCommandsFileName = ".bot_whitelisted_commands.json"
+	// MCPConfigFileName : serveurs MCP (voir internal/mcp) — déclare des
+	// commandes lancées sous l'identité réelle, donc protégé au même titre.
+	MCPConfigFileName = ".bot_mcp.json"
+	// MCPTokensFileName : jetons OAuth des serveurs MCP distants (secrets,
+	// lus et écrits uniquement par le bot sous l'identité réelle).
+	MCPTokensFileName = ".bot_mcp_tokens.json"
 )
 
 // protectedNames : noms de base (fichier ou répertoire) jamais accordés au
@@ -36,6 +42,8 @@ var protectedNames = map[string]bool{
 	ConfigFileName:              true,
 	AllowedDirsFileName:         true,
 	WhitelistedCommandsFileName: true,
+	MCPConfigFileName:           true,
+	MCPTokensFileName:           true,
 	".ssh":                      true,
 	".gnupg":                    true,
 	".netrc":                    true,
@@ -50,7 +58,7 @@ func IsProtectedName(name string) bool {
 	if protectedNames[name] {
 		return true
 	}
-	for _, state := range []string{AllowedDirsFileName, WhitelistedCommandsFileName} {
+	for _, state := range []string{AllowedDirsFileName, WhitelistedCommandsFileName, MCPConfigFileName, MCPTokensFileName} {
 		if strings.HasPrefix(name, state+".") {
 			return true
 		}

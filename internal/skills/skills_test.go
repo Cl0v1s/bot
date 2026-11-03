@@ -84,8 +84,8 @@ func TestEnsureDefaultsCreatesOwnSubdirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if len(got) != 1 || got[0].Name != defaultSkillDir {
-		t.Fatalf("Load() = %+v, attendu la skill par défaut", got)
+	if len(got) != 2 || got[0].Name != configureMCPSkillDir || got[1].Name != defaultSkillDir {
+		t.Fatalf("Load() = %+v, attendu les skills par défaut", got)
 	}
 }
 

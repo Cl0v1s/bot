@@ -19,6 +19,7 @@ import (
 	"bot/internal/convo"
 	"bot/internal/llm"
 	"bot/internal/mailbot"
+	"bot/internal/mcp"
 	"bot/internal/ontology"
 	"bot/internal/sandbox"
 	"bot/internal/skills"
@@ -157,6 +158,7 @@ func main() {
 		}
 		toolsCfg := chat.ToolsConfig{
 			Enabled:                     cfg.ChatToolsEnabled,
+			MCPConfigFile:               filepath.Join(cfg.WorkspaceDir, mcp.ConfigFileName),
 			AllowedDirsFile:             allowedDirsFile,
 			WhitelistedCommandsFile:     whitelistFile,
 			SandboxUserEnabled:          cfg.SandboxUserEnabled,
@@ -361,6 +363,16 @@ func main() {
 					toolList = append(toolList, &tools.ClaudeTool{Bin: cfg.ToolsClaudeBin, PermissionMode: cfg.ToolsClaudePermissionMode, Timeout: cfg.ToolsClaudeTimeout, MaxTimeout: cfg.ToolsClaudeMaxTimeout, Perms: perms})
 				}
 			}
+
+			mcpTools, mcpStatus, closeMCP := tools.LoadMCPToolsStatus(ctx, filepath.Join(cfg.WorkspaceDir, mcp.ConfigFileName), func(m string) { log.Printf("mode mail: %s", m) })
+			defer closeMCP()
+			if len(mcpStatus) == 0 {
+				log.Printf("mode mail: MCP : aucun serveur configuré")
+			}
+			for _, st := range mcpStatus {
+				log.Printf("mode mail: MCP %s", st)
+			}
+			toolList = append(toolList, mcpTools...)
 
 			opts.Tools = tools.NewRegistry(toolList...)
 			opts.ToolsPerms = perms

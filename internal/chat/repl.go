@@ -28,6 +28,9 @@ import (
 // ToolsConfig paramètre les tools disponibles en mode chat.
 type ToolsConfig struct {
 	Enabled bool
+	// MCPConfigFile : configuration des serveurs MCP (voir internal/mcp).
+	// "" = MCP désactivé.
+	MCPConfigFile string
 	// AllowedDirsFile : fichier partagé de répertoires accordés dynamiquement
 	// (voir tools.DirPermissions.WithPersistence). Chaque nouvel accès
 	// accordé en direct par l'utilisateur y est ajouté, et devient ainsi
@@ -420,6 +423,29 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 		if toolsCfg.Ontology != nil {
 			toolList = append(toolList, &tools.QueryOntologyTool{Store: toolsCfg.Ontology})
 		}
+		mcpTools, mcpStatus, closeMCP := tools.LoadMCPToolsStatus(ctx, toolsCfg.MCPConfigFile, func(m string) {
+			fmt.Fprintln(out, color(ansiYellow, "[avertissement: "+m+"]"))
+		}, tools.MCPLoadOptions{Interactive: true, Notify: func(m string) {
+			fmt.Fprintln(out, color(ansiYellow, m))
+		}})
+		defer closeMCP()
+		if len(mcpStatus) == 0 && toolsCfg.MCPConfigFile != "" {
+			fmt.Fprintln(out, color(ansiYellow, "Serveurs MCP : aucun configuré ("+toolsCfg.MCPConfigFile+")"))
+		}
+		if len(mcpStatus) > 0 {
+			fmt.Fprintln(out, "Serveurs MCP :")
+			for _, st := range mcpStatus {
+				c := ansiGreen
+				if !st.OK {
+					c = ansiRed
+				}
+				if st.Disabled {
+					c = ansiYellow
+				}
+				fmt.Fprintln(out, "  "+color(c, st.String()))
+			}
+		}
+		toolList = append(toolList, mcpTools...)
 		registry = tools.NewRegistry(toolList...)
 		if !registry.Empty() {
 			agent.AppendToolUsagePrompt(conv)
