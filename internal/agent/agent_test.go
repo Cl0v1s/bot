@@ -28,8 +28,9 @@ func TestRunSurvivesCompactionFailure(t *testing.T) {
 	var calls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reply := "réponse finale"
-		if atomic.AddInt32(&calls, 1) == 1 {
-			// Premier appel = la tentative de résumé de compaction.
+		if atomic.AddInt32(&calls, 1) <= 1+2 {
+			// Premiers appels = la tentative de résumé de compaction et ses
+			// relances (maxInvalidSummaryRetries).
 			reply = "<tool_call>\n<function=run_shell>\n</function>\n</tool_call>"
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{

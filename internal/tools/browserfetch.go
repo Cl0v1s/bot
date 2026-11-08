@@ -11,11 +11,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
+
+// browserPageCacheTTL : durée pendant laquelle le HTML rendu d'une URL est
+// gardé en mémoire, pour que lire une grande page par portions (offset,
+// search) ne relance pas un navigateur (plusieurs secondes) à chaque appel.
+const browserPageCacheTTL = 5 * time.Minute
+
+type cachedPage struct {
+	html string
+	at   time.Time
+}
 
 // BrowserFetchTool charge une page dans un vrai navigateur headless
 // (exécution du JavaScript comprise) et en retourne le DOM rendu — par
@@ -58,6 +71,9 @@ type BrowserFetchTool struct {
 	Timeout      time.Duration
 	MaxBodyBytes int
 
+	cacheMu sync.Mutex
+	cache   map[string]cachedPage // URL -> HTML rendu (voir browserPageCacheTTL)
+
 	// MaxMediaBytes : taille max acceptée pour un média téléchargé (voir
 	// probeAndSaveMedia). <= 0 = valeur par défaut (25 Mio).
 	MaxMediaBytes int
@@ -86,6 +102,7 @@ func (t *BrowserFetchTool) Name() string { return "browser_fetch" }
 func (t *BrowserFetchTool) Description() string {
 	return "Charge une URL dans un vrai navigateur headless (JavaScript exécuté) et retourne le contenu rendu. " +
 		"Par défaut converti en texte lisible ; passe \"format\":\"html\" pour recevoir le HTML brut à la place — nécessaire pour extraire une information qui vit dans un attribut (ex: l'URL d'une image dans `<img src=\"...\">`, perdue par la conversion en texte, qui ne garde que le texte visible). " +
+		"Le contenu est limité en taille par appel : pour une grande page, lis-la par portions avec \"offset\" (en reprenant à l'offset indiqué en fin de résultat tant qu'il reste du contenu) ou cherche un passage précis avec \"search\", comme avec read_file. " +
 		"À utiliser quand http_get échoue ou revient bredouille (403, protection anti-bot, page qui ne se remplit qu'après exécution de JavaScript côté client) — pas en premier recours : plus lent et plus lourd qu'une simple requête HTTP. " +
 		"Firefox est utilisé en priorité s'il est disponible (avec geckodriver), sinon un navigateur Chromium/Chrome trouvé sur la machine ; échoue explicitement si aucun des deux n'est installé. " +
 		"Si l'URL pointe directement vers un fichier média (image, vidéo, audio, PDF) plutôt qu'une page HTML, il est téléchargé tel quel dans un fichier local et son chemin est renvoyé, au lieu d'un texte rendu inexploitable (le paramètre \"format\" est alors sans effet). " +
@@ -100,6 +117,8 @@ func (t *BrowserFetchTool) ParametersSchema() json.RawMessage {
 	if t.Perms != nil {
 		props["save_to"] = map[string]any{"type": "string", "description": saveToDescription + " Enregistre le contenu au format demandé par \"format\" — typiquement \"html\" pour ensuite chercher des balises (ex: grep '<img' sur le fichier)."}
 	}
+	props["offset"] = map[string]any{"type": "integer", "minimum": 0, "description": "Position (en octets, 0 = début) à partir de laquelle lire le contenu. Si le résultat est tronqué, il indique l'offset de suite à passer pour lire la portion suivante (la page est gardée en cache quelques minutes : pas de rechargement). Incompatible avec \"search\"."}
+	props["search"] = map[string]any{"type": "string", "description": "Motif (expression régulière RE2/Go, ex: \"(?i)breaking change\") : ne renvoie que les lignes du contenu qui correspondent, avec 2 lignes de contexte — à préférer pour trouver un passage précis dans une très grande page. Incompatible avec \"offset\"."}
 	return mustSchema("browser_fetch", props, []string{"url"})
 }
 
@@ -107,6 +126,8 @@ type browserFetchArgs struct {
 	URL    string `json:"url"`
 	Format string `json:"format"`
 	SaveTo string `json:"save_to"`
+	Offset int    `json:"offset"`
+	Search string `json:"search"`
 }
 
 // browserRenderBudget : temps laissé à la page pour finir de se construire
@@ -167,6 +188,20 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 		return "", fmt.Errorf(`paramètre "format" invalide (%q) : "text" ou "html" uniquement`, args.Format)
 	}
 
+	if args.Offset < 0 {
+		return "", fmt.Errorf(`paramètre "offset" invalide : doit être positif ou nul`)
+	}
+	if args.Search != "" && args.Offset > 0 {
+		return "", fmt.Errorf(`"search" et "offset" sont mutuellement exclusifs : utilise l'un ou l'autre, pas les deux`)
+	}
+	var searchRe *regexp.Regexp
+	if args.Search != "" {
+		searchRe, err = regexp.Compile(args.Search)
+		if err != nil {
+			return "", fmt.Errorf(`motif "search" invalide : %w`, err)
+		}
+	}
+
 	timeout := t.Timeout
 	if timeout <= 0 {
 		timeout = 45 * time.Second // démarrage d'un navigateur (et de geckodriver) compris, plus lent qu'un simple http_get
@@ -180,7 +215,16 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 	}
 
 	var html string
-	for round := 0; ; round++ {
+	// Cache réservé à la lecture par portions : un appel simple (sans offset
+	// ni search) recharge toujours la page, pour ne pas resservir du périmé.
+	if args.Offset > 0 || searchRe != nil {
+		t.cacheMu.Lock()
+		if c, ok := t.cache[args.URL]; ok && time.Since(c.at) < browserPageCacheTTL {
+			html = c.html
+		}
+		t.cacheMu.Unlock()
+	}
+	for round := 0; html == ""; round++ {
 		result, err := attempt()
 		if err != nil {
 			return "", err
@@ -204,6 +248,12 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 
 		if !looksLikeBotChallenge(result.html) {
 			html = result.html
+			t.cacheMu.Lock()
+			if t.cache == nil {
+				t.cache = map[string]cachedPage{}
+			}
+			t.cache[args.URL] = cachedPage{html: html, at: time.Now()}
+			t.cacheMu.Unlock()
 			break
 		}
 
@@ -247,9 +297,32 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 	if maxBytes <= 0 {
 		maxBytes = 20000
 	}
+	total := len(content)
+	if searchRe != nil {
+		content = grepLines(content, searchRe, 2, maxBytes)
+		if content == "" {
+			return fmt.Sprintf("Aucune ligne ne correspond à %q dans la page (%d octets).", args.Search, total), nil
+		}
+		label += fmt.Sprintf(" — lignes correspondant à %q", args.Search)
+	}
+	start := 0
+	if searchRe == nil && args.Offset > 0 {
+		if args.Offset >= total {
+			return fmt.Sprintf("offset %d au-delà de la fin du contenu (%d octets).", args.Offset, total), nil
+		}
+		start = args.Offset
+		for start < len(content) && !utf8.RuneStart(content[start]) {
+			start++
+		}
+		content = content[start:]
+	}
 	truncated := len(content) > maxBytes
 	if truncated {
-		content = content[:maxBytes]
+		end := maxBytes
+		for end > 0 && !utf8.RuneStart(content[end]) {
+			end--
+		}
+		content = content[:end]
 	}
 
 	// Même cadrage explicite que HTTPGetTool.Call (voir son commentaire) :
@@ -261,9 +334,48 @@ func (t *BrowserFetchTool) Call(ctx context.Context, argsJSON string) (string, e
 		label, content,
 	)
 	if truncated {
-		out += "\n[... contenu tronqué ...]"
+		if searchRe != nil {
+			out += "\n[... résultats de recherche tronqués : affine le motif ...]"
+		} else {
+			out += fmt.Sprintf("\n[... contenu tronqué (%d octets au total) : pour la suite, rappelle browser_fetch avec \"offset\": %d ...]", total, start+len(content))
+		}
 	}
 	return out, nil
+}
+
+// grepLines renvoie les lignes de s correspondant à re, avec ctx lignes de
+// contexte de part et d'autre (blocs séparés par "--"), plafonné à maxBytes.
+func grepLines(s string, re *regexp.Regexp, ctx, maxBytes int) string {
+	lines := strings.Split(s, "\n")
+	keep := make([]bool, len(lines))
+	any := false
+	for i, l := range lines {
+		if re.MatchString(l) {
+			any = true
+			for j := max(0, i-ctx); j <= min(len(lines)-1, i+ctx); j++ {
+				keep[j] = true
+			}
+		}
+	}
+	if !any {
+		return ""
+	}
+	var b strings.Builder
+	prev := -2
+	for i, l := range lines {
+		if !keep[i] {
+			continue
+		}
+		if prev >= 0 && i != prev+1 {
+			b.WriteString("--\n")
+		}
+		b.WriteString(l + "\n")
+		prev = i
+		if b.Len() > maxBytes*2 {
+			break
+		}
+	}
+	return b.String()
 }
 
 // fetch essaie Firefox (geckodriver) en priorité, puis un navigateur

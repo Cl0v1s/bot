@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeFakeExecutable crée, dans dir, un script shell exécutable nommé name
@@ -525,5 +526,31 @@ func TestBrowserFetchCallFailsExplicitlyOnOversizedMedia(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "volumineux") {
 		t.Fatalf("erreur = %q, attendu qu'elle mentionne la taille excessive", err.Error())
+	}
+}
+
+// Une grande page se lit par portions (offset) ou se fouille (search), sans
+// relancer de navigateur : le HTML rendu est servi depuis le cache.
+func TestBrowserFetchPaginationAndSearchUseCache(t *testing.T) {
+	const target = "https://example.com/gros"
+	if err := checkPublicHost(context.Background(), "example.com"); err != nil {
+		t.Skipf("résolution DNS indisponible : %v", err)
+	}
+	body := "<html><body>" + strings.Repeat("<p>ligne banale</p>\n", 3000) + "<p>BREAKING CHANGE ici</p>\n</body></html>"
+	tool := &BrowserFetchTool{MaxBodyBytes: 1000, cache: map[string]cachedPage{target: {html: body, at: time.Now()}}}
+	args := func(extra string) string { return fmt.Sprintf(`{"url":%q%s}`, target, extra) }
+
+	// Appel simple : n'utilise PAS le cache (il tenterait un vrai navigateur),
+	// donc on part directement de la deuxième portion.
+	next, err := tool.Call(context.Background(), args(`,"offset":1000`))
+	if err != nil || strings.Contains(next, "Aucune") || !strings.Contains(next, `"offset": 2000`) {
+		t.Fatalf("portion suivante : err=%v, sortie=%q", err, next)
+	}
+	found, err := tool.Call(context.Background(), args(`,"search":"(?i)breaking change"`))
+	if err != nil || !strings.Contains(found, "BREAKING CHANGE ici") {
+		t.Fatalf("search : err=%v, sortie=%q", err, found)
+	}
+	if _, err := tool.Call(context.Background(), args(`,"offset":5,"search":"x"`)); err == nil {
+		t.Fatal("offset + search doivent être refusés")
 	}
 }

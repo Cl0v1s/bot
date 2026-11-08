@@ -334,7 +334,30 @@ func (c *Client) chatCompletionOnce(ctx context.Context, messages []Message, too
 
 	msg := parsed.Choices[0].Message
 	msg.FinishReason = parsed.Choices[0].FinishReason
+	msg.Content, msg.ReasoningContent = splitInlineThink(msg.Content, msg.ReasoningContent)
 	return msg, usage, nil
+}
+
+// splitInlineThink retire de content un raisonnement inline : soit un bloc
+// <think>…</think>, soit (gabarit qui ouvre <think> dans le prompt, donc
+// absent de la sortie) tout ce qui précède un "</think>" orphelin.
+func splitInlineThink(content, reasoning string) (string, string) {
+	if i := strings.LastIndex(content, "</think>"); i >= 0 {
+		r := strings.TrimSpace(strings.Replace(content[:i], "<think>", "", 1))
+		return strings.TrimSpace(content[i+len("</think>"):]), strings.TrimSpace(reasoning + "\n" + r)
+	}
+	return content, reasoning
+}
+
+// WithoutThinking retourne une copie du client qui désactive le raisonnement
+// (tâches utilitaires : résumé, maintenance mémoire — le raisonnement y fuit
+// dans la réponse et allonge les requêtes jusqu'au timeout).
+func (c *Client) WithoutThinking() *Client {
+	cc := *c
+	off := false
+	cc.EnableThinking = &off
+	cc.ReasoningEffort = ""
+	return &cc
 }
 
 // StreamCallbacks : fonctions appelées au fil du streaming (voir

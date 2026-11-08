@@ -15,6 +15,7 @@ import (
 	"bot/internal/convo"
 	"bot/internal/imapclient"
 	"bot/internal/llm"
+	"bot/internal/mdfmt"
 	"bot/internal/ontology"
 	"bot/internal/smtpclient"
 	"bot/internal/tools"
@@ -459,10 +460,21 @@ func (o Options) sendReply(ic *imapclient.Client, seq int, parsed *parsedMail, s
 		references = parsed.References + " " + parsed.MessageID
 	}
 
+	// Corps texte : tableaux markdown réalignés en ASCII ; version HTML en
+	// alternative (tableaux rendus, liens cliquables) pour les clients riches.
+	// Si la conversion HTML échoue, on envoie le texte seul.
+	plain := mdfmt.FormatText(body, mdfmt.Options{Width: func() int { return 100 }})
+	htmlBody, herr := mdfmt.HTML(body)
+	if herr != nil {
+		log.Printf("mailbot: conversion HTML impossible (%v), envoi en texte seul", herr)
+		htmlBody = ""
+	}
+
 	err := o.SMTP.Send(smtpclient.Mail{
 		To:         senderAddr,
 		Subject:    parsed.Subject,
-		Body:       body,
+		Body:       plain,
+		HTML:       htmlBody,
 		InReplyTo:  parsed.MessageID,
 		References: references,
 	})

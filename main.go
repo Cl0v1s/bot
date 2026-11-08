@@ -206,7 +206,7 @@ func main() {
 		// est en cours, sortie immédiate sinon). Un ctx pré-annulé par un
 		// premier signal casserait silencieusement toutes les requêtes
 		// suivantes.
-		if err := chat.Run(context.Background(), client, conv, toolsCfg, os.Stdin, os.Stdout); err != nil {
+		if err := chat.Run(agent.WithSkills(context.Background(), loadedSkills), client, conv, toolsCfg, os.Stdin, os.Stdout); err != nil {
 			log.Fatalf("mode chat: %v", err)
 		}
 
@@ -380,7 +380,7 @@ func main() {
 		if ontoStore != nil && cfg.OntologyIdle > 0 {
 			opts.Distiller = &ontology.Distiller{Store: ontoStore, Client: client}
 		}
-		if err := mailbot.Run(ctx, client, opts); err != nil {
+		if err := mailbot.Run(agent.WithSkills(ctx, loadedSkills), client, opts); err != nil {
 			log.Fatalf("mode mail: %v", err)
 		}
 

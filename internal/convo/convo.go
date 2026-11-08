@@ -54,6 +54,16 @@ func (c *Conversation) AddUser(content string) {
 	c.Messages = append(c.Messages, llm.Message{Role: "user", Content: content})
 }
 
+// AppendToLastUser ajoute text à la fin du contenu du dernier message, s'il
+// est de rôle "user" (sinon ne fait rien et retourne false).
+func (c *Conversation) AppendToLastUser(text string) bool {
+	if n := len(c.Messages); n > 0 && c.Messages[n-1].Role == "user" {
+		c.Messages[n-1].Content += text
+		return true
+	}
+	return false
+}
+
 func (c *Conversation) AddAssistant(content string) {
 	c.Messages = append(c.Messages, llm.Message{Role: "assistant", Content: content})
 }
@@ -401,6 +411,7 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 		return false, nil
 	}
 
+	client = client.WithoutThinking()
 	toSummarize := c.Messages[:cut]
 	kept := append([]llm.Message(nil), c.Messages[cut:]...)
 
@@ -425,6 +436,7 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 
 	var summaryMsg llm.Message
 	var err error
+	invalidTries := 0
 	for attempt := 1; ; attempt++ {
 		if len(toSummarize) == 0 {
 			break
@@ -435,7 +447,19 @@ func (c *Conversation) Compact(ctx context.Context, client *llm.Client) (bool, e
 		}
 		// L'usage renvoyé ici correspond au prompt de résumé, pas à la
 		// conversation réelle : on ne l'enregistre pas via RecordUsage.
+		if invalidTries > 0 {
+			// Retry après un résumé invalide : rappel explicite, en dernier
+			// message (le plus pesant pour le modèle).
+			summarizeReq[1].Content += "\n\nATTENTION : ta réponse précédente était vide ou contenait un appel d'outil. Réponds maintenant UNIQUEMENT par un résumé rédigé en texte libre (Contexte / Déjà fait / Tâche en cours), sans aucune balise."
+		}
 		summaryMsg, _, err = client.ChatCompletion(ctx, summarizeReq, nil)
+		if err == nil && invalidTries < maxInvalidSummaryRetries {
+			if c := strings.TrimSpace(summaryMsg.Content); c == "" || looksLikeToolCallArtifact(c) {
+				invalidTries++
+				log.Printf("convo: compaction : résumé invalide (tentative %d/%d, %d tool_calls structurés, contenu: %q) — nouvel essai", invalidTries, maxInvalidSummaryRetries+1, len(summaryMsg.ToolCalls), truncateForLog(c, 300))
+				continue
+			}
+		}
 		if err == nil || !IsContextOverflow(err) || attempt >= maxCompactionAttempts || ctx.Err() != nil {
 			break
 		}
@@ -515,6 +539,9 @@ const (
 	// maxCompactionAttempts : nombre max de tentatives de résumé dans un
 	// même appel à Compact (voir la boucle de réessai).
 	maxCompactionAttempts = 6
+	// maxInvalidSummaryRetries : nouvelles tentatives quand le modèle renvoie
+	// un résumé vide ou un appel d'outil échappé en texte.
+	maxInvalidSummaryRetries = 2
 	// compactionDropDivisor : à chaque échec pour dépassement de contexte,
 	// 1/compactionDropDivisor des messages restant à résumer (les plus
 	// anciens) est supprimé avant de retenter.
@@ -650,4 +677,11 @@ func (c *Conversation) EnsureFitsContext() int {
 		c.LastKnownMessageCount = 0
 	}
 	return dropped
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }

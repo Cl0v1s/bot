@@ -19,6 +19,7 @@ import (
 	"bot/internal/agent"
 	"bot/internal/convo"
 	"bot/internal/llm"
+	"bot/internal/mdfmt"
 	"bot/internal/ontology"
 	"bot/internal/sandbox"
 	"bot/internal/tools"
@@ -589,8 +590,23 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				streamContent
 			)
 			streamed := streamNone
+			// Tableaux markdown : réalignés (cadre, retour à la ligne) sur un
+			// vrai terminal seulement ; sortie redirigée = texte brut inchangé.
+			var content io.Writer = out
+			var tables *mdfmt.StreamWriter
+			if liveCursor {
+				width := func() int { return 0 }
+				if con != nil {
+					width = con.w
+				}
+				tables = mdfmt.NewStreamWriter(out, mdfmt.Options{Width: width, Unicode: true, Bold: true})
+				content = tables
+			}
 			onReasoning := func(d string) {
 				clearThinking()
+				if tables != nil && streamed == streamContent {
+					_ = tables.Flush()
+				}
 				if streamed != streamReasoning {
 					fmt.Fprint(out, color(ansiGray, "\n┄ réflexion\n┆ "))
 					streamed = streamReasoning
@@ -606,11 +622,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 					fmt.Fprint(out, "\n")
 				}
 				streamed = streamContent
-				fmt.Fprint(out, d)
+				fmt.Fprint(content, d)
 			}
 			// endStream termine la ligne en cours après un streaming, pour
 			// que la suite (prompt, message d'erreur) démarre proprement.
 			endStream := func() {
+				if tables != nil {
+					_ = tables.Flush()
+				}
 				if streamed == streamReasoning || streamed == streamContent {
 					fmt.Fprintln(out)
 				}

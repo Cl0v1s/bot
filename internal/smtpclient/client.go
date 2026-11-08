@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"mime"
+	"mime/quotedprintable"
 	"net"
 	"net/smtp"
 	"strings"
@@ -28,6 +29,7 @@ type Mail struct {
 	To         string
 	Subject    string
 	Body       string
+	HTML       string // corps HTML optionnel : le mail devient multipart/alternative
 	InReplyTo  string // Message-ID du mail auquel on répond, optionnel
 	References string // en-tête References, optionnel
 }
@@ -149,10 +151,28 @@ func buildMessage(from string, m Mail) []byte {
 		fmt.Fprintf(&b, "References: %s\r\n", m.References)
 	}
 	b.WriteString("MIME-Version: 1.0\r\n")
-	b.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
-	b.WriteString("\r\n")
-	b.WriteString(m.Body)
-	b.WriteString("\r\n")
+	if m.HTML == "" {
+		b.WriteString("Content-Type: text/plain; charset=\"utf-8\"\r\n")
+		b.WriteString("\r\n")
+		b.WriteString(m.Body)
+		b.WriteString("\r\n")
+		return []byte(b.String())
+	}
+
+	var raw [12]byte
+	_, _ = rand.Read(raw[:])
+	boundary := "=_alt_" + hex.EncodeToString(raw[:])
+	fmt.Fprintf(&b, "Content-Type: multipart/alternative; boundary=\"%s\"\r\n\r\n", boundary)
+	for _, part := range []struct{ typ, body string }{{"text/plain", m.Body}, {"text/html", m.HTML}} {
+		fmt.Fprintf(&b, "--%s\r\nContent-Type: %s; charset=\"utf-8\"\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n", boundary, part.typ)
+		var qp strings.Builder
+		w := quotedprintable.NewWriter(&qp)
+		_, _ = w.Write([]byte(strings.ReplaceAll(part.body, "\r\n", "\n")))
+		_ = w.Close()
+		b.WriteString(qp.String())
+		b.WriteString("\r\n")
+	}
+	fmt.Fprintf(&b, "--%s--\r\n", boundary)
 	return []byte(b.String())
 }
 

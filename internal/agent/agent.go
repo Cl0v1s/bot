@@ -337,6 +337,14 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 	// d'affilée en ce moment".
 	consecutiveShellFailures := 0
 	truncationRecoveries := 0
+	// Rappel de skill ajouté à la demande de l'utilisateur AVANT que le modèle
+	// n'agisse (voir skillReminder) : plus efficace qu'un refus a posteriori.
+	if all := skillsFromContext(ctx); len(all) > 0 {
+		full := conv.Full()
+		if note := skillReminder(relevantSkills(all, lastUserMessage(full), full)); note != "" {
+			conv.AppendToLastUser(note)
+		}
+	}
 	for step := 0; step < maxSteps; step++ {
 		// Un échec de compaction ne doit JAMAIS faire échouer le tour : la
 		// compaction est une optimisation de contexte, pas un prérequis pour
@@ -470,6 +478,10 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 				} else {
 					consecutiveShellFailures = 0
 				}
+			}
+
+			if tc.Function.Name == "run_shell" && commandNotFound(result) {
+				result += commandNotFoundHint(skillsFromContext(ctx))
 			}
 
 			if callErr != nil {
