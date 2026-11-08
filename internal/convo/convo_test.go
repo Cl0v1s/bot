@@ -643,3 +643,69 @@ func TestEnsureFitsContextNeverOrphansToolResult(t *testing.T) {
 		t.Fatalf("l'historique commence par un message \"tool\" orphelin après EnsureFitsContext : %+v", c.Messages[0])
 	}
 }
+
+func toolGroup(id, name, result string) []llm.Message {
+	return []llm.Message{
+		{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: id, Type: "function", Function: llm.ToolCallFunction{Name: name, Arguments: "{}"}}}},
+		{Role: "tool", ToolCallID: id, Content: result},
+	}
+}
+
+func TestMaskOldToolResultsKeepsRecentAndStructure(t *testing.T) {
+	c := New("", 100000, 0.9, 6)
+	big := strings.Repeat("x", 2000)
+	c.AddUser("go")
+	for _, id := range []string{"a", "b", "c"} {
+		for _, m := range toolGroup(id, "read_file", big) {
+			c.AppendRaw(m)
+		}
+	}
+	c.AppendRaw(llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "s", Type: "function", Function: llm.ToolCallFunction{Name: "run_shell", Arguments: "{}"}}}})
+	c.AppendRaw(llm.Message{Role: "tool", ToolCallID: "s", Content: "ok"}) // court : jamais masqué
+	c.LastKnownTokens, c.LastKnownMessageCount = 5000, len(c.Messages)
+
+	n := len(c.Messages)
+	if got := c.MaskOldToolResults(2); got != 2 {
+		t.Fatalf("masqués = %d, attendu 2 (a et b ; c et s sont les 2 plus récents)", got)
+	}
+	if len(c.Messages) != n {
+		t.Fatal("le nombre de messages ne doit pas changer")
+	}
+	if !strings.HasPrefix(c.Messages[2].Content, maskedPrefix) || !strings.Contains(c.Messages[2].Content, "read_file") {
+		t.Fatalf("a non masqué correctement: %q", c.Messages[2].Content)
+	}
+	if c.Messages[2].ToolCallID != "a" {
+		t.Fatal("tool_call_id doit être conservé")
+	}
+	if c.Messages[6].Content != big {
+		t.Fatal("c (récent) ne doit pas être masqué")
+	}
+	if c.LastKnownTokens >= 5000 {
+		t.Fatalf("LastKnownTokens non réduit: %d", c.LastKnownTokens)
+	}
+	if got := c.MaskOldToolResults(2); got != 0 {
+		t.Fatalf("second passage: %d masqués, attendu 0 (idempotent)", got)
+	}
+}
+
+func TestMaskOldToolResultsIfNeededRespectsThreshold(t *testing.T) {
+	c := New("", 100000, 0.9, 6)
+	for _, id := range []string{"a", "b"} {
+		for _, m := range toolGroup(id, "read_file", strings.Repeat("x", 2000)) {
+			c.AppendRaw(m)
+		}
+	}
+	c.KeepToolResults = 0
+	if c.MaskOldToolResultsIfNeeded() != 0 {
+		t.Fatal("sous le seuil : rien à masquer")
+	}
+	c.MaxContextTokens = 500
+	if c.MaskOldToolResultsIfNeeded() != 2 {
+		t.Fatal("au-dessus du seuil : les 2 résultats auraient dû être masqués")
+	}
+	c.MaskAt = 0
+	c.Messages[1].Content = strings.Repeat("y", 2000)
+	if c.MaskOldToolResultsIfNeeded() != 0 {
+		t.Fatal("MaskAt=0 désactive le masquage")
+	}
+}

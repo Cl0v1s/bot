@@ -21,7 +21,7 @@ Toutes les variables sont documentées, avec leurs valeurs par défaut, dans `.e
 | Domaine | Variables |
 |---|---|
 | LLM | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `SYSTEM_PROMPT`, `LLM_TIMEOUT` (10m), `LLM_MAX_TOKENS`, `LLM_MAX_RETRIES` (5), `LLM_PARALLEL` (1) |
-| Contexte | `LLM_CONTEXT_TOKENS` (8192), `CONTEXT_COMPACT_AT` (0.95), `CONTEXT_KEEP_LAST` (6) |
+| Contexte | `LLM_CONTEXT_TOKENS` (8192), `CONTEXT_COMPACT_AT` (0.95), `CONTEXT_KEEP_LAST` (6), `CONTEXT_MASK_AT` (0.5), `CONTEXT_KEEP_TOOL_RESULTS` (4) |
 | IMAP (mode mail) | `IMAP_HOST`, `IMAP_PORT` (993), `IMAP_USER`, `IMAP_PASSWORD`, `IMAP_MAILBOX` (INBOX), `IMAP_TLS` (true, `false` refusé) |
 | SMTP (mode mail) | `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_TLS_MODE` (`starttls` \| `tls` ; `none` refusé) |
 | Mode mail | `POLL_INTERVAL` (60s), `MAIL_ALLOW_FROM`, `MAIL_REQUIRE_DKIM` (true), `MAIL_MAX_BODY_CHARS` (12000), `MAIL_TOOLS_ENABLED` (false) |
@@ -65,6 +65,8 @@ L'extraction de l'ontologie plafonne sa propre génération à 8192 tokens, quel
 ## Gestion du contexte
 
 La taille du contexte est estimée grossièrement (~4 caractères/token). Quand elle atteint la fraction `CONTEXT_COMPACT_AT` (0.95 par défaut) de `LLM_CONTEXT_TOKENS`, les messages les plus anciens sont résumés en un seul message via un appel au LLM (avec un vrai résumé structuré — voir plus bas pourquoi le format de cet appel est particulier), en conservant tels quels les `CONTEXT_KEEP_LAST` derniers messages. Cet appel de résumé ne propose aucun outil au modèle (il ne doit produire que du texte) : une réponse vide ou invalide (ex: un appel d'outil échappé en texte) fait échouer la compaction plutôt que de remplacer l'historique par un résumé creux — elle sera retentée au tour suivant (une seule fois par tour), sans jamais bloquer la réponse.
+
+**Masquage des anciens résultats d'outils** : dès que le contexte atteint `CONTEXT_MASK_AT` (0.5 par défaut, `0` = désactivé), le contenu des résultats d'outils les plus anciens (hors les `CONTEXT_KEEP_TOOL_RESULTS` derniers, et seulement s'ils dépassent ~400 caractères) est remplacé par un court placeholder indiquant l'outil et la taille d'origine ; le modèle relance l'outil s'il en a de nouveau besoin. Gratuit (aucun appel LLM), et appliqué avant la compaction, qu'il permet souvent d'éviter. Les appels d'outils et leur ordre sont conservés.
 
 **Filet de sécurité de dernier recours** : si, même après (une tentative de) compaction, l'historique dépasse encore la fenêtre réelle du modèle (`LLM_CONTEXT_TOKENS`, pas seulement le seuil `CONTEXT_COMPACT_AT`), les messages les plus anciens sont supprimés sans passer par le LLM (aucun résumé, juste une coupe), jusqu'à repasser sous la limite — pour ne jamais envoyer une requête vouée à être rejetée par le serveur pour dépassement de contexte. Garde toujours au moins le dernier message, ne coupe jamais un groupe [appel d'outil + ses résultats], et le signale explicitement (`[avertissement: ...supprimé(s) sans résumé]`).
 

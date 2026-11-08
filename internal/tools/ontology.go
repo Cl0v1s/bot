@@ -29,7 +29,7 @@ func (t *QueryOntologyTool) ParametersSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"query": {"type": "string", "description": "Nom ou fragment de nom d'un concept (insensible à la casse), ex: \"synapse\". Vide ou absent : aperçu global."},
+			"query": {"type": "string", "description": "Nom ou fragment de nom d'un seul concept (insensible à la casse), ex: \"synapse\" ; jamais plusieurs concepts dans la même requête. Vide ou absent : aperçu global."},
 			"depth": {"type": "integer", "minimum": 1, "maximum": 3, "description": "Nombre de sauts à parcourir depuis les concepts trouvés (défaut 1 : leurs liens directs)."},
 			"relation": {"type": "string", "description": "Optionnel : ne montrer que les liens de ce type, ex: \"appartient à\" (casse et espaces ignorés)."}
 		},

@@ -54,6 +54,8 @@ type Config struct {
 	ContextMaxTokens   int     // taille de contexte du modèle, en tokens (approx.)
 	ContextCompactAt   float64 // fraction du contexte (0-1) déclenchant la compaction
 	ContextKeepLastMsg int     // nombre de messages récents conservés tels quels lors d'une compaction
+	ContextMaskAt      float64 // fraction du contexte (0-1) déclenchant le masquage des anciens résultats d'outils ; 0 = désactivé
+	ContextKeepToolRes int     // nombre de résultats d'outils récents jamais masqués
 
 	// IMAP (lecture des mails)
 	IMAPHost     string
@@ -440,6 +442,16 @@ func Load() Config {
 		contextKeepLast = 6
 	}
 
+	contextMaskAt, err := strconv.ParseFloat(getenv("CONTEXT_MASK_AT", "0.5"), 64)
+	if err != nil || contextMaskAt < 0 || contextMaskAt > 1 {
+		contextMaskAt = 0.5
+	}
+
+	contextKeepToolRes, err := strconv.Atoi(getenv("CONTEXT_KEEP_TOOL_RESULTS", "4"))
+	if err != nil || contextKeepToolRes < 0 {
+		contextKeepToolRes = 4
+	}
+
 	mailMaxBodyChars, err := strconv.Atoi(getenv("MAIL_MAX_BODY_CHARS", "12000"))
 	if err != nil || mailMaxBodyChars <= 0 {
 		mailMaxBodyChars = 12000
@@ -533,6 +545,8 @@ func Load() Config {
 		ContextMaxTokens:   contextMaxTokens,
 		ContextCompactAt:   contextCompactAt,
 		ContextKeepLastMsg: contextKeepLast,
+		ContextMaskAt:      contextMaskAt,
+		ContextKeepToolRes: contextKeepToolRes,
 
 		IMAPHost:     getenv("IMAP_HOST", ""),
 		IMAPPort:     getenv("IMAP_PORT", "993"),

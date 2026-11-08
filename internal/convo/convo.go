@@ -21,6 +21,12 @@ type Conversation struct {
 	CompactAt        float64 // fraction (0-1) du contexte déclenchant la compaction
 	KeepLast         int     // nombre de messages récents conservés tels quels lors d'une compaction
 
+	// MaskAt : fraction (0-1) du contexte déclenchant le masquage des anciens
+	// résultats d'outils (voir MaskOldToolResults) ; 0 = désactivé.
+	// KeepToolResults : nombre de résultats d'outils récents jamais masqués.
+	MaskAt          float64
+	KeepToolResults int
+
 	// LastKnownTokens/LastKnownMessageCount mémorisent le dernier usage réel
 	// (champ "usage" de l'API) reçu du LLM, et le nombre de messages à ce
 	// moment-là. Permet d'estimer le contexte actuel à partir d'un compte
@@ -47,6 +53,8 @@ func New(systemPrompt string, maxContextTokens int, compactAt float64, keepLast 
 		MaxContextTokens: maxContextTokens,
 		CompactAt:        compactAt,
 		KeepLast:         keepLast,
+		MaskAt:           DefaultMaskAt,
+		KeepToolResults:  DefaultKeepToolResults,
 	}
 }
 

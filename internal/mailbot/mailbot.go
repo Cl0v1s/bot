@@ -34,9 +34,11 @@ type Options struct {
 	PollInterval time.Duration
 	SystemPrompt string
 
-	ContextMaxTokens int
-	ContextCompactAt float64
-	ContextKeepLast  int
+	ContextMaxTokens   int
+	ContextCompactAt   float64
+	ContextKeepLast    int
+	ContextMaskAt      float64
+	ContextKeepToolRes int
 
 	// MemoryFile : voir convo.Conversation.MemoryFile — "" = désactivé.
 	// ATTENTION : le corps d'un mail entrant est un contenu non fiable (voir
@@ -203,6 +205,7 @@ func (o Options) getOrCreateConversation(senderAddr, subject string) *convo.Conv
 
 	conv := convo.New(o.SystemPrompt, o.ContextMaxTokens, o.ContextCompactAt, o.ContextKeepLast)
 	conv.MemoryFile = o.MemoryFile
+	conv.MaskAt, conv.KeepToolResults = o.ContextMaskAt, o.ContextKeepToolRes
 	if !o.Tools.Empty() {
 		agent.AppendToolUsagePrompt(conv)
 		if o.Tools.Has(tools.QueryOntologyToolName) {

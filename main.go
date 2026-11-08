@@ -151,6 +151,7 @@ func main() {
 	case "chat":
 		conv := convo.New(systemPrompt, cfg.ContextMaxTokens, cfg.ContextCompactAt, cfg.ContextKeepLastMsg)
 		conv.MemoryFile = cfg.MemoryFile()
+		conv.MaskAt, conv.KeepToolResults = cfg.ContextMaskAt, cfg.ContextKeepToolRes
 
 		var tts *voice.Speaker
 		if cfg.VoiceTTSEnabled && len(cfg.VoiceTTSCmd) > 0 {
@@ -236,10 +237,12 @@ func main() {
 			PollInterval: cfg.PollInterval,
 			SystemPrompt: systemPrompt,
 
-			ContextMaxTokens: cfg.ContextMaxTokens,
-			ContextCompactAt: cfg.ContextCompactAt,
-			ContextKeepLast:  cfg.ContextKeepLastMsg,
-			MemoryFile:       cfg.MemoryFile(),
+			ContextMaxTokens:   cfg.ContextMaxTokens,
+			ContextCompactAt:   cfg.ContextCompactAt,
+			ContextKeepLast:    cfg.ContextKeepLastMsg,
+			ContextMaskAt:      cfg.ContextMaskAt,
+			ContextKeepToolRes: cfg.ContextKeepToolRes,
+			MemoryFile:         cfg.MemoryFile(),
 
 			AllowFrom:    cfg.MailAllowFrom,
 			MaxBodyChars: cfg.MailMaxBodyChars,

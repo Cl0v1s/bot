@@ -69,7 +69,7 @@ func AppendWorkingDirPrompt(conv *convo.Conversation, dir string) {
 // OntologyPrompt explique au modèle qu'il dispose d'une base de
 // connaissances (voir internal/ontology) à consulter pendant sa réflexion.
 // Ajouté, comme ToolUsagePrompt, seulement quand le tool est proposé.
-const OntologyPrompt = `Tu disposes d'une base de connaissances (ontologie) : un graphe de concepts (personnes, projets, outils, méthodes, préférences...) et de liens entre eux, extrait automatiquement de tes conversations passées. Pendant ta réflexion, quand la demande mentionne ou suppose un élément du contexte de l'utilisateur (un projet, une équipe, un outil, une personne, un terme de son domaine), interroge-la avec query_ontology AVANT de répondre ou de poser une question dont la réponse s'y trouve peut-être : c'est plus rapide que de relire l'historique. Une absence de résultat ne prouve rien (la base est incomplète) ; en cas de doute entre la base et ce que l'utilisateur vient de dire, c'est l'utilisateur qui a raison.`
+const OntologyPrompt = `Tu disposes d'une base de connaissances (ontologie) : un graphe de concepts (personnes, projets, outils, méthodes, préférences...) et de liens entre eux, extrait automatiquement de tes conversations passées. Pendant ta réflexion, quand la demande mentionne ou suppose un élément du contexte de l'utilisateur (un projet, une équipe, un outil, une personne, un terme de son domaine), interroge-la avec query_ontology AVANT de répondre ou de poser une question dont la réponse s'y trouve peut-être : c'est plus rapide que de relire l'historique. Chaque appel ne porte que sur UN concept : si la demande en implique plusieurs (ex: « LLM » et « knowledge graph »), fais un appel query_ontology distinct par concept, avec un seul nom court (« LLM », puis « knowledge graph »), jamais plusieurs termes dans la même requête, qui ne correspondrait à aucun nom. Une absence de résultat ne prouve rien (la base est incomplète) ; en cas de doute entre la base et ce que l'utilisateur vient de dire, c'est l'utilisateur qui a raison.`
 
 // AppendOntologyPrompt ajoute OntologyPrompt au system prompt de conv. À
 // appeler une fois, quand le registre contient query_ontology.
@@ -355,6 +355,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// retenterait la même compaction, échouerait de la même façon, sans
 		// qu'aucun message ne puisse plus jamais aboutir. On continue donc
 		// simplement sans compacter, avec l'historique complet tel quel.
+		// Masquage gratuit des anciens résultats d'outils AVANT toute
+		// compaction : souvent suffisant pour repasser sous le seuil, sans
+		// appel LLM ni perte de résumé.
+		if n := conv.MaskOldToolResultsIfNeeded(); n > 0 && onEvent != nil {
+			onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("contexte : %d ancien(s) résultat(s) d'outil masqué(s) pour libérer de la place", n)})
+		}
 		if !compactionFailed {
 			conv.LastCompactionDropped = 0
 			_, err := conv.CompactIfNeeded(ctx, client)
