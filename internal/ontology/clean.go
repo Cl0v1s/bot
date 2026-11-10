@@ -67,10 +67,17 @@ type CleanReport struct {
 	orphanIDs        []int64
 	repairIDs        []int64
 	RelationsRenamed int
-	EdgesRemoved     int // doublons et boucles
-	Candidates       []Candidate
-	BackupPath       string
-	Applied          bool
+	// RelationMerges : types de relation fusionnés par similarité sémantique
+	// ("X → Y"), déjà comptés dans RelationsRenamed.
+	RelationMerges []string
+	// EmbeddingErr : raison pour laquelle la fusion sémantique des relations
+	// a été sautée (téléchargement du modèle impossible...) ; le reste du
+	// nettoyage a eu lieu.
+	EmbeddingErr string
+	EdgesRemoved int // doublons et boucles
+	Candidates   []Candidate
+	BackupPath   string
+	Applied      bool
 }
 
 // Changed indique si le nettoyage déterministe modifie quelque chose.
@@ -105,6 +112,10 @@ func (r CleanReport) String() string {
 		merges = append(merges, fmt.Sprintf("%q → %q", m.Drop, m.Keep))
 	}
 	list("Fusions", merges)
+	list("Relations fusionnées (sémantique)", r.RelationMerges)
+	if r.EmbeddingErr != "" {
+		fmt.Fprintf(&b, "Fusion sémantique des relations ignorée : %s\n", r.EmbeddingErr)
+	}
 	list("Orphelins", r.Orphans)
 	var cands []string
 	for _, c := range r.Candidates {
@@ -191,9 +202,12 @@ type snapEdge struct {
 }
 
 type snapshot struct {
-	nodes []*snapNode
-	byID  map[int64]*snapNode
-	edges []snapEdge
+	// relAlias : fusions sémantiques de types de relation (voir
+	// semanticRelationAliases), appliquées après canonicalRelation.
+	relAlias map[string]string
+	nodes    []*snapNode
+	byID     map[int64]*snapNode
+	edges    []snapEdge
 }
 
 func (s *Store) load(ctx context.Context) (*snapshot, error) {
@@ -274,6 +288,9 @@ func plan(snap *snapshot, opts CleanOptions, now time.Time) (CleanReport, []edge
 	seen := map[edgeKey]bool{}
 	for _, e := range snap.edges {
 		typ := canonicalRelation(e.typ)
+		if a, ok := snap.relAlias[typ]; ok {
+			typ = a
+		}
 		k := edgeKey{e.src, e.dst, typ}
 		switch {
 		case e.src == e.dst || seen[k]:
@@ -474,7 +491,22 @@ func (s *Store) Clean(ctx context.Context, opts CleanOptions) (CleanReport, erro
 	if err != nil {
 		return CleanReport{}, err
 	}
+	var merges []string
+	var embErr string
+	if s.Embedder != nil {
+		aliases, err := semanticRelationAliases(ctx, s.Embedder, relationCounts(snap), s.RelationSimilarity)
+		if err != nil {
+			embErr = err.Error()
+		} else {
+			snap.relAlias = aliases
+			for from, to := range aliases {
+				merges = append(merges, fmt.Sprintf("%s → %s", from, to))
+			}
+			sort.Strings(merges)
+		}
+	}
 	rep, fixes := plan(snap, opts, time.Now())
+	rep.RelationMerges, rep.EmbeddingErr = merges, embErr
 	if !opts.Apply || !rep.Changed() {
 		return rep, nil
 	}

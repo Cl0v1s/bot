@@ -55,7 +55,7 @@ func describeAccess(tool, argsJSON string) string {
 	switch tool {
 	case "read_file", "create_file", "edit_file", "list_dir":
 		target = str("path")
-	case "http_get", "browser_fetch":
+	case "browser_fetch":
 		target = str("url")
 		if s := str("save_to"); s != "" {
 			target += " → " + s

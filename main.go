@@ -18,6 +18,7 @@ import (
 	"bot/internal/config"
 	"bot/internal/convo"
 	"bot/internal/llm"
+	"bot/internal/localembed"
 	"bot/internal/mailbot"
 	"bot/internal/mcp"
 	"bot/internal/ontology"
@@ -132,6 +133,12 @@ func main() {
 		} else {
 			ontoStore = st
 			defer st.Close()
+			if cfg.OntologyEmbeddingModel != "" {
+				emb := &localembed.Local{Dir: filepath.Join(cfg.WorkspaceDir, "embeddings"), Model: cfg.OntologyEmbeddingModel}
+				defer emb.Close()
+				st.Embedder = emb
+				st.RelationSimilarity = cfg.OntologyRelationSimilarity
+			}
 			if cfg.OntologyCleanOnStart {
 				rep, err := st.Clean(context.Background(), ontology.CleanOptions{
 					Apply:        true,
@@ -278,7 +285,6 @@ func main() {
 
 			toolList := []tools.Tool{
 				&tools.ReadFileTool{Perms: perms},
-				&tools.HTTPGetTool{Timeout: cfg.ToolsHTTPTimeout},
 				&tools.BrowserFetchTool{Timeout: cfg.ToolsBrowserFetchTimeout},
 				&tools.RequestDirectoryAccessTool{Perms: perms},
 				// list_dir n'est soumis à aucune permission (voir son

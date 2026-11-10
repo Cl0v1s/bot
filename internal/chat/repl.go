@@ -401,7 +401,6 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			&tools.ReadFileTool{Perms: perms},
 			&tools.CreateFileTool{Perms: perms, Sandboxed: sandboxReady},
 			&tools.EditFileTool{Perms: perms, Sandboxed: sandboxReady},
-			&tools.HTTPGetTool{Timeout: toolsCfg.HTTPTimeout, Perms: perms, Sandboxed: sandboxReady},
 			&tools.BrowserFetchTool{Timeout: toolsCfg.BrowserFetchTimeout, Perms: perms, Sandboxed: sandboxReady, WaitForUser: confirmBrowserChallenge},
 			&tools.RequestDirectoryAccessTool{Perms: perms},
 			&tools.ListDirTool{},

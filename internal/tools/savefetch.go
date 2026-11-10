@@ -8,7 +8,7 @@ import (
 )
 
 // maxSavedFetchBytes : taille max d'un contenu enregistré via "save_to"
-// (http_get, browser_fetch). Bien au-delà de ce qui tiendrait dans le
+// (browser_fetch). Bien au-delà de ce qui tiendrait dans le
 // contexte — c'est tout l'intérêt — mais borné contre une page
 // pathologiquement énorme.
 const maxSavedFetchBytes = 10 << 20 // 10 Mio

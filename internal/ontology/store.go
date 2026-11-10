@@ -81,6 +81,12 @@ type Store struct {
 	path string
 	g    *graph.Graph
 	mu   sync.Mutex // sérialise les Apply (lecture-puis-écriture non atomique)
+
+	// Embedder : si non nil, Clean fusionne aussi les types de relation de
+	// même sens (voir semanticRelationAliases). RelationSimilarity : seuil
+	// cosinus (0 = DefaultRelationSimilarity).
+	Embedder           Embedder
+	RelationSimilarity float64
 }
 
 // Open ouvre (ou crée) la base à path.

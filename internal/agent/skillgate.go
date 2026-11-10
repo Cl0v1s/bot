@@ -154,7 +154,7 @@ func commandNotFound(result string) bool {
 // pertinence ici : l'échec lui-même prouve que le modèle improvise.
 func commandNotFoundHint(list []skills.Skill) string {
 	var b strings.Builder
-	b.WriteString("\n\nCette commande n'existe pas : ne l'invente pas et ne la réessaie pas. Si la tâche est couverte par un outil du bot (browser_fetch, http_get...) ou par l'une des skills ci-dessous, lis la skill concernée avec read_file et suis-la à la lettre.")
+	b.WriteString("\n\nCette commande n'existe pas : ne l'invente pas et ne la réessaie pas. Si la tâche est couverte par un outil du bot (browser_fetch...) ou par l'une des skills ci-dessous, lis la skill concernée avec read_file et suis-la à la lettre.")
 	if len(list) > 0 {
 		b.WriteString("\n")
 		b.WriteString(skills.Summary(list))

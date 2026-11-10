@@ -1,10 +1,6 @@
 package tools
 
 import (
-	"context"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -94,73 +90,5 @@ func TestHTMLToTextDecodesEntities(t *testing.T) {
 	got := htmlToText("<p>Padm&eacute; Amidala &amp; la R&eacute;publique</p>")
 	if !strings.Contains(got, "Padmé Amidala & la République") {
 		t.Fatalf("entités HTML non décodées: %q", got)
-	}
-}
-
-// Le résultat doit cadrer explicitement le contenu comme une donnée externe,
-// pas un message de l'utilisateur — sans quoi un modèle plus faible peut
-// répondre comme si l'utilisateur avait lui-même affirmé ce que dit la page.
-func TestHTTPGetFramesContentAsExternalData(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprint(w, "<html><body><p>Elle a été élue sénatrice à quatorze ans.</p></body></html>")
-	}))
-	defer server.Close()
-
-	tool := &HTTPGetTool{}
-	out, err := tool.Call(context.Background(), fmt.Sprintf(`{"url":%q}`, server.URL))
-	if err != nil {
-		t.Fatalf("Call: %v", err)
-	}
-
-	if !strings.Contains(out, "PAS un message de l'utilisateur") {
-		t.Fatalf("résultat = %q, attendu un cadrage explicite comme donnée externe", out)
-	}
-	if !strings.Contains(out, "Elle a été élue sénatrice à quatorze ans.") {
-		t.Fatalf("le contenu HTML converti est absent: %q", out)
-	}
-	if strings.Contains(out, "<p>") || strings.Contains(out, "<html>") {
-		t.Fatalf("le HTML n'a pas été converti en texte brut: %q", out)
-	}
-}
-
-// Le contenu utile (dans <main>) peut arriver après maxBytes d'en-tête HTML
-// brut (menus, CSS...) : tronquer le HTML avant extraction couperait la
-// page avant d'atteindre son propre contenu. La troncature doit s'appliquer
-// après extraction/nettoyage, sur le texte final.
-func TestHTTPGetExtractsMainContentPastRawByteLimit(t *testing.T) {
-	padding := strings.Repeat("x", 30000) // dépasse largement maxBytes par défaut (20000)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html")
-		fmt.Fprintf(w, "<html><body><div id=\"header\">%s</div><main><p>Contenu réel de l'article.</p></main></body></html>", padding)
-	}))
-	defer server.Close()
-
-	tool := &HTTPGetTool{}
-	out, err := tool.Call(context.Background(), fmt.Sprintf(`{"url":%q}`, server.URL))
-	if err != nil {
-		t.Fatalf("Call: %v", err)
-	}
-	if !strings.Contains(out, "Contenu réel de l'article.") {
-		t.Fatalf("le contenu de <main>, situé après le padding, a été coupé avant extraction: %q", out[:min(len(out), 500)])
-	}
-}
-
-// Une réponse non-HTML (ex: JSON d'une API) ne doit pas être passée dans le
-// convertisseur HTML : le contenu doit rester intact.
-func TestHTTPGetLeavesNonHTMLContentUntouched(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"name":"Padmé Amidala"}`)
-	}))
-	defer server.Close()
-
-	tool := &HTTPGetTool{}
-	out, err := tool.Call(context.Background(), fmt.Sprintf(`{"url":%q}`, server.URL))
-	if err != nil {
-		t.Fatalf("Call: %v", err)
-	}
-	if !strings.Contains(out, `{"name":"Padmé Amidala"}`) {
-		t.Fatalf("le JSON aurait dû rester intact: %q", out)
 	}
 }

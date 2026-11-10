@@ -12,7 +12,7 @@ import (
 )
 
 // Écriture de fichier sous l'identité réelle (write_file, "save_to" de
-// http_get/browser_fetch), resynchronisée avec le compte sandbox quand il
+// browser_fetch), resynchronisée avec le compte sandbox quand il
 // est actif — voir WriteFileTool.Sandboxed. Séquence commune aux deux
 // outils, en deux temps :
 //

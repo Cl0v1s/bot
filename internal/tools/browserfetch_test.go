@@ -288,6 +288,11 @@ func TestLooksLikeBotChallenge(t *testing.T) {
 		t.Fatal("attendu que cette page de vérification Cloudflare soit reconnue")
 	}
 
+	ddg := `<html><body><p>Unfortunately, bots use DuckDuckGo too.</p><p>Select all squares containing a duck:</p></body></html>`
+	if !looksLikeBotChallenge(ddg) {
+		t.Fatal("attendu que le défi DuckDuckGo soit reconnu")
+	}
+
 	real := `<html><body><h1>Protocol Droid</h1><p>A protocol droid is a droid designed for translation and etiquette.</p></body></html>`
 	if looksLikeBotChallenge(real) {
 		t.Fatal("une page de contenu normal ne doit pas être prise pour une vérification anti-bot")

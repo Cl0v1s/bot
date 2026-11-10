@@ -176,6 +176,12 @@ type Config struct {
 	// concept isolé et cité une seule fois est purgé (0 = jamais).
 	OntologyCleanOnStart bool
 	OntologyOrphanDays   int
+	// OntologyEmbeddingModel : modèle d'embeddings (endpoint /embeddings du
+	// serveur LLM) servant à fusionner les types de relation de même sens au
+	// nettoyage ; "" = désactivé. OntologyRelationSimilarity : seuil cosinus
+	// de fusion (0 < s <= 1).
+	OntologyEmbeddingModel     string
+	OntologyRelationSimilarity float64
 
 	// Voice* / STT* : commande vocale du mode chat (voir internal/voice).
 	// VoiceRecordCmd : commande de capture qui écrit du PCM s16 mono 16 kHz
@@ -427,6 +433,10 @@ func Load() Config {
 		compactIdle = 10 * time.Minute
 	}
 
+	ontologyRelSim, err := strconv.ParseFloat(getenv("ONTOLOGY_RELATION_SIMILARITY", "0.9"), 64)
+	if err != nil || ontologyRelSim <= 0 || ontologyRelSim > 1 {
+		ontologyRelSim = 0.9
+	}
 	ontologyOrphanDays, err := strconv.Atoi(getenv("ONTOLOGY_ORPHAN_DAYS", "90"))
 	if err != nil || ontologyOrphanDays < 0 {
 		ontologyOrphanDays = 90
@@ -596,6 +606,9 @@ func Load() Config {
 
 		OntologyCleanOnStart: getenvBool("ONTOLOGY_CLEAN_ON_START", true),
 		OntologyOrphanDays:   ontologyOrphanDays,
+
+		OntologyEmbeddingModel:     getenv("ONTOLOGY_EMBEDDING_MODEL", ""),
+		OntologyRelationSimilarity: ontologyRelSim,
 
 		VoiceEnabled:          getenvBool("VOICE_ENABLED", false),
 		VoiceRecordCmd:        strings.Fields(getenv("VOICE_RECORD_CMD", "")),
