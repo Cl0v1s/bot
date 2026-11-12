@@ -10,10 +10,8 @@ import (
 )
 
 const (
-	// DefaultExploreNodes : plafond de concepts dessinés (au-delà, le SVG
-	// devient illisible) ; le plus connectés d'abord, ou par distance à la
-	// requête.
-	DefaultExploreNodes = 80
+	// DefaultExploreNodes : plafond de concepts dessinés ; 0 = aucun plafond.
+	DefaultExploreNodes = 0
 	maxExploreDepth     = 4
 )
 
@@ -46,7 +44,7 @@ func (s *Store) Explore(ctx context.Context, query string, depth, maxNodes int) 
 		depth = maxExploreDepth
 	}
 	if maxNodes < 1 {
-		maxNodes = DefaultExploreNodes
+		maxNodes = math.MaxInt // pas de plafond
 	}
 	snap, err := s.load(ctx)
 	if err != nil {
@@ -91,9 +89,6 @@ func (s *Store) Explore(ctx context.Context, query string, depth, maxNodes int) 
 			if !add(n.ID) {
 				break
 			}
-		}
-		if len(order) > len(chosen) {
-			truncated = true
 		}
 	} else {
 		var frontier []int64
