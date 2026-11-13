@@ -205,3 +205,20 @@ func TestConsoleTrackIgnoresEscapes(t *testing.T) {
 	c.Write([]byte(" !"))
 	expectScreen(t, term, "ok !\n>")
 }
+
+// Barre d'état : reste au-dessus de la saisie, y compris quand de la sortie
+// arrive et que la saisie s'étend sur plusieurs lignes.
+func TestConsoleStatusLineStaysAboveInput(t *testing.T) {
+	c, term := newTestConsole(10)
+	c.beginInput("> ")
+	c.setStatus("ctx 12%", "")
+	expectScreen(t, term, "ctx 12%\n>")
+	c.Write([]byte("sortie\n"))
+	c.setInput([]rune(strings.Repeat("a", 12)), 12)
+	expectScreen(t, term, "sortie\nctx 12%\n> aaaaaaaa\naaaa")
+	c.setStatus("ctx 50%", "")
+	expectScreen(t, term, "sortie\nctx 50%\n> aaaaaaaa\naaaa")
+	if term.r != 3 || term.c != 4 {
+		t.Fatalf("curseur en %d,%d, attendu 3,4", term.r, term.c)
+	}
+}

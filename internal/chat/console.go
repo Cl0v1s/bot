@@ -41,6 +41,11 @@ type console struct {
 	buf         []rune
 	pos         int
 
+	// Barre d'état (voir setStatus) : une ligne affichée juste au-dessus
+	// du prompt, dans la zone de saisie. "" = aucune.
+	status      string
+	statusColor string
+
 	shown    bool // zone de saisie actuellement dessinée à l'écran
 	curRow   int  // ligne d'écran du curseur, relative au début de la zone de saisie
 	sepAdded bool // un saut de ligne a été ajouté sous une ligne de sortie inachevée pour dessiner la saisie
@@ -130,6 +135,15 @@ func (c *console) restyle(prompt, promptColor, inputColor string) (restore func(
 	}
 }
 
+// setStatus définit la barre d'état affichée en permanence au-dessus de la
+// saisie (tronquée à une ligne d'écran) et redessine la zone de saisie.
+func (c *console) setStatus(text, colorCode string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status, c.statusColor = text, colorCode
+	c.redrawLocked()
+}
+
 func (c *console) redrawLocked() {
 	var b bytes.Buffer
 	c.hide(&b)
@@ -202,6 +216,16 @@ func (c *console) draw(b *bytes.Buffer) {
 		b.WriteString("\r\n")
 		c.sepAdded = true
 	}
+	top := 0 // lignes d'écran occupées au-dessus du prompt (barre d'état)
+	if c.status != "" {
+		st := []rune(c.status)
+		if len(st) > w-1 {
+			st = st[:w-1]
+		}
+		b.WriteString(c.paint(c.statusColor, string(st)))
+		b.WriteString("\r\n")
+		top = 1
+	}
 	promptW := utf8.RuneCountInString(c.prompt)
 	b.WriteString(c.paint(c.promptColor, c.prompt))
 	b.WriteString(c.paint(c.inputColor, string(c.buf)))
@@ -212,9 +236,9 @@ func (c *console) draw(b *bytes.Buffer) {
 		// suivante pour que la position réelle corresponde au calcul.
 		b.WriteString(" \r")
 	}
-	endRow := total / w
+	endRow := total/w + top
 	cursor := promptW + c.pos
-	row, col := cursor/w, cursor%w
+	row, col := cursor/w+top, cursor%w
 	if endRow > row {
 		fmt.Fprintf(b, "\x1b[%dA", endRow-row)
 	}

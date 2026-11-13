@@ -693,3 +693,39 @@ func truncateForLog(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
+// ContextBreakdown : estimation heuristique des tokens par catégorie.
+type ContextBreakdown struct {
+	System, User, Assistant, ToolCalls, ToolResults, Summaries int
+}
+
+// Breakdown ventile le contexte courant par catégorie (heuristique ~4
+// car./token, indépendante de l'usage réel de l'API).
+func (c *Conversation) Breakdown() ContextBreakdown {
+	var b ContextBreakdown
+	if c.SystemPrompt != "" {
+		b.System = estimateTokens(c.SystemPrompt)
+	}
+	for _, m := range c.Messages {
+		calls := 0
+		for _, tc := range m.ToolCalls {
+			calls += estimateTokens(tc.Function.Name) + estimateTokens(tc.Function.Arguments)
+		}
+		b.ToolCalls += calls
+		content := 0
+		if m.Content != "" || calls == 0 {
+			content = estimateTokens(m.Content)
+		}
+		switch m.Role {
+		case "user":
+			b.User += content
+		case "assistant":
+			b.Assistant += content
+		case "tool":
+			b.ToolResults += content
+		case "system":
+			b.Summaries += content
+		}
+	}
+	return b
+}

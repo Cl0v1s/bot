@@ -117,7 +117,7 @@ type queuedLine struct {
 }
 
 // Run lance une boucle de lecture-évaluation-affichage sur la console.
-// Commandes spéciales : /exit, /reset, /stats, /compact, /ontology, et les
+// Commandes spéciales : /exit, /reset, /stats, /context, /compact, /ontology, et les
 // commandes directes "!cmd" (voir direct.go : exécutées sans appel LLM).
 //
 // Si toolsCfg.Enabled, chaque tour passe par la boucle agentique
@@ -462,6 +462,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 	// showPrompt : sans éditeur de ligne uniquement — avec, console affiche
 	// déjà le prompt en permanence (voir readLine).
 	showPrompt := func() {
+		text, code := contextStatus(conv)
+		if con != nil && editor != nil {
+			con.setStatus(text, code)
+		} else {
+			fmt.Fprintln(out, color(code, text))
+		}
 		if editor == nil {
 			fmt.Fprint(out, promptIdle)
 		}
@@ -510,6 +516,9 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 				basis = "exact + estimation du dernier message"
 			}
 			fmt.Fprintf(out, "[messages=%d tokens~=%d/%d (%s)]\n", len(conv.Messages), conv.EstimateTokens(), conv.MaxContextTokens, basis)
+			return true, false
+		case "/context":
+			runContextCommand(out, conv)
 			return true, false
 		case "/unload":
 			if err := client.TryUnloadModel(ctx); err != nil {
@@ -1184,7 +1193,7 @@ func isQueueCommand(line string) bool {
 		return true
 	}
 	switch line {
-	case "/exit", "/quit", "/new", "/reset", "/stats", "/compact":
+	case "/exit", "/quit", "/new", "/reset", "/stats", "/context", "/compact":
 		return true
 	}
 	return isOntologyCommand(line) || isThinkCommand(line)

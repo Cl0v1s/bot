@@ -47,6 +47,8 @@ En mode `chat` :
 - `/exit` ou `/quit` — quitter
 - `/reset` — vider l'historique de la conversation
 - `/stats` — afficher le nombre de messages et l'estimation de tokens utilisés
+- Une barre d'état permanente au-dessus du prompt affiche l'occupation du contexte (jauge, %, tokens), en jaune à l'approche du seuil de compaction et en rouge au-delà ; elle est rafraîchie à chaque retour au prompt.
+- `/context` — afficher l'occupation du contexte (jauge) et sa répartition par catégorie : prompt système, messages, appels et résultats d'outils
 - `/ontology` — taille de l'ontologie ; `/ontology explore [concept] [profondeur]` — écrit un SVG du graphe (ou du voisinage du concept, 2 sauts par défaut, 80 concepts max) dans `scratchpad/ontologie-*.svg` du workspace, à ouvrir dans un navigateur (couleur = type, taille = nombre de liens, survol = description) ; `/ontology clean` — plan de nettoyage sans rien modifier ; `/ontology clean apply` — l'applique (voir "Ontologie")
 - `/compact` — forcer une compaction immédiate (résumé + extraction mémoire, voir "Gestion du contexte" plus bas), comme si le seuil `CONTEXT_COMPACT_AT` venait d'être atteint. Utile pour alléger le contexte à la demande plutôt que d'attendre.
 
