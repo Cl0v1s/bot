@@ -713,7 +713,12 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, tool
 			}
 
 			reply := msg.Content
-			if msg.FinishReason == llm.FinishReasonLength {
+			if msg.FinishReason == llm.FinishReasonLoop {
+				errorLine("[avertissement: boucle de répétition détectée : génération interrompue]")
+				if strings.TrimSpace(reply) == "" {
+					reply = "[réponse interrompue : boucle de répétition détectée]"
+				}
+			} else if msg.FinishReason == llm.FinishReasonLength {
 				errorLine("[avertissement: réponse interrompue par la limite de tokens de sortie (max_tokens=%d, voir LLM_MAX_TOKENS) : le modèle est peut-être parti en boucle]", client.MaxTokens)
 				if strings.TrimSpace(reply) == "" {
 					reply = "[réponse interrompue : limite de tokens de sortie atteinte]"

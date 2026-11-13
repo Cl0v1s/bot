@@ -389,9 +389,25 @@ type StreamCallbacks struct {
 // est prévenu avant chaque relance via WithRetryNotifier, pour pouvoir
 // signaler que le texte partiel déjà affiché est abandonné.
 func (c *Client) ChatCompletionStream(ctx context.Context, messages []Message, tools []Tool, cb StreamCallbacks) (Message, Usage, error) {
-	return c.withRetry(ctx, func() (Message, Usage, error) {
-		return c.chatCompletionStreamWithAutoLoad(ctx, messages, tools, cb)
-	})
+	notify, _ := ctx.Value(retryNotifierKey{}).(RetryNotifier)
+	msgs := messages
+	for attempt := 1; ; attempt++ {
+		msg, usage, err := c.withRetry(ctx, func() (Message, Usage, error) {
+			return c.chatCompletionStreamWithAutoLoad(ctx, msgs, tools, cb)
+		})
+		// Boucle de répétition coupée : on relance la génération (sur une
+		// copie de l'historique, sans la sortie en boucle) avec un rappel,
+		// pour que le modèle reprenne sa tâche sans que l'appelant ait à
+		// intervenir. Au-delà de maxLoopRecoveries, la réponse (tronquée)
+		// est rendue telle quelle avec FinishReasonLoop.
+		if err != nil || msg.FinishReason != FinishReasonLoop || attempt > maxLoopRecoveries || ctx.Err() != nil {
+			return msg, usage, err
+		}
+		if notify != nil {
+			notify(attempt, maxLoopRecoveries, errLoopDetected)
+		}
+		msgs = append(append([]Message(nil), messages...), Message{Role: "user", Content: loopNudge})
+	}
 }
 
 func (c *Client) chatCompletionStreamWithAutoLoad(ctx context.Context, messages []Message, tools []Tool, cb StreamCallbacks) (Message, Usage, error) {
@@ -435,6 +451,11 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		return Message{}, Usage{}, err
 	}
 
+	// ctx annulable en interne : coupe la génération dès qu'une boucle de
+	// répétition est détectée (voir loopGuard).
+	ctx, cancelReq := context.WithCancel(ctx)
+	defer cancelReq()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(reqBody))
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -462,6 +483,10 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 	var finishReason string
 	var usage Usage
 	done := false
+	var contentGuard, reasoningGuard loopGuard
+	looped := false
+	var loopCut int // octets de réponse à retirer
+	var loopCutR int
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -532,6 +557,15 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		// Qwen & co. : raisonnement parfois inline dans content, entre
 		// <think>…</think> (serveur sans reasoning parser).
 		tags.feed(choice.Delta.Content, emitReasoning, emitContent)
+		if n, ok := reasoningGuard.check(reasoning.String()); ok {
+			looped, loopCutR = true, n
+		} else if n, ok := contentGuard.check(content.String()); ok {
+			looped, loopCut = true, n
+		}
+		if looped {
+			cancelReq() // le serveur arrête de générer ; la lecture se termine
+			break
+		}
 		for _, tc := range choice.Delta.ToolCalls {
 			if tc.Index < 0 {
 				continue
@@ -551,6 +585,17 @@ func (c *Client) chatCompletionStreamOnce(ctx context.Context, messages []Messag
 		}
 	}
 
+	if looped {
+		r, ct := reasoning.String(), content.String()
+		r = r[:len(r)-loopCutR]
+		ct = ct[:len(ct)-loopCut]
+		return Message{
+			Role:             "assistant",
+			Content:          ct,
+			ReasoningContent: r,
+			FinishReason:     FinishReasonLoop,
+		}, usage, nil
+	}
 	tags.flush(func(d string) {
 		reasoning.WriteString(d)
 		if cb.OnReasoning != nil {

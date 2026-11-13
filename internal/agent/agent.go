@@ -411,7 +411,8 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		// avertissement explicite plutôt qu'une réponse silencieusement
 		// tronquée.
 		unusableTruncation := false
-		if msg.FinishReason == llm.FinishReasonLength {
+		looped := msg.FinishReason == llm.FinishReasonLoop
+		if msg.FinishReason == llm.FinishReasonLength || looped {
 			// Rien d'exploitable (tool_calls perdus ou aucun texte) : au lieu
 			// d'arrêter le tour, on relance le modèle (borné).
 			unusableTruncation = len(msg.ToolCalls) > 0 || strings.TrimSpace(msg.Content) == ""
@@ -424,7 +425,11 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 				if client.MaxTokens > 0 {
 					limit = fmt.Sprintf("max_tokens=%d", client.MaxTokens)
 				}
-				onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("réponse interrompue par la limite de tokens de sortie (%s, voir LLM_MAX_TOKENS) : le modèle est peut-être parti en boucle", limit)})
+				if looped {
+					onEvent(Event{Kind: EventWarning, Result: "boucle de répétition détectée : génération interrompue"})
+				} else {
+					onEvent(Event{Kind: EventWarning, Result: fmt.Sprintf("réponse interrompue par la limite de tokens de sortie (%s, voir LLM_MAX_TOKENS) : le modèle est peut-être parti en boucle", limit)})
+				}
 			}
 		}
 
@@ -440,7 +445,7 @@ func Run(ctx context.Context, client *llm.Client, conv *convo.Conversation, regi
 		conv.AppendRaw(msg)
 		conv.RecordUsage(usage)
 
-		if msg.FinishReason == llm.FinishReasonLength && unusableTruncation && truncationRecoveries < maxTruncationRecoveries && step+1 < maxSteps {
+		if (msg.FinishReason == llm.FinishReasonLength || looped) && unusableTruncation && truncationRecoveries < maxTruncationRecoveries && step+1 < maxSteps {
 			truncationRecoveries++
 			conv.AddUser(truncationNudge)
 			continue
